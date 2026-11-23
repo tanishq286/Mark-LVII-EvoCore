@@ -1159,8 +1159,8 @@ async def main() -> int:
     test_voices_follow_the_language()
     test_voice_folder_is_writable()
     test_a_chosen_voice_downloads_itself()
-    test_panel_settings_survive()
     test_gemini_oneshot_think_and_ollama_fallback()
+    test_panel_settings_survive()
 
     print(f"\n{'=' * 56}")
     print(f"{_ok} passed, {_fail} failed")
