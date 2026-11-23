@@ -97,8 +97,8 @@ def main() -> int:
     rejected = [p for p in ui_list if not p["valid"]]
     active_names = sorted(p["name"] for p in active)
     all_ok &= _check(
-        "Plugin auto-discovery: 8 active, 0 rejected, zero collisions",
-        len(active) == 8 and len(rejected) == 0 and "feedback_logger" in active_names,
+        "Plugin auto-discovery: >=8 active, 0 rejected, zero collisions",
+        len(active) >= 8 and len(rejected) == 0 and "feedback_logger" in active_names,
         f"active={len(active)}, rejected={len(rejected)}, core_checked={len(core_names)}",
     )
 

@@ -28,7 +28,10 @@ PLUGIN = {
         "and report 10-dimension quality scores across all JARVIS plugins and actions; "
         "'auto_improve' = run a closed-loop tq-forge + horizon self-improvement pass across JARVIS's "
         "own codebase, minting new hash-chained heuristics from any runtime friction logs; "
-        "'compile_skill' = compile any of the 246 installed skills (in target) into a native JARVIS plugin."
+        "'compile_skill' = compile an installed skill (in target) into a validated JARVIS plugin staged on an isolated skill/* Git branch (never modifying main directly)."
+    ),
+    "brief": (
+        "Verify heuristics chain & 10D plugin scores, run auto-improve diagnostics, or compile a skill onto a validated skill/* branch."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -159,6 +162,12 @@ def _compile_skill(target: str, player) -> str:
         return f"Skill '{q}' not found in ecosystem_index.json."
 
     pname = "skill_" + re.sub(r"[^a-z0-9_]+", "_", skill_info["name"].lower()).strip("_")[:28]
+    from plugins._skill_gate import preflight_clean_repo
+    ok_pre, pre_reason = preflight_clean_repo(_BASE, pname)
+    if not ok_pre:
+        msg = f"Branch-gated skill compilation blocked: {pre_reason}"
+        _call(player, "write_log", f"ERR: [forge_skill_factory] {msg}")
+        return msg
     capability = (
         f"Compile the installed skill '{skill_info['name']}' ({skill_info['description']}) "
         f"from {skill_info['path']} into a native JARVIS plugin."

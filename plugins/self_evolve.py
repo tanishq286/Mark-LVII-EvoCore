@@ -30,10 +30,13 @@ PLUGIN = {
         "or inspect its evolution status. "
         "Actions: "
         "'status' = inspect JARVIS's current generation, tq-forge quality scores, learned repos, and plugins; "
-        "'evolve' = autonomously design, write, score (>=70/100), test, and hot-load a new JARVIS plugin; "
+        "'evolve' = design, write, validate via scripts/validate_plugin.py, and stage a new JARVIS plugin on an isolated skill/* Git branch (never writing directly onto main); "
         "'learn_repo' = study a local project or repository (e.g. 'tq-forge', 'omega-system') and absorb its architecture into JARVIS; "
-        "'heal' = scan all plugins for errors or low quality scores and repair them automatically; "
+        "'heal' = scan all plugins for errors or low quality scores and stage any repair on a validated skill/* Git branch; "
         "'reflect' = store a permanent cognitive directive or architectural lesson."
+    ),
+    "brief": (
+        "Self-evolution status, repo learning, cognitive directives, and branch-gated plugin drafting/healing (never mutating main)."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -388,10 +391,17 @@ Return ONLY valid JSON:
   "actions_supported": ["status", "..."]
 }}"""
         plan_data = gemini.as_json(plan_prompt, tier=gemini.SMART) or {}
+        step("Checking Git branch-gate preflight (clean main & no core action collision)…", status="reading")
+        from plugins._skill_gate import preflight_clean_repo, sanitize_plugin_slug, stage_plugin_on_branch
+
         raw_pname = requested_name or (plan_data.get("plugin_name") if isinstance(plan_data, dict) else "") or capability.split()[0]
-        pname = _slug_name(str(raw_pname))
+        pname = sanitize_plugin_slug(str(raw_pname))
         if pname in existing_actions:
-            pname = f"evolved_{pname}"
+            pname = sanitize_plugin_slug(f"evolved_{pname}")
+        ok_pre, pre_reason = preflight_clean_repo(_BASE, pname)
+        if not ok_pre:
+            raise RuntimeError(pre_reason)
+
         rel_path = f"plugins/{pname}.py"
         target_path = _BASE / rel_path
         is_edit = target_path.exists()
@@ -404,7 +414,7 @@ Return ONLY valid JSON:
             "what": summary,
             "state": "writing",
         }
-        step(f"Writing {rel_path}…", status="writing", file_rel=rel_path, fstate="writing")
+        step(f"Drafting {rel_path} for isolated skill/* branch…", status="writing", file_rel=rel_path, fstate="writing")
 
         write_prompt = f"""You are writing a production JARVIS plugin at `{rel_path}` inside Mark-LVII.
 
@@ -423,83 +433,49 @@ PLUGIN TEMPLATE REFERENCE:
 {f"EXISTING CODE IN {rel_path} TO UPGRADE:\n{current_code}\n" if current_code else ""}
 Additional mandatory rules for `{rel_path}`:
 1. Include a clear module docstring at top.
-2. Define module-level `PLUGIN = {{"name": "{pname}", "description": "...", "parameters": {{"type": "OBJECT", "properties": {{...}}}}}}`
+2. Define module-level `PLUGIN = {{"name": "{pname}", "description": "...", "brief": "...", "parameters": {{"type": "OBJECT", "properties": {{...}}}}}}`
 3. Define module-level `def run(parameters: dict, player=None, session_memory=None) -> str:`
-4. NEVER import or touch `PyQt6.QtWidgets`, `PyQt6.QtGui`, or `QApplication`. Use thread-safe `player.show_content(title, text)` and `player.write_log(text)` instead, guarding for `player is None`.
-5. `run()` must NEVER raise an exception, must return a short spoken string within a few seconds, and if the parameters have an `"enum"`, the first enum option (e.g. `"status"`) must return a safe, instant status string without side effects so automated smoke tests pass cleanly.
-6. For any LLM call, use `from core import gemini` (`gemini.text(prompt, tier=gemini.FAST)` or `gemini.SMART`) and handle `None`/empty fallbacks gracefully.
-7. Output ONLY valid Python source code — no markdown fences, no commentary.
+4. NEVER import or touch PyQt/PySide GUI toolkits. Use thread-safe `player.show_content(title, text)` and `player.write_log(text)` instead, guarding for `player is None`.
+5. NEVER read/write config or memory JSON files directly and NEVER use os.system, eval, exec, or shell=True.
+6. `run()` must NEVER raise an exception, must return a short spoken string within a few seconds, and must handle `parameters={{}}` safely with `player=None`.
+7. For any LLM call, use `from core import gemini` (`gemini.text(prompt, tier=gemini.FAST)` or `gemini.SMART`) and handle `None`/empty fallbacks gracefully.
+8. Output ONLY valid Python source code — no markdown fences, no commentary.
 """
         code = _strip_fences(gemini.text(write_prompt, tier=gemini.SMART, timeout_ms=90_000) or "")
         if not code or "PLUGIN" not in code or "def run(" not in code:
             raise RuntimeError("Model did not return a complete plugin module.")
 
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        backup_file = _BACKUP_DIR / stamp / rel_path
-        if is_edit:
-            backup_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(target_path, backup_file)
+        step(f"Validating and staging {rel_path} in isolated Git worktree (main untouched)…", status="checking", file_rel=rel_path, fstate="waiting")
 
-        target_path.write_text(code + "\n", encoding="utf-8")
-
-        step(f"Running tq-forge 5-dimension quality scorer & static checks on {rel_path}…", status="checking", file_rel=rel_path, fstate="waiting")
-        written = {rel_path: code + "\n"}
-        originals = {rel_path: current_code} if is_edit else {}
-
-        for attempt in range(3):
-            problems = code_checks.static_problems(_BASE, written, stack)
-            qscore = score_plugin_quality(written[rel_path])
-            if not problems and not qscore["passed"]:
-                problems[rel_path] = f"tq-forge quality score {qscore['total']}/100 is below 70/100 promotion threshold: {qscore['dimensions']}"
-            if not problems:
-                step(f"Running isolated worker-thread smoke test on {rel_path} (quality={qscore['total']}/100)…", status="testing")
-                problems = code_checks.runtime_problems(_BASE, written, originals, stack)
-            if not problems:
-                break
-            err_msg = problems.get(rel_path) or "; ".join(problems.values())
-            step(f"Auto-fixing verification issue (round {attempt + 1}): {err_msg[:120]}", status="writing", file_rel=rel_path, fstate="fixing")
-            fix_prompt = f"""Fix the following verification problem in JARVIS plugin `{rel_path}`:
-
-Problem reported by code_checks / tq-forge scorer:
-{err_msg}
+        def _fix_in_worktree(broken_code: str, errs: list[str]) -> str | None:
+            step(f"Auto-fixing validation issue in worktree: {errs[0][:120]}", status="writing", file_rel=rel_path, fstate="fixing")
+            fix_prompt = f"""Fix these validation errors in JARVIS plugin `{rel_path}`:
+{chr(10).join('- ' + e for e in errs)}
 
 Current code of `{rel_path}`:
-{written[rel_path]}
+{broken_code}
 
 Rules:
-- Keep `PLUGIN["name"] == "{pname}"` and `def run(parameters: dict, player=None, session_memory=None) -> str:`.
-- No PyQt6 imports; use only standard library / installed packages and `player.show_content` / `player.write_log`.
+- Keep `PLUGIN["name"] == "{pname}"`, include concise `brief`, and `def run(parameters: dict, player=None, session_memory=None) -> str:`.
+- Zero Qt imports, zero raw config/memory JSON file paths, zero eval/exec/os.system/shell=True.
 - Return ONLY the complete corrected Python file, no markdown fences.
 """
             fixed = _strip_fences(gemini.text(fix_prompt, tier=gemini.SMART, timeout_ms=90_000) or "")
-            if fixed and "PLUGIN" in fixed and "def run(" in fixed:
-                written[rel_path] = fixed + "\n"
-                target_path.write_text(written[rel_path], encoding="utf-8")
+            return fixed if (fixed and "PLUGIN" in fixed and "def run(" in fixed) else None
 
-        final_problems = code_checks.static_problems(_BASE, written, stack)
-        if final_problems:
-            raise RuntimeError(f"Static verification failed: {'; '.join(final_problems.values())}")
+        staged = stage_plugin_on_branch(
+            _BASE,
+            pname,
+            code,
+            summary=summary,
+            fix_fn=_fix_in_worktree,
+            max_fix_rounds=2,
+        )
+        if not staged["ok"]:
+            raise RuntimeError(staged["error"])
 
-        qscore = score_plugin_quality(written[rel_path])
-
-        if player and callable(getattr(player, "tool_catalog", None)):
-            try:
-                player.tool_catalog()
-            except Exception:
-                pass
-
-        try:
-            from core.undo import push_undo
-            def _undo_evolve():
-                if is_edit and backup_file.exists():
-                    shutil.copy2(backup_file, target_path)
-                    return f"Restored previous version of {rel_path}."
-                if target_path.exists():
-                    target_path.unlink()
-                return f"Removed evolved plugin {rel_path}."
-            push_undo(f"self-evolution of {pname}", _undo_evolve)
-        except Exception:
-            pass
+        branch = staged["branch"]
+        qscore = score_plugin_quality(code)
 
         journal = _load_journal()
         journal["generation"] = int(journal.get("generation", 1)) + 1
@@ -509,6 +485,8 @@ Rules:
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
             "plugin": pname,
             "file": rel_path,
+            "branch": branch,
+            "status": "pending_human_review",
             "quality_score": qscore["total"],
             "dimensions": qscore["dimensions"],
             "request": capability,
@@ -516,20 +494,10 @@ Rules:
         })
         _save_journal(journal)
 
-        try:
-            from memory.memory_manager import update_memory
-            update_memory({
-                "projects": {
-                    f"evolved_{pname}": f"Gen {gen} evolved plugin ({rel_path}, score {qscore['total']}/100): {summary}"
-                }
-            })
-        except Exception:
-            pass
-
         elapsed = round(time.time() - started, 1)
         result_msg = (
-            f"Evolution to Generation {gen} complete in {elapsed}s (tq-forge quality score: {qscore['total']}/100). "
-            f"Hot-loaded `{rel_path}` ({pname}): {summary}"
+            f"Validated draft for `{rel_path}` committed on branch `{branch}` in {elapsed}s "
+            f"(main untouched). Review: `{staged['review_cmd']}` | Merge: `{staged['merge_cmd']}`"
         )
         job["status"] = "done"
         job["finished"] = time.time()
@@ -538,15 +506,14 @@ Rules:
         _call(
             player,
             "show_content",
-            f"EVOLVED → GEN {gen}: {pname.upper()} ({qscore['total']}/100)",
-            f"{result_msg}\n\nFile: {target_path}\n\nCode Preview:\n{written[rel_path][:3200]}",
+            f"DRAFT READY → BRANCH {branch}",
+            f"{result_msg}\n\nDiff Preview:\n{staged['diff'][:3000]}",
         )
         _call(
             player,
             "request_say",
-            f"[SELF EVOLUTION COMPLETE] JARVIS has evolved to Generation {gen} with a quality score of "
-            f"{qscore['total']} out of 100 and hot-loaded '{pname}' ({summary}). Tell the user in one or two "
-            "confident sentences in their language that the new capability is live.",
+            f"[SKILL DRAFT READY] A validated draft for '{pname}' is ready on Git branch '{branch}'. "
+            "Main was not modified. Tell the user in one sentence that it is ready for git diff review and merge.",
         )
     except Exception as e:
         err = f"Self-evolution failed: {e}"
@@ -638,8 +605,15 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             return _status(player)
         if any(r in capability.lower() for r in ("tq-forge", "tq_forge", "omega-system", "omega_system")) and "learn" in capability.lower():
             return _learn_repo(capability, player)
+        from plugins._skill_gate import preflight_clean_repo, sanitize_plugin_slug
+        preflight_slug = sanitize_plugin_slug(plugin_name or capability.split()[0])
+        ok_pre, pre_reason = preflight_clean_repo(_BASE, preflight_slug)
+        if not ok_pre:
+            msg = f"Branch-gated self-evolution blocked: {pre_reason}"
+            _call(player, "write_log", f"ERR: [Self-Evolve] {msg}")
+            return msg
         if not _evolve_lock.acquire(blocking=False):
-            return "I am already evolving a new capability in the background — watch the HUD panel for progress."
+            return "I am already staging a new capability on a skill/* branch — watch the HUD panel for progress."
         threading.Thread(
             target=_evolve_worker,
             args=(capability, plugin_name, player),
@@ -647,7 +621,7 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             name="jarvis-self-evolve",
         ).start()
         return (
-            "Initiating self-evolution with tq-forge quality scoring. Watch the live coding panel "
-            "on my HUD as I architect, write, score, test, and hot-load this capability."
+            "Initiating branch-gated skill draft with scripts/validate_plugin.py. "
+            "Main will remain untouched — watch the HUD for the skill/* branch diff and merge command."
         )
     return _status(player)
