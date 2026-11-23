@@ -90,8 +90,11 @@ def _restore_from_trash(original: Path) -> str:
             f"automatically, but it is there and can be restored by hand.")
 
 
+_BASE_DIR = Path(__file__).resolve().parent.parent
+
 _SAFE_ROOTS: list[Path] = [
     Path.home(),
+    _BASE_DIR,
 ]
 if Path("/mnt/c/Users/tanis").exists():
     _SAFE_ROOTS.append(Path("/mnt/c/Users/tanis"))
@@ -159,6 +162,7 @@ def _resolve_path(raw: str) -> Path:
         "music":     _get_music(),
         "videos":    _get_videos(),
         "home":      Path.home(),
+        "reports":   _BASE_DIR / "reports",
     }
     raw   = raw.strip().strip('"').strip("'")
     lower = raw.lower()

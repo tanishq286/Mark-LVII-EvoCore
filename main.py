@@ -274,7 +274,7 @@ def _describe_tools(declarations) -> str:
         if not name:
             continue
         desc = " ".join(str(desc).split())
-        lines.append(f"- {name}: {desc[:90]}" if desc else f"- {name}")
+        lines.append(f"- {name}: {desc[:150]}" if desc else f"- {name}")
     return "\n".join(lines)
 
 
@@ -2032,6 +2032,11 @@ class JarvisLive:
                                 print("[JARVIS] 🔗 Session resumption armed")
                             self._resume_handle = _sru.new_handle
 
+                    if getattr(response, "go_away", None) is not None:
+                        print("[JARVIS] 🔄 Server sent GoAway — rotating session with context preserved")
+                        self.request_reconnect(keep_context=True, reason="session refresh")
+                        return
+
                     if response.data:
                         if self._interrupted:
                             pass  # discard: interrupted
@@ -2134,6 +2139,18 @@ class JarvisLive:
                                 self._keep_task(asyncio.create_task(_cam_close()))
 
                     if response.tool_call:
+                        if out_buf or out_streamed or in_buf:
+                            _flush_user_in()
+                            full_lead = " ".join(out_buf).strip()
+                            if full_lead:
+                                self._last_out_logged = full_lead
+                                if not out_streamed:
+                                    self.ui.write_log(f"{self._asst_name}: {full_lead}")
+                                self._session_log.append(f"{self._asst_name}: {full_lead}")
+                            if out_streamed and callable(_stream_fn):
+                                _stream_fn(self._asst_name, "", True)
+                            out_buf = []
+                            out_streamed = False
                         fn_responses = []
                         for fc in response.tool_call.function_calls:
                             print(f"[JARVIS] 📞 {fc.name}")
@@ -2147,6 +2164,13 @@ class JarvisLive:
             print(f"[JARVIS] ❌ Recv: {e}")
             traceback.print_exc()
             raise
+        finally:
+            if out_streamed and callable(_stream_fn):
+                try:
+                    _stream_fn(self._asst_name, "", True)
+                except Exception:
+                    pass
+                out_streamed = False
 
     async def _play_audio(self):
         print("[JARVIS] 🔊 Play started")
@@ -3090,6 +3114,13 @@ class JarvisLive:
                     self._conn_backoff = 3
             finally:
                 self.session = None
+                _stream_fn = getattr(self.ui, "write_log_stream", None)
+                if callable(_stream_fn):
+                    try:
+                        _stream_fn(self._asst_name, "", True)
+                    except Exception:
+                        pass
+                self.set_speaking(False)
                 # Only save if there was a real conversation (≥3 turns)
                 if len(self._session_log) >= 3:
                     self._keep_task(asyncio.create_task(self._save_session_summary()))

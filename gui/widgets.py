@@ -156,6 +156,9 @@ class LogWidget(QTextEdit):
         self._sig.emit(text)
 
     def _enqueue(self, text: str):
+        if self._stream_active and text.lower().startswith(("you:", "err:")):
+            self._stream_active = False
+            self._stream_has_text = False
         self._queue.append(text)
         if not self._typing and not self._stream_active:
             self._next()
