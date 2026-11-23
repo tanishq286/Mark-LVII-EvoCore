@@ -1099,13 +1099,48 @@ def test_gemini_oneshot_think_and_ollama_fallback():
     responses = [
         {"message": {"content": "<think>only thoughts</think>"}},
         {"message": {"content": "<think>checking</think>42"}},
+        {"message": {"content": "<think>reasoning</think>tradeoff_ok"}},
+        {"message": {"content": "<think>quick</think>fast_ok"}},
     ]
     seen_models: list[str] = []
 
     class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/api/tags":
+                raw = json.dumps({"models": [
+                    {"name": "qwen3:8b"},
+                    {"name": "qwen2.5-coder:14b"},
+                    {"name": "qwen2.5:14b"},
+                    {"name": "gemma4:12b"},
+                ]}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+            if self.path == "/api/ps":
+                raw = json.dumps({"models": []}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+            self.send_response(404)
+            self.end_headers()
+
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if self.path == "/api/generate":
+                raw = json.dumps({"done": True}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+                return
             seen_models.append(body.get("model", ""))
             reply = responses.pop(0) if responses else {"message": {"content": "ok"}}
             raw = json.dumps(reply).encode("utf-8")
@@ -1125,13 +1160,29 @@ def test_gemini_oneshot_think_and_ollama_fallback():
     orig_url = g._OLLAMA_CHAT_URL
     try:
         g._OLLAMA_CHAT_URL = f"http://127.0.0.1:{port}/api/chat"
-        rep = g._local_ollama_fallback("what is 6*7?", g.SMART, 5000)
+        rep_code = g._local_ollama_fallback(
+            "Debug this Python script: def mul(a, b): return a * b", g.SMART, 5000
+        )
         check("returns _Reply instance (no _TextResp NameError)",
-              isinstance(rep, g._Reply), repr(type(rep)))
+              isinstance(rep_code, g._Reply), repr(type(rep_code)))
         check("skips think-only model and strips <think> from answer",
-              rep is not None and rep.text == "42", repr(getattr(rep, "text", None)))
-        check("SMART fallback tries qwen2.5-coder:14b first, then qwen3:8b",
+              rep_code is not None and rep_code.text == "42",
+              repr(getattr(rep_code, "text", None)))
+        check("coding fallback tries qwen2.5-coder:14b first, then qwen3:8b",
               seen_models[:2] == ["qwen2.5-coder:14b", "qwen3:8b"], str(seen_models))
+
+        rep_reason = g._local_ollama_fallback(
+            "Analyze the architectural trade-offs between monoliths and microservices.",
+            g.SMART, 5000,
+        )
+        check("reasoning fallback routes to qwen2.5:14b",
+              rep_reason is not None and rep_reason.text == "tradeoff_ok"
+              and seen_models[2] == "qwen2.5:14b", str(seen_models))
+
+        rep_fast = g._local_ollama_fallback("Summarize in one word: OK", g.FAST, 5000)
+        check("fast fallback routes to qwen3:8b",
+              rep_fast is not None and rep_fast.text == "fast_ok"
+              and seen_models[3] == "qwen3:8b", str(seen_models))
     finally:
         g._OLLAMA_CHAT_URL = orig_url
         srv.shutdown()

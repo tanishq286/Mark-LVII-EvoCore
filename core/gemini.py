@@ -688,17 +688,52 @@ def _to_openai_messages(contents, config) -> tuple[list[dict], Optional[float]]:
     return messages, temperature
 
 
-def _provider_call(model: str, contents, config, timeout_ms: int):
+def _extract_prompt_text(contents) -> tuple[str, bool]:
+    """Return `(plain_text, has_media)` for one-shot contents without touching SDK types."""
+    parts: list[str] = []
+    has_media = False
+    items = contents if isinstance(contents, (list, tuple)) else [contents]
+    for item in items:
+        if isinstance(item, str):
+            parts.append(item)
+        elif item is not None:
+            has_media = True
+    return "\n".join(parts).strip(), has_media
+
+
+def _provider_call(model: str, contents, config, timeout_ms: int, tier: str = FAST):
     """One generation through a configured provider. Raises like every other
     rung, so the loop's error classification applies to it unchanged."""
     from memory.config_manager import get_provider_config
     from providers import registry
 
     pid = model[len(PROVIDER_PREFIX):]
-    cfg = get_provider_config(pid)
+    cfg = dict(get_provider_config(pid) or {})
     missing = registry.missing_fields(pid, cfg)
     if missing:
         raise RuntimeError(f"404 not configured: {', '.join(missing)}")
+
+    # Free Local Specialist Router (M6): for text-only requests going to local
+    # Ollama, select the best installed specialist (qwen3:8b vs qwen2.5-coder:14b
+    # vs qwen2.5:14b / gemma4:12b) and evict any competing LLM from 12 GB VRAM.
+    prompt_text, has_media = _extract_prompt_text(contents)
+    base_url = str(cfg.get("base_url") or "")
+    if not has_media and prompt_text:
+        try:
+            from providers import local_router
+            if local_router.is_local_ollama_url(base_url):
+                origin = local_router.normalize_ollama_origin(base_url)
+                decision, _ladder = local_router.route_prompt(
+                    prompt_text,
+                    tier=tier,
+                    ollama_origin=origin,
+                    fallback_model=str(cfg.get("model") or "qwen3:8b"),
+                )
+                chosen = decision.selected_model or str(cfg.get("model") or "qwen3:8b")
+                local_router.ensure_vram_ready(chosen, origin)
+                cfg["model"] = chosen
+        except Exception:
+            pass
 
     llm = registry.build(pid, cfg)
     messages, temperature = _to_openai_messages(contents, config)
@@ -784,7 +819,7 @@ def call(contents, tier: str = FAST, config=None,
                     return reply
                 raise RuntimeError("the Live turn came back empty")
             if model.startswith(PROVIDER_PREFIX):
-                return _provider_call(model, contents, config, timeout_ms)
+                return _provider_call(model, contents, config, timeout_ms, tier=tier)
             if cl is None:
                 cl = client(timeout_ms=timeout_ms, key=resolved_key)
             kwargs = {"model": model, "contents": contents}
@@ -821,50 +856,28 @@ _OLLAMA_CHAT_URL = "http://127.0.0.1:11434/api/chat"
 
 def _local_ollama_fallback(contents, tier: str, timeout_ms: int):
     """Zero-config local RTX 5070 Ti Ollama fallback when cloud rungs are
-    exhausted or offline. Uses qwen2.5-coder:14b first for SMART/coding calls
-    and qwen3:8b first for FAST daily side calls."""
-    import urllib.request
-    prompt_parts = []
-    if isinstance(contents, str):
-        prompt_parts.append(contents)
-    elif isinstance(contents, (list, tuple)):
-        for item in contents:
-            if isinstance(item, str):
-                prompt_parts.append(item)
-    prompt = "\n".join(prompt_parts).strip()
+    exhausted or offline. Uses `providers.local_router` lazily to route across
+    qwen3:8b (fast), qwen2.5-coder:14b (coding), and qwen2.5:14b / gemma4:12b
+    (deep reasoning) with 12 GB VRAM unload guards and `<think>` stripping."""
+    prompt, _has_media = _extract_prompt_text(contents)
     if not prompt:
         return None
-    models = (
-        ("qwen2.5-coder:14b", "qwen3:8b", "jarvis-pro:latest", "claude-fable-5-2:latest", "gemma4:e2b")
-        if tier == SMART
-        else ("qwen3:8b", "gemma4:e2b", "qwen3:4b", "jarvis-pro:latest")
-    )
     timeout_s = max(5.0, min(60.0, timeout_ms / 1000.0))
-    for m in models:
-        try:
-            payload = json.dumps({
-                "model": m,
-                "messages": [
-                    {"role": "system", "content": _ONE_SHOT_SYSTEM},
-                    {"role": "user", "content": prompt},
-                ],
-                "stream": False,
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                _OLLAMA_CHAT_URL,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="replace"))
-                raw_txt = str((data.get("message") or {}).get("content") or "")
-                txt = _strip_thinking(raw_txt)
-                if txt:
-                    print(f"[Gemini] Local RTX 5070 Ti Ollama fallback answered via {m}")
-                    return _Reply(txt)
-        except Exception:
-            continue
+    from providers import local_router
+
+    res = local_router.complete_local(
+        prompt,
+        tier=tier,
+        system=_ONE_SHOT_SYSTEM,
+        chat_url=_OLLAMA_CHAT_URL,
+        timeout_s=timeout_s,
+    )
+    if res and res.get("text"):
+        print(
+            f"[Gemini] Local RTX 5070 Ti Ollama fallback answered via "
+            f"{res['model']} ({res['category']})"
+        )
+        return _Reply(res["text"])
     return None
 
 
