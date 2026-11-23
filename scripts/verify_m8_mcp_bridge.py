@@ -159,12 +159,8 @@ def main() -> int:
     print("=== Milestone 8: Safe Local MCP Tool Bridge Verification ===")
 
     # 1. Privacy (.gitignore) + tracked config/mcp_servers.example.json
-    gi = subprocess.run(
-        ["git", "check-ignore", "-v", "config/mcp_servers.json"],
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-    )
+    from core.cross_os import run_git
+    gi = run_git(ROOT, "check-ignore", "-v", "config/mcp_servers.json")
     example_path = ROOT / "config" / "mcp_servers.example.json"
     example_data = json.loads(example_path.read_text(encoding="utf-8")) if example_path.is_file() else {}
     ex_servers = example_data.get("servers") or {}

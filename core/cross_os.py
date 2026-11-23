@@ -186,13 +186,52 @@ def run_windows(cmd: str, cwd: str | None = None, timeout: int = 45) -> subproce
     )
 
 
+def git_available() -> bool:
+    """True when native `git` OR WSL2 `git` (via `wsl.exe` on Windows) is reachable."""
+    if shutil.which("git") is not None:
+        return True
+    return _IS_WIN and shutil.which("wsl.exe") is not None
+
+
+def run_git(cwd: str | Path, *args: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
+    """Run a git command in `cwd`, automatically bridging through WSL2 on Windows
+    when native Git for Windows is not installed."""
+    cwd_path = Path(cwd).resolve()
+    if shutil.which("git") is not None:
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(cwd_path),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    if _IS_WIN and shutil.which("wsl.exe") is not None:
+        wsl_cwd = to_wsl_path(str(cwd_path))
+        return subprocess.run(
+            ["wsl.exe", "-d", WSL_DISTRO, "--cd", wsl_cwd, "-e", "git", *args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    raise FileNotFoundError("Neither native git nor wsl.exe git is available.")
+
+
 def peer_memory_dir() -> Path | None:
-    """Return the OTHER J.A.R.V.I.S install's `memory/` directory if reachable."""
+    """Return the OTHER J.A.R.V.I.S install's `memory/` directory if reachable
+    and NOT archived (`.archived_single_brain`)."""
     try:
         if _IS_WIN:
             p = Path(f"{_WSL_UNC_PREFIX}\\home\\tanishq\\Mark-LVII\\memory")
         else:
             p = Path("/mnt/c/Users/tanis/Downloads/Mark-LVII-main/Mark-LVII-main/memory")
+        if (p.parent / ".archived_single_brain").is_file():
+            return None
         return p if p.is_dir() else None
     except OSError:
         return None

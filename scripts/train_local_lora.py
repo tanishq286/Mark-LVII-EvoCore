@@ -357,7 +357,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--quantization", default=RTX_5070_TI_PLAN["quantization_method"])
     parser.add_argument("--dry-run", action="store_true", help="Validate dataset, GPU/VRAM, and preview Modelfile without training")
     parser.add_argument("--json", action="store_true", dest="as_json", help="Emit JSON summary during --dry-run")
+    parser.add_argument("--wsl", action="store_true", help="Bridge from Windows into WSL2 /home/tanishq/unsloth_env automatically")
     args = parser.parse_args(argv)
+
+    if args.wsl:
+        from scripts.wsl_train import run_wsl_train
+        raw_argv = list(sys.argv[1:] if argv is None else argv)
+        return run_wsl_train(raw_argv)
 
     ok_name, name_or_err = validate_ollama_target_name(args.ollama_name)
     if not ok_name:

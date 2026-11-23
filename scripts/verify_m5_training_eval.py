@@ -28,8 +28,10 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 UNSLOTH_PY = Path("/home/tanishq/unsloth_env/bin/python")
 TRAIN_SCRIPT = ROOT / "scripts" / "train_local_lora.py"
+WSL_TRAIN_SCRIPT = ROOT / "scripts" / "wsl_train.py"
 EVAL_SCRIPT = ROOT / "scripts" / "eval_local_model.py"
 TEMPLATE_PATH = ROOT / "scripts" / "eval_set.template.jsonl"
 EVAL_PATH = ROOT / "training_data" / "eval_set.jsonl"
@@ -47,12 +49,8 @@ def main() -> int:
     print("=== Milestone 5: Isolated QLoRA Pipeline & Promotion Gate Verification ===")
 
     # 1. Verify requirements.txt untouched & Mark-LVII/.venv free of PyTorch/Unsloth
-    req_diff = subprocess.run(
-        ["git", "diff", "baseline-before-upgrade", "--", "requirements.txt"],
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-    )
+    from core.cross_os import run_git
+    req_diff = run_git(ROOT, "diff", "baseline-before-upgrade", "--", "requirements.txt")
     ml_in_main = [
         p for p in ("torch", "unsloth", "trl", "peft", "bitsandbytes")
         if importlib.util.find_spec(p) is not None
@@ -73,10 +71,14 @@ def main() -> int:
         f"bytes={len(req_train_txt)}",
     )
 
-    # 3. scripts/train_local_lora.py --dry-run inside /home/tanishq/unsloth_env
-    train_py = str(UNSLOTH_PY) if UNSLOTH_PY.is_file() else sys.executable
+    # 3. scripts/train_local_lora.py --dry-run inside /home/tanishq/unsloth_env (via wsl_train.py on Windows)
+    train_cmd = (
+        [str(UNSLOTH_PY), str(TRAIN_SCRIPT)]
+        if UNSLOTH_PY.is_file()
+        else [sys.executable, str(WSL_TRAIN_SCRIPT)]
+    )
     dry_train = subprocess.run(
-        [train_py, str(TRAIN_SCRIPT), "--dry-run", "--json"],
+        [*train_cmd, "--dry-run", "--json"],
         cwd=str(ROOT),
         stdin=subprocess.DEVNULL,
         capture_output=True,
@@ -118,7 +120,7 @@ def main() -> int:
             encoding="utf-8",
         )
         floor_chk = subprocess.run(
-            [train_py, str(TRAIN_SCRIPT), "--dataset", str(tiny_ds)],
+            [*train_cmd, "--dataset", str(tiny_ds)],
             cwd=str(ROOT),
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -126,7 +128,7 @@ def main() -> int:
             timeout=20.0,
         )
         overwrite_chk = subprocess.run(
-            [train_py, str(TRAIN_SCRIPT), "--dry-run", "--ollama-name", "qwen3:8b"],
+            [*train_cmd, "--dry-run", "--ollama-name", "qwen3:8b"],
             cwd=str(ROOT),
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -152,12 +154,7 @@ def main() -> int:
         timeout=20.0,
     )
     eval_data = json.loads(dry_eval.stdout) if dry_eval.returncode == 0 and dry_eval.stdout.strip() else {}
-    gi = subprocess.run(
-        ["git", "check-ignore", "-v", "training_data/eval_set.jsonl"],
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-    )
+    gi = run_git(ROOT, "check-ignore", "-v", "training_data/eval_set.jsonl")
     all_ok &= _check(
         "eval_set.template.jsonl (20 prompts) auto-seeds git-ignored training_data/eval_set.jsonl",
         TEMPLATE_PATH.is_file()

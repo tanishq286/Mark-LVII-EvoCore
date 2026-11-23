@@ -112,3 +112,18 @@ Connect free local stdio or HTTP Model Context Protocol (MCP) servers without we
 3. **Mutating-tool confirmation gate:** Tools listed in `"mutating_tools"` (or starting with mutating verbs such as `write_`, `delete_`, `remove_`, `create_`, `update_`, `exec_`, `run_`, `send_`, `post_`) never execute silently — they pause behind Mark-LVII's on-screen `core/confirm.py` CONFIRM/CANCEL banner (and are blocked when `player=None`).
 4. **Untrusted-content isolation & timeouts:** Every MCP tool response is length-capped and wrapped inside `<<<UNTRUSTED source=mcp...>>>`, and stdio child processes are terminated cleanly on timeout with zero leaked processes.
 5. **Inspect & invoke:** Use `mcp_bridge(mode="list_servers")`, `mcp_bridge(mode="list_tools", server="<name>")`, `mcp_bridge(mode="call_tool", server="<name>", tool="<tool>", arguments={...})`, or `mcp_bridge(mode="stats")`.
+
+---
+
+## 7. Unified Single-Brain Architecture (Milestone 9 — Windows 11 + WSL2)
+
+`C:\Users\tanis\Downloads\Mark-LVII-main\Mark-LVII-main` is the **single source of truth** (one Git repo with full `baseline-before-upgrade` → `HEAD` history, one `memory/long_term.json`, one `memory/routines.json`, one `knowledge/` vault, one `training_data/`, and one `reports/`). The legacy WSL2 directory (`/home/tanishq/Mark-LVII`) is archived read-only via `.archived_single_brain` so split-brain drift can never recur.
+
+| Task (from Windows PowerShell / CMD) | Command |
+|---|---|
+| Launch unified J.A.R.V.I.S. (Windows HUD + Voice + WSL2 backend) | `C:\Users\tanis\AppData\Local\Python\pythoncore-3.13-64\pythonw.exe "C:\Users\tanis\Downloads\Mark-LVII-main\Mark-LVII-main\main.py"` |
+| Run one-command health check (<10s) | `python scripts\health_check.py` |
+| Dry-run local QLoRA training via WSL2 CUDA bridge | `python scripts\wsl_train.py --dry-run` |
+| Run real QLoRA training in WSL2 `/home/tanishq/unsloth_env` | `python scripts\wsl_train.py` *(or `python scripts\train_local_lora.py --wsl`)* |
+| Run 20-prompt local model promotion gate | `python scripts\eval_local_model.py --base qwen3:8b --candidate jarvis-custom` |
+| Full Git rollback (via WSL2 git) | `wsl.exe -d Ubuntu-D --cd /mnt/c/Users/tanis/Downloads/Mark-LVII-main/Mark-LVII-main -- git checkout baseline-before-upgrade` |

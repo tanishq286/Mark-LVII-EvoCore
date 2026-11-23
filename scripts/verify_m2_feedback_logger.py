@@ -273,12 +273,8 @@ def main() -> int:
         )
 
     # 7. Git ignore check on training_data/corrections.jsonl
-    gi = subprocess.run(
-        ["git", "check-ignore", "-v", "training_data/corrections.jsonl"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-    )
+    from core.cross_os import run_git
+    gi = run_git(ROOT, "check-ignore", "-v", "training_data/corrections.jsonl")
     all_ok &= _check(
         "git check-ignore -v training_data/corrections.jsonl passes",
         gi.returncode == 0 and "training_data/" in gi.stdout,

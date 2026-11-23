@@ -36,6 +36,7 @@ memory/*.log
 memory/*.db
 training_data/
 knowledge/
+backups/
 reports/
 UPGRADE_PROGRESS.md
 config/project_briefs/

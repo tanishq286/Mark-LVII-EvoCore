@@ -60,12 +60,8 @@ def main() -> int:
     print("=== Milestone 7: Free Local Semantic Knowledge Vault (knowledge_rag) Verification ===")
 
     # 1. Privacy / gitignore check
-    gi = subprocess.run(
-        ["git", "check-ignore", "-v", "knowledge/.rag_index.sqlite"],
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-    )
+    from core.cross_os import run_git
+    gi = run_git(ROOT, "check-ignore", "-v", "knowledge/.rag_index.sqlite")
     all_ok &= _check(
         "git check-ignore -v knowledge/.rag_index.sqlite passes",
         gi.returncode == 0 and "knowledge/" in gi.stdout,

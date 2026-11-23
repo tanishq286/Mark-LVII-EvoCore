@@ -62,16 +62,11 @@ def _run_validator(path: Path, repo_root: Path | None = None) -> tuple[int, dict
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args],
-        cwd=str(cwd),
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=True,
-    )
+    from core.cross_os import run_git
+    res = run_git(cwd, *args)
+    if res.returncode != 0:
+        raise subprocess.CalledProcessError(res.returncode, ["git", *args], res.stdout, res.stderr)
+    return res
 
 
 def _collect_core_names() -> set[str]:

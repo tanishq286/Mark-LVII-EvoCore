@@ -499,12 +499,8 @@ def main() -> int:
         (r for r in live_eng.list() if r.get("kind") == "task" and r.get("agent") == "reflector"),
         None,
     )
-    gi = subprocess.run(
-        ["git", "check-ignore", "-v", "memory/routines.json"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-    )
+    from core.cross_os import run_git
+    gi = run_git(ROOT, "check-ignore", "-v", "memory/routines.json")
     all_ok &= _check(
         "Live Linux memory/routines.json has 01:00 silent reflector routine & is git-ignored",
         live_ref is not None

@@ -39,17 +39,21 @@ def sanitize_plugin_slug(raw: str) -> str:
     return slug if _SLUG_RE.match(slug) else "skill_custom"
 
 
+def _using_wsl_git() -> bool:
+    return sys.platform == "win32" and shutil.which("git") is None and shutil.which("wsl.exe") is not None
+
+
+def _git_path_arg(path: Path) -> str:
+    """Format a local path for whichever git executable `_git()` invokes."""
+    if _using_wsl_git():
+        from core.cross_os import to_wsl_path
+        return to_wsl_path(str(path.resolve()))
+    return str(path)
+
+
 def _git(repo_root: Path, *args: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args],
-        cwd=str(repo_root),
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-    )
+    from core.cross_os import run_git
+    return run_git(repo_root, *args, timeout=timeout)
 
 
 def _core_action_names(repo_root: Path) -> set[str]:
@@ -73,8 +77,9 @@ def preflight_clean_repo(repo_root: Path, plugin_slug: str) -> tuple[bool, str]:
     if slug in _core_action_names(root):
         return False, f"Refused: '{slug}' collides with a core action in actions/. Choose a distinct plugin name."
 
-    if shutil.which("git") is None:
-        return False, "Git executable not found; branch-gated skill drafting requires Git."
+    from core.cross_os import git_available
+    if not git_available():
+        return False, "Git executable not found (native or WSL2); branch-gated skill drafting requires Git."
 
     inside = _git(root, "rev-parse", "--is-inside-work-tree")
     if inside.returncode != 0 or inside.stdout.strip().lower() != "true":
@@ -209,7 +214,7 @@ def stage_plugin_on_branch(
     rel_path = f"plugins/{slug}.py"
 
     try:
-        add_wt = _git(root, "worktree", "add", "-b", branch, str(wt_dir), "HEAD")
+        add_wt = _git(root, "worktree", "add", "-b", branch, _git_path_arg(wt_dir), "HEAD")
         if add_wt.returncode != 0:
             return {
                 "ok": False,
@@ -315,7 +320,7 @@ def stage_plugin_on_branch(
         }
     finally:
         # Always detach and remove the temporary worktree directory
-        _git(root, "worktree", "remove", "--force", str(wt_dir))
+        _git(root, "worktree", "remove", "--force", _git_path_arg(wt_dir))
         shutil.rmtree(wt_parent, ignore_errors=True)
         if branch_created and not keep_branch:
             _git(root, "branch", "-D", branch)
