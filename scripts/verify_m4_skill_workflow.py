@@ -386,8 +386,8 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
     rejected = [p for p in ui_list if not p["valid"]]
     active_names = sorted(p["name"] for p in active)
     all_ok &= _check(
-        "Live plugin auto-discovery: 9 active, 0 rejected, _skill_gate skipped, 0 collisions",
-        len(active) == 9
+        "Live plugin auto-discovery: >=9 active, 0 rejected, _skill_gate skipped, 0 collisions",
+        len(active) >= 9
         and len(rejected) == 0
         and "skill_drafter" in active_names
         and "_skill_gate" not in active_names,

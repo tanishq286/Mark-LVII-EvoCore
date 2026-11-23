@@ -86,3 +86,14 @@ Weight fine-tuning stays **strictly isolated** in `/home/tanishq/unsloth_env` (n
 | Promote candidate (ONLY if gate outputs `PROMOTE`, exit `0`) | In HUD `⚙ → ENGINE & PROVIDERS`, set Ollama model to `jarvis-custom` |
 | Instant model rollback (if any issue appears) | Switch Ollama model back to `qwen3:8b` (or `ollama rm jarvis-custom`) |
 | Full repository rollback | `git checkout baseline-before-upgrade` |
+
+---
+
+## 5. Free Local Semantic Knowledge Vault (`knowledge/` — Milestone 7)
+
+Drop private `.md`, `.txt`, `.py`, `.json`, `.csv`, or `.pdf` files into the git-ignored `knowledge/` folder to give JARVIS local semantic RAG with **$0 API cost** using Ollama `nomic-embed-text:latest` + SQLite + NumPy:
+
+1. **Add documents:** Copy notes, project specs, or PDFs into `/home/tanishq/Mark-LVII/knowledge/` (subfolders allowed; symlinks outside `knowledge/` are blocked).
+2. **Index incrementally:** Ask JARVIS *"index my knowledge vault"* (`knowledge_rag(mode="index")`) — unchanged files are skipped by SHA-256 hash, modified files are re-embedded, and deleted files are pruned from `knowledge/.rag_index.sqlite`.
+3. **Query with citations:** Ask JARVIS *"search my knowledge vault for ..."* (`knowledge_rag(mode="search", query="...", top_k=5)`) — returns exact `knowledge/<rel_path>:L<start>-L<end>` citations wrapped inside `<<<UNTRUSTED source=knowledge_rag>>>` markers.
+4. **Check status:** Ask *"check knowledge vault stats"* (`knowledge_rag(mode="stats")`).

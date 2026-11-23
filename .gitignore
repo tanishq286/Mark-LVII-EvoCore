@@ -33,6 +33,7 @@ memory/failure_patterns.json
 memory/*.log
 memory/*.db
 training_data/
+knowledge/
 reports/
 UPGRADE_PROGRESS.md
 config/project_briefs/
