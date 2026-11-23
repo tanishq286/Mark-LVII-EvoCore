@@ -124,9 +124,12 @@ def default_context() -> dict:
 class TaskEngine:
     def __init__(self, root, reports_dir, agents_dirs, notify=None, max_parallel: int = 2,
                  tools_factory=None, ask_fn=None, clock=time.time, tick: float = 1.0,
-                 log=print, context_fn=None, autostart: bool = True):
+                 log=print, context_fn=None, autostart: bool = True, training_dir=None):
         self.store = TaskStore(Path(root))
         self.reports_dir = Path(reports_dir)
+        self.training_dir = (
+            Path(training_dir) if training_dir is not None else (self.reports_dir.parent / "training_data")
+        )
         self.agents_dirs = [Path(d) for d in agents_dirs]
         self.notify = notify or (lambda *_a: None)
         self.max_parallel = max(1, int(max_parallel))
@@ -206,6 +209,19 @@ class TaskEngine:
         rounds = max(1, min(400, int(rounds or prof.rounds)))
         tid = new_id()
         copied = self._copy_inputs(tid, files or [])
+        if prof.name == "reflector":
+            try:
+                from core.tasks.snapshots import stage_reflector_inputs
+                staged = stage_reflector_inputs(
+                    self.store.workdir(tid) / "inputs",
+                    corrections_path=self.training_dir / "corrections.jsonl",
+                    reports_dir=self.reports_dir,
+                )
+                for rel in staged:
+                    if rel not in copied:
+                        copied.append(rel)
+            except Exception as e:
+                self._log(f"[Tasks] reflector snapshot staging failed: {e}")
         not_before = float(not_before or 0)
         task_doc = {
             "id": tid, "agent": prof.name, "title": _title(title or text), "task": text,

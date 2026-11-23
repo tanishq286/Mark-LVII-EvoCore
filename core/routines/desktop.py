@@ -32,6 +32,17 @@ DEFAULT_FOCUSES = [
     "what you know about this person.",
 ]
 
+NIGHTLY_REFLECTION_NAME = "Nightly reflection"
+NIGHTLY_REFLECTION_TIME = "01:00"
+NIGHTLY_REFLECTION_TASK = (
+    "Run tonight's read-only Reflexion review on the staged snapshots in inputs/. "
+    "Read inputs/snapshot_manifest.md first; if new corrections or recent reports exist, "
+    "analyze recurring friction patterns, propose human-reviewable core/prompt.txt "
+    "improvements (never auto-applied), list candidate plugins/skills for the branch-gated "
+    "M4 workflow, and report LoRA dataset health toward the 200-example target. "
+    "If no new data exists, write a concise 'No New Issues to Review' report without inventing findings."
+)
+
 
 def routines_path() -> Path:
     return _BASE / "memory" / "routines.json"
@@ -57,6 +68,42 @@ def seed_defaults(engine, brief_enabled: bool) -> None:
     engine.mark_seeded()
 
 
+def seed_nightly_reflection(engine) -> dict | None:
+    """Seed the daily 01:00 silent reflection routine once without recreating if user deletes it.
+
+    Uses `deliver="silent"` and `quiet=False` so it runs quietly in the background at 01:00
+    without speaking unprompted, even when overnight quiet hours are configured, and uses
+    `system=False` so the user can edit, toggle, or delete it by voice or in the ROUTINES panel.
+    """
+    existing = next(
+        (r for r in engine.list() if r.get("kind") == "task" and r.get("agent") == "reflector"),
+        None,
+    )
+    if existing is not None:
+        if not engine.has_seed_flag("seeded_reflector"):
+            engine.mark_seed_flag("seeded_reflector")
+        return existing
+    if engine.has_seed_flag("seeded_reflector"):
+        return None
+    routine = engine.add(
+        name=NIGHTLY_REFLECTION_NAME,
+        kind="task",
+        text=NIGHTLY_REFLECTION_TASK,
+        trigger={
+            "type": "time",
+            "rule": {"type": "weekly", "time": NIGHTLY_REFLECTION_TIME, "days": [1, 2, 3, 4, 5, 6, 7]},
+        },
+        deliver="silent",
+        agent="reflector",
+        minutes=15,
+        quiet=False,
+        system=False,
+        source="upgrade:m3_nightly_reflection",
+    )
+    engine.mark_seed_flag("seeded_reflector")
+    return routine
+
+
 def attach(host, log=print):
     """Start the routine engine for this app. Returns it."""
     global _engine
@@ -70,6 +117,7 @@ def attach(host, log=print):
             except Exception:
                 brief = True
             seed_defaults(eng, brief)
+            seed_nightly_reflection(eng)
             eng.start()
             _engine = eng
         else:

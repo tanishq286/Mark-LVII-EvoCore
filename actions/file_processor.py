@@ -64,7 +64,7 @@ def _detect_type(path: Path) -> str:
     if ext in archive_exts: return "archive"
     if ext == "pdf":       return "pdf"
     if ext in ("docx", "doc"): return "docx"
-    if ext in ("txt", "md", "rst", "log"): return "text"
+    if ext in ("txt", "md", "rst", "log", "jsonl"): return "text"
     if ext in ("csv", "tsv"): return "csv"
     if ext in ("xlsx", "xls", "ods"): return "excel"
     if ext == "json":      return "json"
@@ -274,6 +274,9 @@ def _process_text_doc(path: Path, file_type: str, action: str,
     content = _read_content()
     if not content.strip():
         return "File appears to be empty."
+
+    if action == "read":
+        return content[:24000]
 
     if action == "word_count":
         words = len(content.split())

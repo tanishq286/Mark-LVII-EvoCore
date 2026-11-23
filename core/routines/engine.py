@@ -133,6 +133,14 @@ class RoutineEngine:
             self._doc["seeded"] = True
             self._save()
 
+    def has_seed_flag(self, name: str) -> bool:
+        return bool(self._doc.get(name))
+
+    def mark_seed_flag(self, name: str) -> None:
+        with self._lock:
+            self._doc[name] = True
+            self._save()
+
     # ── lifecycle ────────────────────────────────────────────────────────────
     def start(self) -> None:
         if self._thread is None:
