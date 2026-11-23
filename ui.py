@@ -258,6 +258,10 @@ class JarvisUI:
     def write_log(self, text: str):
         self._win._log_sig.emit(text)
 
+    def write_log_stream(self, speaker: str, chunk: str, done: bool = False):
+        """Thread-safe: stream live reply transcript chunks into the HUD log immediately."""
+        self._win._log_stream_sig.emit(str(speaker or ""), str(chunk or ""), bool(done))
+
     def wait_for_api_key(self):
         while not self._win._ready:
             time.sleep(0.1)

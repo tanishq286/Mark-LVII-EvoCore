@@ -266,14 +266,15 @@ def _describe_tools(declarations) -> str:
     for d in declarations or ():
         try:
             name = d.get("name") if isinstance(d, dict) else getattr(d, "name", None)
-            desc = (d.get("description") if isinstance(d, dict)
-                    else getattr(d, "description", "")) or ""
+            brief = d.get("brief") if isinstance(d, dict) else getattr(d, "brief", None)
+            desc = brief or (d.get("description") if isinstance(d, dict)
+                             else getattr(d, "description", "")) or ""
         except Exception:
             continue
         if not name:
             continue
         desc = " ".join(str(desc).split())
-        lines.append(f"- {name}: {desc[:150]}" if desc else f"- {name}")
+        lines.append(f"- {name}: {desc[:90]}" if desc else f"- {name}")
     return "\n".join(lines)
 
 
@@ -1375,6 +1376,9 @@ class JarvisLive:
                 self._engine.interrupt()
             except Exception:
                 pass
+        _stream_fn = getattr(self.ui, "write_log_stream", None)
+        if callable(_stream_fn):
+            _stream_fn(self._asst_name, "", True)
         self.ui.write_log("SYS: Interrupted — listening...")
 
     def speak(self, text: str):
@@ -1988,6 +1992,23 @@ class JarvisLive:
     async def _receive_audio(self):
         print("[JARVIS] 👂 Recv started")
         out_buf, in_buf = [], []
+        out_streamed = False
+        _stream_fn = getattr(self.ui, "write_log_stream", None)
+
+        def _flush_user_in():
+            nonlocal in_buf
+            full_in = " ".join(in_buf).strip()
+            if full_in:
+                self._last_out_logged = ""   # new exchange
+                self.ui.write_log(f"You: {full_in}")
+                self._session_log.append(f"User: {full_in}")
+                if self._dashboard:
+                    asyncio.create_task(self._dashboard.broadcast({
+                        "type": "log", "speaker": "user",
+                        "text": full_in,
+                        "ts": datetime.now().isoformat(),
+                    }))
+            in_buf = []
 
         try:
             while True:
@@ -2036,8 +2057,21 @@ class JarvisLive:
                             # out_buf had been flushed and emptied, the repeat
                             # sailed straight back in, which logged the answer
                             # twice AND made the avatar mouth it twice.
-                            if txt and not _is_repeat_chunk(txt, out_buf):
+                            _dup_prev = (
+                                not out_buf
+                                and len(txt) >= _REPEAT_MIN
+                                and self._last_out_logged
+                                and txt in self._last_out_logged
+                            )
+                            if txt and not _dup_prev and not _is_repeat_chunk(txt, out_buf):
+                                if not out_buf and in_buf:
+                                    _flush_user_in()
                                 out_buf.append(txt)
+                                # Stream each chunk straight to the HUD log (~0.6s)
+                                # instead of leaving the screen blank until turn_complete.
+                                if callable(_stream_fn) and not self._interrupted:
+                                    _stream_fn(self._asst_name, txt, False)
+                                    out_streamed = True
                                 # Hand the words to the mouth as they arrive, so
                                 # the avatar can form the consonants the audio
                                 # alone cannot show. Pure string work — it adds
@@ -2054,27 +2088,20 @@ class JarvisLive:
                             if self._turn_done_event:
                                 self._turn_done_event.set()
 
+                            if out_streamed and callable(_stream_fn):
+                                _stream_fn(self._asst_name, "", True)
+
                             # If this turn_complete ends an interrupted response, clear the
                             # flag and skip all further processing for that turn.
                             if self._interrupted:
                                 self._interrupted = False
                                 in_buf  = []
                                 out_buf = []
+                                out_streamed = False
                                 self._visemes.reset()
                                 continue
 
-                            full_in = " ".join(in_buf).strip()
-                            if full_in:
-                                self._last_out_logged = ""   # new exchange
-                                self.ui.write_log(f"You: {full_in}")
-                                self._session_log.append(f"User: {full_in}")
-                                if self._dashboard:
-                                    asyncio.create_task(self._dashboard.broadcast({
-                                        "type": "log", "speaker": "user",
-                                        "text": full_in,
-                                        "ts": datetime.now().isoformat(),
-                                    }))
-                            in_buf = []
+                            _flush_user_in()
 
                             full_out = " ".join(out_buf).strip()
                             # Second line of defence: even if a repeat slips
@@ -2085,7 +2112,8 @@ class JarvisLive:
                                     full_out = ""
                             if full_out:
                                 self._last_out_logged = full_out
-                                self.ui.write_log(f"{self._asst_name}: {full_out}")
+                                if not out_streamed:
+                                    self.ui.write_log(f"{self._asst_name}: {full_out}")
                                 self._session_log.append(f"{self._asst_name}: {full_out}")
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
@@ -2094,6 +2122,7 @@ class JarvisLive:
                                         "ts": datetime.now().isoformat(),
                                     }))
                             out_buf = []
+                            out_streamed = False
 
                             if self._vision_close_pending:
                                 # This turn_complete IS the vision answer — close camera + release busy flag
@@ -3036,6 +3065,13 @@ class JarvisLive:
                         await asyncio.sleep(1)
                     print("[JARVIS] New API key saved — reconnecting...")
                     self._conn_backoff = 3
+                    continue
+
+                # Idle inactivity / GoAway socket rotation — reconnect immediately
+                # with the stored resumption handle instead of sleeping 3 seconds.
+                if "inactivity" in err_str.lower() or "goaway" in err_str.lower():
+                    print("[JARVIS] Live socket rotated (inactivity/GoAway) — reconnecting immediately.")
+                    self._conn_backoff = 0
                     continue
 
                 # Network / timeout errors — log clearly and back off

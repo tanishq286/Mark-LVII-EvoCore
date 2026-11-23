@@ -112,7 +112,7 @@ _PREFERRED_APIS = {
 # detail: DirectSound input passes a callback stream and fails a blocking read,
 # so an earlier version of this probe rejected a microphone that works perfectly
 # in the app. Probe the mode you ship, not the mode that is easier to write.
-_PROBE_SECONDS = {"output": 0.6, "input": 0.35}
+_PROBE_SECONDS = {"output": 0.25, "input": 0.20}
 
 # Cache: {(api_name_or_None, kind): bool}
 _probe_results: dict = {}

@@ -167,20 +167,24 @@ PROVIDER_PREFIX = "prov:"
 # created before their retirement can still use them.
 _LADDERS = {
     FAST: (LIVE,
-           "gemini-3.5-flash-lite", "gemini-flash-lite-latest",
+           "gemini-flash-lite-latest", "gemini-3-flash-preview",
+           "gemini-3.6-flash", "gemini-3.5-flash-lite",
            "gemini-3.1-flash-lite", "gemini-3.5-flash",
-           "gemini-3.6-flash", "gemini-3.8-flash", "gemini-flash-latest",
-           "gemini-3-flash-preview", "gemini-2.5-flash-lite", "gemini-2.5-flash"),
+           "gemini-3.8-flash", "gemini-flash-latest",
+           "gemini-2.5-flash-lite", "gemini-2.5-flash"),
     SMART: (LIVE,
-            "gemini-3.5-flash", "gemini-3.8-flash", "gemini-3.6-flash",
-            "gemini-flash-latest", "gemini-3.7-flash",
-            "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.1-flash-lite",
-            "gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.5-flash-lite"),
+            "gemini-3-flash-preview", "gemini-3.6-flash",
+            "gemini-flash-lite-latest", "gemini-3.5-flash",
+            "gemini-3.8-flash", "gemini-flash-latest", "gemini-3.7-flash",
+            "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+            "gemini-2.5-flash", "gemini-2.5-flash-lite"),
     # Grounded search needs response.candidates[...].grounding_metadata, which a
-    # Live turn does not produce. REST only, and it says so rather than silently
-    # returning an answer with no sources behind it.
-    SEARCH: ("gemini-3.5-flash", "gemini-flash-latest", "gemini-3.8-flash",
-             "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"),
+    # Live turn does not produce. REST only, ordered by measured reliability so
+    # 504-prone aliases do not stall search before a healthy rung answers.
+    SEARCH: ("gemini-3-flash-preview", "gemini-3.6-flash",
+             "gemini-flash-lite-latest", "gemini-3.5-flash",
+             "gemini-flash-latest", "gemini-3.8-flash",
+             "gemini-2.5-flash", "gemini-2.5-flash-lite"),
 }
 
 # The conversation's own model, and ONE careful fallback behind it.
@@ -536,10 +540,10 @@ async def _live_turn(parts: list, system: str, key: str, timeout_s: float) -> st
 
         await asyncio.wait_for(drain(), timeout=timeout_s)
         # The transcription can trail the audio turn by a beat; a short second
-        # drain stops a reply being cut mid-token. chat_takeover learned this
-        # the same way and for the same reason.
+        # drain catches trailing chunks without adding a 1.5s stall to every
+        # one-shot call once text has already arrived.
         try:
-            await asyncio.wait_for(drain(), timeout=1.5)
+            await asyncio.wait_for(drain(), timeout=0.25 if chunks else 0.75)
         except asyncio.TimeoutError:
             pass
         return "".join(chunks).strip()
@@ -701,6 +705,43 @@ def _extract_prompt_text(contents) -> tuple[str, bool]:
     return "\n".join(parts).strip(), has_media
 
 
+def _carries_image(contents) -> bool:
+    """True when the request carries an inline image payload (screenshot/photo)."""
+    if isinstance(contents, str):
+        return False
+    items = contents if isinstance(contents, (list, tuple)) else [contents]
+    for item in items:
+        if isinstance(item, str):
+            continue
+        mime = None
+        blob = getattr(item, "inline_data", None)
+        if blob is not None:
+            mime = getattr(blob, "mime_type", None)
+        elif isinstance(item, dict):
+            inline = item.get("inline_data") or item.get("inlineData")
+            if isinstance(inline, dict):
+                mime = inline.get("mime_type") or inline.get("mimeType")
+        if isinstance(mime, str) and mime.startswith("image/"):
+            return True
+    return False
+
+
+def _provider_supports_vision(model: str) -> bool:
+    """Check whether a `prov:` rung can accept images without wasting a failing call."""
+    try:
+        from memory.config_manager import get_provider_config
+        from providers import registry
+
+        pid = model[len(PROVIDER_PREFIX):]
+        cfg = dict(get_provider_config(pid) or {})
+        if registry.missing_fields(pid, cfg):
+            return False
+        llm = registry.build(pid, cfg)
+        return bool((getattr(llm, "caps", None) or {}).get("vision"))
+    except Exception:
+        return False
+
+
 def _provider_call(model: str, contents, config, timeout_ms: int, tier: str = FAST):
     """One generation through a configured provider. Raises like every other
     rung, so the loop's error classification applies to it unchanged."""
@@ -807,6 +848,17 @@ def call(contents, tier: str = FAST, config=None,
         if not ladder:
             print("[Gemini] nothing on this ladder can read a recording")
             return None
+
+    # When sidecar_first is enabled with a text-only local model (e.g. qwen3:8b),
+    # skip that text-only provider for image requests rather than paying a failed
+    # round trip before Gemini vision handles it.
+    if _carries_image(contents) and any(m.startswith(PROVIDER_PREFIX) for m in ladder):
+        filtered = tuple(
+            m for m in ladder
+            if not m.startswith(PROVIDER_PREFIX) or _provider_supports_vision(m)
+        )
+        if filtered:
+            ladder = filtered
 
     cl = None
     tried = usable_rungs(ladder)

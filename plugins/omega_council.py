@@ -14,6 +14,7 @@ from pathlib import Path
 
 PLUGIN = {
     "name": "omega_council",
+    "brief": "Convene multi-agent peer-critique and 5D engineering/security audits.",
     "description": (
         "JARVIS's Multi-Agent Specialist Council, auto-evolved from the user's omega-system repository. "
         "Convenes up to 13 specialist agents (planner, security, backend, frontend, infrastructure, "

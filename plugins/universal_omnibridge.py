@@ -21,6 +21,7 @@ from core import cross_os as _cross_os
 
 PLUGIN = {
     "name": "universal_omnibridge",
+    "brief": "Run Windows/WSL2 shells, GitHub repos, installed skills, MCP servers, and cloud connectors.",
     "description": (
         "JARVIS's unified cross-OS (Windows 11 + Ubuntu WSL2) execution bridge to all 30 GitHub repositories "
         "(tq-forge, omega-system, horizon, finsolenterprises, recoveryos, OmniRoute, agent-hq, addzify-*), "

@@ -13,6 +13,7 @@ from pathlib import Path
 
 PLUGIN = {
     "name": "autonomous_brain",
+    "brief": "Plan and chain multiple JARVIS tools for complex multi-step goals.",
     "description": (
         "JARVIS's high-intelligence multi-step executive planner and autonomous orchestrator. "
         "Use this when the user gives a complex multi-stage goal that requires planning, chaining "

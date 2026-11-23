@@ -144,6 +144,9 @@ class LogWidget(QTextEdit):
         self._pos     = 0
         self._tag     = "sys"
         self._fmt     = QTextCharFormat()
+        self._stream_active   = False
+        self._stream_has_text = False
+        self._stream_fmt      = QTextCharFormat()
         self._ai_name_lc = "jarvis"   # updated when assistant name changes
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
@@ -154,8 +157,84 @@ class LogWidget(QTextEdit):
 
     def _enqueue(self, text: str):
         self._queue.append(text)
-        if not self._typing:
+        if not self._typing and not self._stream_active:
             self._next()
+
+    def _flush_pending(self):
+        """Finish any in-progress typewriter animation and queued lines immediately
+        before opening a live streaming reply bubble so messages never interleave."""
+        if self._typing:
+            self._tmr.stop()
+            if self._pos < len(self._text):
+                cur = self.textCursor()
+                cur.movePosition(cur.MoveOperation.End)
+                cur.insertText(self._text[self._pos:], self._fmt)
+                self.setTextCursor(cur)
+                self._pos = len(self._text)
+            self._typing = False
+        while self._queue:
+            tag, label, words = self._split(self._queue.pop(0))
+            label_col, text_col = self._colours(tag)
+            self._insert_header(label, label_col)
+            fmt = QTextCharFormat()
+            fmt.setFont(px_font(13))
+            fmt.setForeground(QBrush(text_col))
+            cur = self.textCursor()
+            cur.movePosition(cur.MoveOperation.End)
+            cur.insertText(words, fmt)
+            self.setTextCursor(cur)
+        self.ensureCursorVisible()
+
+    def _insert_header(self, label: str, label_col: QColor):
+        cur = self.textCursor()
+        cur.movePosition(cur.MoveOperation.End)
+        head = QTextBlockFormat()
+        if self.document().isEmpty():
+            cur.setBlockFormat(head)
+        else:
+            head.setTopMargin(9)
+            cur.insertBlock(head)
+        lf = QTextCharFormat()
+        lf.setFont(px_font(10, QFont.Weight.DemiBold, spacing=1.6))
+        lf.setForeground(QBrush(label_col))
+        cur.insertText(label, lf)
+        sf = QTextCharFormat()
+        sf.setFont(px_font(10, mono=True))
+        sf.setForeground(QBrush(qcol(C.TEXT_DIM)))
+        cur.insertText("   " + time.strftime("%H:%M:%S"), sf)
+        body = QTextBlockFormat()
+        body.setTopMargin(1)
+        cur.insertBlock(body)
+        self.setTextCursor(cur)
+
+    def append_stream(self, speaker: str, chunk: str, done: bool = False):
+        """Stream an assistant reply directly into the activity log as chunks arrive
+        (zero waiting for turn_complete). Always invoked on the Qt main thread."""
+        if chunk:
+            if not self._stream_active:
+                self._flush_pending()
+                label = (speaker or self._ai_name_lc or "JARVIS").strip().upper()
+                label_col, text_col = self._colours("ai")
+                self._insert_header(label, label_col)
+                self._stream_fmt = QTextCharFormat()
+                self._stream_fmt.setFont(px_font(13))
+                self._stream_fmt.setForeground(QBrush(text_col))
+                self._stream_active = True
+                self._stream_has_text = False
+            piece = chunk
+            if self._stream_has_text and not piece[0].isspace() and piece[0] not in ".,!?;:'’)]}%":
+                piece = " " + piece
+            cur = self.textCursor()
+            cur.movePosition(cur.MoveOperation.End)
+            cur.insertText(piece, self._stream_fmt)
+            self.setTextCursor(cur)
+            self.ensureCursorVisible()
+            self._stream_has_text = True
+        if done:
+            self._stream_active = False
+            self._stream_has_text = False
+            if self._queue and not self._typing:
+                self._next()
 
     def _split(self, text: str) -> tuple[str, str, str]:
         """(tag, label, words) for one log line."""
@@ -224,13 +303,14 @@ class LogWidget(QTextEdit):
         if self._pos < len(self._text):
             cur = self.textCursor()
             cur.movePosition(cur.MoveOperation.End)
-            cur.insertText(self._text[self._pos], self._fmt)
+            step = min(4, len(self._text) - self._pos)
+            cur.insertText(self._text[self._pos:self._pos + step], self._fmt)
             self.setTextCursor(cur)
             self.ensureCursorVisible()
-            self._pos += 1
+            self._pos += step
         else:
             self._tmr.stop()
-            QTimer.singleShot(20, self._next)
+            QTimer.singleShot(10, self._next)
 
 _FILE_ICONS = {
     "image":   ("🖼", "#00d4ff"), "video":   ("🎬", "#ff6b00"),

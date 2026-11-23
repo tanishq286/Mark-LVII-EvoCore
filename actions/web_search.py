@@ -20,19 +20,26 @@ def _gemini_available() -> bool:
         return time.monotonic() >= _quota_blocked_until
 
 
-def _note_gemini_error(exc: Exception) -> None:
-    """Trip the breaker when the error is a quota / rate-limit rejection."""
+def _trip_gemini_cooldown(seconds: float = _QUOTA_COOLDOWN_SEC, reason: str = "") -> None:
     global _quota_blocked_until
+    with _quota_lock:
+        already = time.monotonic() < _quota_blocked_until
+        _quota_blocked_until = max(_quota_blocked_until, time.monotonic() + seconds)
+    if not already:
+        why = f" ({reason})" if reason else ""
+        print(
+            f"[WebSearch] Gemini grounding paused{why} - skipping it for "
+            f"{int(seconds) // 60} min and serving results from DDG."
+        )
+
+
+def _note_gemini_error(exc: Exception) -> None:
+    """Trip the breaker when the error is a quota / rate-limit / ladder exhaustion."""
     msg = str(exc)
     if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-        with _quota_lock:
-            already = time.monotonic() < _quota_blocked_until
-            _quota_blocked_until = time.monotonic() + _QUOTA_COOLDOWN_SEC
-        if not already:
-            print(
-                "[WebSearch] Gemini grounding quota exhausted — skipping it for "
-                f"{_QUOTA_COOLDOWN_SEC // 60} min and serving results from DDG."
-            )
+        _trip_gemini_cooldown(_QUOTA_COOLDOWN_SEC, "quota exhausted")
+    elif "every Gemini model on the ladder failed" in msg:
+        _trip_gemini_cooldown(300, "all SEARCH rungs unavailable/quota")
 
 
 class _QuotaCooldown(RuntimeError):
@@ -43,7 +50,7 @@ def _log_gemini_failure(context: str, exc: Exception) -> None:
     """Log a Gemini failure — silently when it is just the expected cooldown."""
     if isinstance(exc, _QuotaCooldown):
         return          # announced once when the breaker tripped; not a warning
-    print(f"[WebSearch] \u26a0\ufe0f {context} failed ({exc}) — using DDG instead")
+    print(f"[WebSearch] WARN: {context} failed ({exc}) - using DDG instead")
 
 
 def _run_bounded(fn, timeout: float, label: str = "task"):
@@ -84,12 +91,12 @@ def _gemini_search(query: str) -> str:
 
     from core import gemini
 
-    # Grounded search reads a live page, so it gets a longer deadline than the
-    # default — but it still HAS one, and it still walks the fallback ladder.
+    # Grounded search reads a live page, so it gets a bounded deadline and walks
+    # the healthy SEARCH fallback ladder without stalling 30s on 504 rungs.
     try:
         response = gemini.call(query, tier=gemini.SEARCH,
                                config={"tools": [{"google_search": {}}]},
-                               timeout_ms=30_000)
+                               timeout_ms=12_000)
         if response is None:
             raise RuntimeError("every Gemini model on the ladder failed")
     except Exception as e:
@@ -241,13 +248,22 @@ def _gemini_headlines(n: int = 5) -> tuple[list[str], str]:
 # ── Modes ──────────────────────────────────────────────────────────────────────
 
 def _search(query: str) -> str:
-    """Default search — Gemini grounded, DDG fallback."""
+    """Fast DDG first, Gemini grounded as backup.
+
+    Free-tier Gemini grounding exhausts quickly and 504/429 rungs added 7-30s
+    before DDG ran. Serving DDG first returns live web results in ~1.5-3s with
+    zero quota burn and preserves Gemini grounding for deep research/fallback.
+    """
+    results = _run_bounded(
+        lambda: _ddg_search(query, max_results=6), timeout=4.5, label="DDG search"
+    )
+    if results:
+        return _format_ddg(query, results)
     try:
         return _gemini_search(query)
     except Exception as e:
         _log_gemini_failure("Gemini search", e)
-        results = _ddg_search(query)
-        return _format_ddg(query, results)
+        return _format_ddg(query, [])
 
 
 def _news(query: str) -> str:
@@ -302,14 +318,19 @@ def _research(query: str) -> str:
 
 
 def _price(query: str) -> str:
-    """Product price lookup — searches for current market prices."""
+    """Product price lookup — DDG first, Gemini grounded as backup."""
+    results = _run_bounded(
+        lambda: _ddg_search(f"{query} price buy", max_results=6),
+        timeout=4.5, label="DDG price",
+    )
+    if results:
+        return _format_ddg(query, results)
     price_query = f"current price of {query} — how much does it cost today"
     try:
         return _gemini_search(price_query)
     except Exception as e:
         _log_gemini_failure("Gemini price", e)
-        results = _ddg_search(f"{query} price buy", max_results=6)
-        return _format_ddg(query, results)
+        return _format_ddg(query, [])
 
 
 def _compare(items: list[str], aspect: str) -> str:

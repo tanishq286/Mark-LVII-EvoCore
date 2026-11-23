@@ -21,6 +21,7 @@ from pathlib import Path
 
 PLUGIN = {
     "name": "linux_wsl_mastery",
+    "brief": "Inspect Ubuntu WSL2 codebases, local Ollama GPU models, GOD MODE council, and Linux services.",
     "description": (
         "JARVIS's deep Linux Ubuntu WSL2 mastery, Local RTX 5070 Ti Ollama brain, and GOD MODE engine. "
         "Gives JARVIS complete knowledge and execution control over all 42 local codebases, 17 local "

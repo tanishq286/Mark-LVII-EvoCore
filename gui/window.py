@@ -96,6 +96,7 @@ from gui.widgets import (ArcLogo, CommandFrame, DataRow, HeaderBar, HoloPanel, I
 
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
+    _log_stream_sig = pyqtSignal(str, str, bool)  # (speaker, chunk, done) live streaming reply
     _state_sig      = pyqtSignal(str)
     _content_sig    = pyqtSignal(str, str)   # (title, text) — thread-safe content display
     _codejob_sig    = pyqtSignal(object)     # dev_agent job state — live coding panel
@@ -394,6 +395,7 @@ class MainWindow(QMainWindow):
         self._update_metrics()
 
         self._log_sig.connect(self._log.append_log)
+        self._log_stream_sig.connect(self._log.append_stream)
         self._state_sig.connect(self._apply_state)
         self._content_sig.connect(self._show_content)
         self._codejob_sig.connect(self._show_code_job)

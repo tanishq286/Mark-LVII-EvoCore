@@ -339,6 +339,10 @@ class RoutineEngine:
                 elif ready:
                     self._startup_done.add(r["id"])
                     self._fire(r)
+                    # Fire at most one spoken startup routine per tick so two
+                    # startup prompts do not collide inside the Live session.
+                    if r.get("kind") != "task":
+                        ready = False
                 elif self._mono() - self._session_at > STARTUP_WINDOW:
                     self._startup_done.add(r["id"])
                     self._log(f"[Routines] '{r['name']}' skipped: the assistant was not ready after start")
