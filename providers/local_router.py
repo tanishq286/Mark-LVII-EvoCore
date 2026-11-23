@@ -66,6 +66,11 @@ _CODE_STRONG_RE = re.compile(
     r"\b(?:def |async def |class |lambda\b|import |from [a-z_][a-z0-9_.]* import|"
     r"pytest|unittest|refactor|debug|stack ?trace|regex|sql query|dockerfile|"
     r"git diff|pull request|unit test|code review|bug ?fix|compile error|"
+    r"audit_code|code[- ]?audit|static analysis|\bsast\b|\bcwe-\d+\b|semgrep|codeql|"
+    r"vuln(?:erability)? remediation|"
+    r"patch(?:ing)? (?:the |this )?(?:vuln|cve|sql injection|xss|ssrf|rce|cwe)|"
+    r"fix (?:the |this )?(?:sql injection|xss|csrf|ssrf|cwe-\d+|cve-\d{4}-\d+|hardcoded secret|security bug)|"
+    r"sanitize (?:sql|html|input)|"
     r"python (?:script|function|lambda|code|module|class|snippet|one-liner)|"
     r"bash (?:script|one-liner|command)|shell script|powershell script|"
     r"javascript|typescript|write a (?:script|function|class|plugin|parser|cli))\b|"
@@ -83,7 +88,9 @@ _CODE_WEAK_RE = re.compile(
 # Deep reasoning / analysis / architecture indicators
 _REASONING_STRONG_RE = re.compile(
     r"\b(analy[sz]e|analysis|architect(?:ure|ural)?|trade[- ]?offs?|pros and cons|"
-    r"root[- ]?cause|threat model|step[- ]by[- ]step|deep dive|evaluate|critique|"
+    r"root[- ]?cause|threat model|stride|owasp(?: top 10| asvs)?|mitre att&?ck|"
+    r"defense[- ]?in[- ]?depth|attack surface|log triage|incident triage|"
+    r"step[- ]by[- ]step|deep dive|evaluate|critique|"
     r"compare in depth|design a system|strategic|strategy|synthesi[sz]e|"
     r"security audit|multi[- ]step|first principles|prove that|derive|explain why)\b",
     re.IGNORECASE,

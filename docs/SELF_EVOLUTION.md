@@ -127,3 +127,24 @@ Connect free local stdio or HTTP Model Context Protocol (MCP) servers without we
 | Run real QLoRA training in WSL2 `/home/tanishq/unsloth_env` | `python scripts\wsl_train.py` *(or `python scripts\train_local_lora.py --wsl`)* |
 | Run 20-prompt local model promotion gate | `python scripts\eval_local_model.py --base qwen3:8b --candidate jarvis-custom` |
 | Full Git rollback (via WSL2 git) | `wsl.exe -d Ubuntu-D --cd /mnt/c/Users/tanis/Downloads/Mark-LVII-main/Mark-LVII-main -- git checkout baseline-before-upgrade` |
+
+## 8. Defensive Cybersecurity & Ethical-Hacking Knowledge Vault ($0 Local)
+
+J.A.R.V.I.S. includes a strictly defensive, local-only cybersecurity stack at zero paid API cost:
+
+- **Defensive Inspector Plugin ([plugins/cybersec_defender.py](../plugins/cybersec_defender.py)):**
+  - `audit_ports`: Read-only local listening TCP/UDP socket & process audit (flags unexpected `0.0.0.0` / `::` wildcard exposures).
+  - `audit_posture`: Read-only Windows Defender, Firewall (`Domain`/`Private`/`Public`), and UAC (`EnableLUA`) status check.
+  - `audit_code`: Local folder/file static SAST + secret scanner (redacts all discovered secrets, skips protected credential/memory files, blocks symlink escapes outside target).
+  - `audit_headers`: Loopback-only (`127.0.0.1`, `localhost`, `::1`) HTTP security header inspector; refuses non-loopback targets.
+  - `cve_lookup`: Free OSV.dev (`https://api.osv.dev/v1`) advisory & package vulnerability lookup wrapped in `<<<UNTRUSTED source=cybersec_cve>>>`.
+- **Threat-Modeling & Research Agent ([agents/cybersec_analyst.md](../agents/cybersec_analyst.md)):**
+  - Runs in isolated `mode: research` with `search_web, fetch_page, file_processor` only (strictly omitting `recall_memory` and all acting/write tools) for STRIDE threat modeling, OWASP Top 10/ASVS code reviews, log triage, and authorized CTF/lab study.
+  - Outputs evidence-cited Markdown reports with `Severity` (`Critical`/`High`/`Medium`/`Low`), `Root Cause`, and `Remediation` steps for `reports/`.
+- **Local Specialist Routing ([providers/local_router.py](../providers/local_router.py)):**
+  - Code-audit, CWE, SAST, and vulnerability-remediation prompts automatically route to `qwen2.5-coder:14b` (`coding`).
+  - STRIDE threat modeling, OWASP ASVS architecture reviews, MITRE ATT&CK, and log-triage prompts route to `qwen2.5:14b` / `gemma4:12b` (`reasoning`) under the 12 GB VRAM guard.
+- **Offline Cybersecurity Reference Vault (`knowledge/cybersec/`):**
+  - Store personal Markdown/text study notes (OWASP Cheat Sheets, MITRE ATT&CK defensive mitigations, and authorized HTB/TryHackMe/Juice Shop lab writeups) in git-ignored `knowledge/cybersec/`.
+  - Index offline via `knowledge_rag(mode="index")` (`nomic-embed-text:latest` + SQLite cosine vectors) and query anytime with `knowledge_rag(mode="search", query="...")`.
+
