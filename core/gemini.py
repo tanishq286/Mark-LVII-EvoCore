@@ -706,9 +706,10 @@ def _provider_call(model: str, contents, config, timeout_ms: int):
         messages, tools=None,
         timeout=max(MIN_TIMEOUT_MS, int(timeout_ms)) / 1000.0,
         temperature=temperature)
-    if not (text_out or "").strip():
+    cleaned = _strip_thinking(text_out or "")
+    if not cleaned:
         raise RuntimeError("the provider returned an empty answer")
-    return _Reply(text_out)
+    return _Reply(cleaned)
 
 
 def call(contents, tier: str = FAST, config=None,
@@ -815,9 +816,13 @@ def call(contents, tier: str = FAST, config=None,
     return None
 
 
+_OLLAMA_CHAT_URL = "http://127.0.0.1:11434/api/chat"
+
+
 def _local_ollama_fallback(contents, tier: str, timeout_ms: int):
-    """Zero-config local RTX 5070 Ti Ollama fallback (jarvis-pro, claude-fable-5-2,
-    qwen2.5-coder:14b, gemma4:e2b) when cloud rungs are exhausted or offline."""
+    """Zero-config local RTX 5070 Ti Ollama fallback when cloud rungs are
+    exhausted or offline. Uses qwen2.5-coder:14b first for SMART/coding calls
+    and qwen3:8b first for FAST daily side calls."""
     import urllib.request
     prompt_parts = []
     if isinstance(contents, str):
@@ -830,9 +835,9 @@ def _local_ollama_fallback(contents, tier: str, timeout_ms: int):
     if not prompt:
         return None
     models = (
-        ("jarvis-pro:latest", "claude-fable-5-2:latest", "qwen2.5-coder:14b", "gemma4:e2b")
+        ("qwen2.5-coder:14b", "qwen3:8b", "jarvis-pro:latest", "claude-fable-5-2:latest", "gemma4:e2b")
         if tier == SMART
-        else ("gemma4:e2b", "qwen3:4b", "jarvis-pro:latest")
+        else ("qwen3:8b", "gemma4:e2b", "qwen3:4b", "jarvis-pro:latest")
     )
     timeout_s = max(5.0, min(60.0, timeout_ms / 1000.0))
     for m in models:
@@ -846,20 +851,35 @@ def _local_ollama_fallback(contents, tier: str, timeout_ms: int):
                 "stream": False,
             }).encode("utf-8")
             req = urllib.request.Request(
-                "http://127.0.0.1:11434/api/chat",
+                _OLLAMA_CHAT_URL,
                 data=payload,
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
-                txt = str((data.get("message") or {}).get("content") or "").strip()
+                raw_txt = str((data.get("message") or {}).get("content") or "")
+                txt = _strip_thinking(raw_txt)
                 if txt:
                     print(f"[Gemini] Local RTX 5070 Ti Ollama fallback answered via {m}")
-                    return _TextResp(txt)
+                    return _Reply(txt)
         except Exception:
             continue
     return None
+
+
+_THINK_OPEN_RE = re.compile(r"(?is)<(?:think|thinking|reasoning)>.*$")
+
+
+def _strip_thinking(raw: str) -> str:
+    """Remove inline <think>/<thinking>/<reasoning> blocks (including any
+    unterminated block) so reasoning models never leak chain-of-thought into
+    one-shot tool answers or spoken responses."""
+    if not raw:
+        return ""
+    cleaned = _THINK_RE.sub("", raw)
+    cleaned = _THINK_OPEN_RE.sub("", cleaned)
+    return cleaned.strip()
 
 
 def text(contents, tier: str = FAST, config=None,
@@ -869,7 +889,7 @@ def text(contents, tier: str = FAST, config=None,
                 timeout_ms=timeout_ms, key=key)
     if resp is None:
         return default
-    return (getattr(resp, "text", None) or "").strip() or default
+    return _strip_thinking(getattr(resp, "text", None) or "") or default
 
 
 def as_json(contents, tier: str = FAST, config=None,
@@ -888,7 +908,7 @@ def as_json(contents, tier: str = FAST, config=None,
 
 
 _MISSING = object()
-_THINK_RE = re.compile(r"(?is)<think(?:ing)?>.*?</think(?:ing)?>")
+_THINK_RE = re.compile(r"(?is)<(?:think|thinking|reasoning)>.*?</(?:think|thinking|reasoning)>")
 _FENCE_RE = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.S)
 
 

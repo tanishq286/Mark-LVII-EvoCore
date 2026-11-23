@@ -496,7 +496,8 @@ async def test_failures_name_the_part():
 
     logs2: list[str] = []
     from providers.llm_openai import OpenAICompatLLM
-    dead = OpenAICompatLLM({"base_url": "http://127.0.0.1:9", "model": "m"})
+    dead = OpenAICompatLLM({"base_url": "http://127.0.0.1:9", "model": "m",
+                            "timeout": 2.0})
     said2 = await run(PipelineEngine(dead, config=Cfg(), log=logs2.append))
     check("an unreachable model is reported as the MODEL",
           any("the language model failed" in l for l in logs2), str(logs2))
@@ -1074,6 +1075,69 @@ def test_panel_settings_survive():
             cfg_file.unlink(missing_ok=True)
 
 
+def test_gemini_oneshot_think_and_ollama_fallback():
+    """Regression test for core/gemini.py:
+    1) _local_ollama_fallback() returns _Reply (previously raised NameError: _TextResp).
+    2) One-shot replies strip <think>/<thinking>/<reasoning> blocks cleanly.
+    3) Think-only replies are treated as empty rather than returning blank text.
+    """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    import core.gemini as g
+
+    section("[20] One-shot <think> stripping & local Ollama fallback (_Reply)")
+
+    check("strips <think> block",
+          g._strip_thinking("<think>step 1</think>Final answer.") == "Final answer.")
+    check("strips <thinking> and <reasoning> blocks",
+          g._strip_thinking("<thinking>a</thinking>OK<reasoning>b</reasoning>") == "OK")
+    check("drops unterminated <think> block",
+          g._strip_thinking("Keep.<think>truncated...") == "Keep.")
+    check("think-only reply becomes empty string",
+          g._strip_thinking("<think>only thoughts</think>") == "")
+
+    responses = [
+        {"message": {"content": "<think>only thoughts</think>"}},
+        {"message": {"content": "<think>checking</think>42"}},
+    ]
+    seen_models: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            seen_models.append(body.get("model", ""))
+            reply = responses.pop(0) if responses else {"message": {"content": "ok"}}
+            raw = json.dumps(reply).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, *_a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    port = srv.server_address[1]
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    orig_url = g._OLLAMA_CHAT_URL
+    try:
+        g._OLLAMA_CHAT_URL = f"http://127.0.0.1:{port}/api/chat"
+        rep = g._local_ollama_fallback("what is 6*7?", g.SMART, 5000)
+        check("returns _Reply instance (no _TextResp NameError)",
+              isinstance(rep, g._Reply), repr(type(rep)))
+        check("skips think-only model and strips <think> from answer",
+              rep is not None and rep.text == "42", repr(getattr(rep, "text", None)))
+        check("SMART fallback tries qwen2.5-coder:14b first, then qwen3:8b",
+              seen_models[:2] == ["qwen2.5-coder:14b", "qwen3:8b"], str(seen_models))
+    finally:
+        g._OLLAMA_CHAT_URL = orig_url
+        srv.shutdown()
+        srv.server_close()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 async def main() -> int:
     print("providers self-test")
@@ -1096,6 +1160,7 @@ async def main() -> int:
     test_voice_folder_is_writable()
     test_a_chosen_voice_downloads_itself()
     test_panel_settings_survive()
+    test_gemini_oneshot_think_and_ollama_fallback()
 
     print(f"\n{'=' * 56}")
     print(f"{_ok} passed, {_fail} failed")
