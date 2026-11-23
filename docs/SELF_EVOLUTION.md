@@ -97,3 +97,18 @@ Drop private `.md`, `.txt`, `.py`, `.json`, `.csv`, or `.pdf` files into the git
 2. **Index incrementally:** Ask JARVIS *"index my knowledge vault"* (`knowledge_rag(mode="index")`) — unchanged files are skipped by SHA-256 hash, modified files are re-embedded, and deleted files are pruned from `knowledge/.rag_index.sqlite`.
 3. **Query with citations:** Ask JARVIS *"search my knowledge vault for ..."* (`knowledge_rag(mode="search", query="...", top_k=5)`) — returns exact `knowledge/<rel_path>:L<start>-L<end>` citations wrapped inside `<<<UNTRUSTED source=knowledge_rag>>>` markers.
 4. **Check status:** Ask *"check knowledge vault stats"* (`knowledge_rag(mode="stats")`).
+
+---
+
+## 6. Safe Local MCP Tool Bridge (`plugins/mcp_bridge.py` — Milestone 8)
+
+Connect free local stdio or HTTP Model Context Protocol (MCP) servers without weakening Mark-LVII's security boundaries:
+
+1. **Create your private server config (git-ignored):**
+   ```bash
+   cp config/mcp_servers.example.json config/mcp_servers.json
+   ```
+2. **Enable & allowlist explicitly:** Edit `config/mcp_servers.json` to set `"enabled": true` on a trusted local server and list ONLY the exact tools JARVIS may call inside `"allowed_tools"`. Any server left disabled or any tool omitted from `"allowed_tools"` is **denied by default**.
+3. **Mutating-tool confirmation gate:** Tools listed in `"mutating_tools"` (or starting with mutating verbs such as `write_`, `delete_`, `remove_`, `create_`, `update_`, `exec_`, `run_`, `send_`, `post_`) never execute silently — they pause behind Mark-LVII's on-screen `core/confirm.py` CONFIRM/CANCEL banner (and are blocked when `player=None`).
+4. **Untrusted-content isolation & timeouts:** Every MCP tool response is length-capped and wrapped inside `<<<UNTRUSTED source=mcp...>>>`, and stdio child processes are terminated cleanly on timeout with zero leaked processes.
+5. **Inspect & invoke:** Use `mcp_bridge(mode="list_servers")`, `mcp_bridge(mode="list_tools", server="<name>")`, `mcp_bridge(mode="call_tool", server="<name>", tool="<tool>", arguments={...})`, or `mcp_bridge(mode="stats")`.

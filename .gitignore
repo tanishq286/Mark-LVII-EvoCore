@@ -8,6 +8,8 @@
 # Note: gitignore does NOT strip inline # comments — keep patterns on clean lines!
 # your Gemini API key, plus per-plugin credentials
 config/api_keys.json
+# local private MCP server definitions (template tracked in config/mcp_servers.example.json)
+config/mcp_servers.json
 # the dashboard's TLS private key and certificate
 config/certs/
 # a LINKED WhatsApp session — committing it hands somebody your WhatsApp account

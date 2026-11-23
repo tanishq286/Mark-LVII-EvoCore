@@ -1,0 +1,40 @@
+{
+  "_comment": "Copy to config/mcp_servers.json (git-ignored) and set enabled=true only for servers you trust. Tools NOT listed in allowed_tools are denied by default.",
+  "servers": {
+    "local_filesystem": {
+      "enabled": false,
+      "transport": "stdio",
+      "command": [
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/home/tanishq/Mark-LVII/knowledge"
+      ],
+      "allowed_tools": [
+        "read_file",
+        "list_directory",
+        "search_files"
+      ],
+      "mutating_tools": [
+        "write_file",
+        "delete_file"
+      ],
+      "timeout_sec": 15
+    },
+    "local_http_mcp": {
+      "enabled": false,
+      "transport": "http",
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": {},
+      "allowed_tools": [
+        "health_check",
+        "query_notes"
+      ],
+      "mutating_tools": [
+        "create_note",
+        "delete_note"
+      ],
+      "timeout_sec": 15
+    }
+  }
+}
