@@ -32,6 +32,8 @@ CATEGORY_CODING = "coding"
 CATEGORY_REASONING = "reasoning"
 
 DEFAULT_OLLAMA_ORIGIN = "http://127.0.0.1:11434"
+FAST_KEEP_ALIVE = "30m"
+HEAVY_KEEP_ALIVE = "5m"
 
 # Specialist preference ladders (first installed model wins; always falls back to qwen3:8b)
 SPECIALIST_LADDERS: dict[str, tuple[str, ...]] = {
@@ -370,6 +372,11 @@ def ensure_vram_ready(
     }
 
 
+def fast_keep_alive_for(category: str) -> str:
+    """Keep fast daily model (qwen3:8b) warm for 30m; keep heavy 14B models at 5m."""
+    return FAST_KEEP_ALIVE if category == CATEGORY_FAST else HEAVY_KEEP_ALIVE
+
+
 def complete_local(
     prompt: str,
     *,
@@ -380,9 +387,15 @@ def complete_local(
     timeout_s: float = 60.0,
     available_models: Iterable[str] | None = None,
     force_category: str | None = None,
-    keep_alive: str | int = "5m",
+    keep_alive: str | int | None = None,
+    allow_thinking: bool | None = None,
 ) -> dict | None:
-    """Route `prompt` to the best installed local Ollama specialist, guard VRAM, and strip `<think>`."""
+    """Route `prompt` to the best installed local Ollama specialist, guard VRAM, and strip `<think>`.
+
+    Disables hidden thinking (`think: False`) on fast/chat/coding routes so `qwen3:8b`
+    answers in ~0.2-0.5s instead of 2-13s, while keeping full thinking enabled for
+    explicit deep `reasoning` routes.
+    """
     origin = normalize_ollama_origin(chat_url or ollama_origin)
     endpoint = chat_url or f"{origin}/api/chat"
     decision, ladder = route_prompt(
@@ -392,6 +405,8 @@ def complete_local(
         available_models=available_models,
         force_category=force_category,
     )
+    resolved_keep_alive = fast_keep_alive_for(decision.category) if keep_alive is None else keep_alive
+    use_thinking = (decision.category == CATEGORY_REASONING) if allow_thinking is None else bool(allow_thinking)
 
     messages: list[dict[str, str]] = []
     if system:
@@ -400,12 +415,15 @@ def complete_local(
 
     for model in ladder:
         vram_info = ensure_vram_ready(model, origin, timeout=min(5.0, timeout_s))
-        payload = json.dumps({
+        body: dict = {
             "model": model,
             "messages": messages,
             "stream": False,
-            "keep_alive": keep_alive,
-        }).encode("utf-8")
+            "keep_alive": resolved_keep_alive,
+        }
+        if not use_thinking:
+            body["think"] = False
+        payload = json.dumps(body).encode("utf-8")
         req = Request(
             endpoint,
             data=payload,
@@ -425,6 +443,8 @@ def complete_local(
                 "model": model,
                 "category": decision.category,
                 "reason": decision.reason,
+                "thinking_enabled": use_thinking,
+                "keep_alive": resolved_keep_alive,
                 "unloaded": vram_info.get("unloaded") or [],
             }
     return None

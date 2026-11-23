@@ -732,6 +732,8 @@ def _provider_call(model: str, contents, config, timeout_ms: int, tier: str = FA
                 chosen = decision.selected_model or str(cfg.get("model") or "qwen3:8b")
                 local_router.ensure_vram_ready(chosen, origin)
                 cfg["model"] = chosen
+                cfg["keep_alive"] = local_router.fast_keep_alive_for(decision.category)
+                cfg["allow_thinking"] = (decision.category == local_router.CATEGORY_REASONING)
         except Exception:
             pass
 

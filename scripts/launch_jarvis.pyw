@@ -31,7 +31,11 @@ ROOT: Path = Path(__file__).resolve().parent.parent
 MAIN_SCRIPT: Path = ROOT / "main.py"
 STARTUP_LOG: Path = ROOT / "memory" / "startup.log"
 OLLAMA_TAGS_URL: str = "http://127.0.0.1:11434/api/tags"
+OLLAMA_PS_URL: str = "http://127.0.0.1:11434/api/ps"
+OLLAMA_GENERATE_URL: str = "http://127.0.0.1:11434/api/generate"
 OLLAMA_WAIT_SEC: float = 3.0
+WARMUP_MODEL: str = "qwen3:8b"
+WARMUP_KEEP_ALIVE: str = "30m"
 
 
 def _log(message: str) -> None:
@@ -186,6 +190,51 @@ def ensure_ollama_running(
     }
 
 
+def trigger_background_warmup(pythonw: Path, *, dry_run: bool = False) -> dict:
+    """Optionally warm `qwen3:8b` (`keep_alive: '30m'`) in a detached background ping
+    ONLY when Ollama is reachable and no LLM is already loaded in VRAM. Never blocks launch."""
+    try:
+        with urlopen(OLLAMA_PS_URL, timeout=1.2) as resp:
+            active = json.loads(resp.read().decode("utf-8")).get("models") or []
+    except Exception:
+        return {"triggered": False, "reason": "ollama /api/ps unavailable"}
+
+    active_names = [str(m.get("name") or "") for m in active if isinstance(m, dict)]
+    if any(n.lower() == WARMUP_MODEL.lower() for n in active_names):
+        return {"triggered": False, "reason": f"{WARMUP_MODEL} already warm in VRAM"}
+    # Do not evict an active 14B/12B model if the user is already running one
+    if any("embed" not in n.lower() for n in active_names):
+        return {"triggered": False, "reason": f"another LLM already active ({active_names})"}
+    if dry_run:
+        return {"triggered": False, "reason": f"would warm {WARMUP_MODEL} ({WARMUP_KEEP_ALIVE}) in background"}
+
+    ping_code = (
+        "import json; from urllib.request import Request, urlopen; "
+        f"req=Request({OLLAMA_GENERATE_URL!r}, "
+        f"data=json.dumps({{'model':{WARMUP_MODEL!r},'keep_alive':{WARMUP_KEEP_ALIVE!r}}}).encode('utf-8'), "
+        "headers={'Content-Type':'application/json'}, method='POST'); "
+        "urlopen(req, timeout=30).read()"
+    )
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+        )
+    try:
+        subprocess.Popen(
+            [str(pythonw), "-c", ping_code],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            creationflags=creationflags,
+        )
+        return {"triggered": True, "reason": f"background warm-up sent for {WARMUP_MODEL} ({WARMUP_KEEP_ALIVE})"}
+    except Exception as exc:
+        return {"triggered": False, "reason": f"warm-up spawn skipped: {exc}"}
+
+
 def launch_jarvis(*, dry_run: bool = False) -> dict:
     """Run single-instance guard, Ollama check, and launch `main.py` (or report plan in dry-run)."""
     pythonw = resolve_pythonw()
@@ -215,6 +264,11 @@ def launch_jarvis(*, dry_run: bool = False) -> dict:
         }
 
     ollama_info = ensure_ollama_running(dry_run=dry_run)
+    warmup_info = (
+        trigger_background_warmup(pythonw, dry_run=dry_run)
+        if ollama_info.get("reachable")
+        else {"triggered": False, "reason": "ollama offline"}
+    )
     if dry_run:
         return {
             "action": "dry_run_ready",
@@ -224,9 +278,10 @@ def launch_jarvis(*, dry_run: bool = False) -> dict:
             "workdir": str(ROOT),
             "startup_log": str(STARTUP_LOG),
             "ollama": ollama_info,
+            "warmup": warmup_info,
         }
 
-    _log(f"Starting Mark-LVII via {pythonw.name} ({ollama_info['note']})")
+    _log(f"Starting Mark-LVII via {pythonw.name} ({ollama_info['note']}; {warmup_info['reason']})")
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     try:
         STARTUP_LOG.parent.mkdir(parents=True, exist_ok=True)
