@@ -1,0 +1,24 @@
+# ── Mark-LVII Isolated Local QLoRA Training Dependencies ─────────────────────
+# DO NOT install these into Mark-LVII/.venv or add them to requirements.txt.
+#
+# Primary environment on this machine (already verified with PyTorch 2.14+cu130
+# and Unsloth on NVIDIA RTX 5070 Ti 12 GB VRAM):
+#   /home/tanishq/unsloth_env/bin/python scripts/train_local_lora.py --dry-run
+#
+# Fallback isolated training venv (only if setting up on a fresh machine):
+#   python3 -m venv .venv-train
+#   .venv-train/bin/pip install --upgrade pip
+#   .venv-train/bin/pip install -r scripts/requirements-train.txt
+
+torch>=2.5.0
+unsloth>=2025.3
+unsloth-zoo>=2025.3
+transformers>=4.49.0
+trl>=0.15.0
+peft>=0.14.0
+accelerate>=1.3.0
+bitsandbytes>=0.45.0
+datasets>=3.2.0
+sentencepiece>=0.2.0
+protobuf>=4.25.0
+gguf>=0.10.0

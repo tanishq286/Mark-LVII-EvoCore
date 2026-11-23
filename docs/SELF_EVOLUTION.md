@@ -69,3 +69,20 @@ User Correction / Friction
 | Discard a rejected skill branch | `git branch -D skill/<slug>-<timestamp>` |
 | Run full provider + upgrade checks | `.venv/bin/python -u -m providers._tests && .venv/bin/python -u scripts/verify_m4_skill_workflow.py` |
 | Roll back to pre-upgrade baseline | `git checkout baseline-before-upgrade` |
+
+---
+
+## 4. Isolated Local QLoRA Fine-Tuning & Promotion Gate (Milestone 5)
+
+Weight fine-tuning stays **strictly isolated** in `/home/tanishq/unsloth_env` (never adding PyTorch/Unsloth to `requirements.txt` or `Mark-LVII/.venv`), requires **>= 200 curated unique corrections** by default, and exports to a separate candidate model (`jarvis-custom`) so `qwen3:8b` is never overwritten.
+
+| Stage | Command |
+|---|---|
+| Dry-run training plan (check CUDA, VRAM headroom, dataset floor & `Modelfile`) | `/home/tanishq/unsloth_env/bin/python scripts/train_local_lora.py --dry-run` |
+| Run 4-bit QLoRA training + GGUF (`q4_k_m`) export (once >= 200 examples collected) | `/home/tanishq/unsloth_env/bin/python scripts/train_local_lora.py` |
+| Register candidate model in Ollama (keeps `qwen3:8b` untouched) | `ollama create jarvis-custom -f training_data/exports/<run_tag>/gguf/Modelfile` |
+| Dry-run the 20-prompt eval benchmark & promotion gate offline | `.venv/bin/python scripts/eval_local_model.py --dry-run` |
+| Side-by-side live promotion gate (`qwen3:8b` vs `jarvis-custom`) | `.venv/bin/python scripts/eval_local_model.py --base qwen3:8b --candidate jarvis-custom` |
+| Promote candidate (ONLY if gate outputs `PROMOTE`, exit `0`) | In HUD `⚙ → ENGINE & PROVIDERS`, set Ollama model to `jarvis-custom` |
+| Instant model rollback (if any issue appears) | Switch Ollama model back to `qwen3:8b` (or `ollama rm jarvis-custom`) |
+| Full repository rollback | `git checkout baseline-before-upgrade` |
