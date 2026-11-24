@@ -52,15 +52,19 @@ CONFIRM = "CONFIRM"
 LOCKED = "LOCKED"
 
 TOOL_RISK_POLICY: dict[str | tuple[str, str], str] = {
-    # LOCKED: security-sensitive decryption / unhide / evolution approval / rollback
+    # LOCKED: security-sensitive decryption / unhide / evolution approval / rollback / voice lock / form autofill
     ("file_vault", "decrypt"): LOCKED,
     ("file_vault", "unlock_folder"): LOCKED,
     ("file_vault", "unhide"): LOCKED,
     ("evolution_control", "approve_upgrade"): LOCKED,
     ("evolution_control", "rollback_last"): LOCKED,
+    ("voice_lock", "clear"): LOCKED,
+    ("smart_form_filler", "fill_form"): LOCKED,
     # CONFIRM: external comms, power/network state, destructive deletion, active scans/merges
     "send_message": CONFIRM,
     ("send_message", "send"): CONFIRM,
+    ("send_message", "media"): CONFIRM,
+    ("send_message", "call"): CONFIRM,
     ("computer_settings", "restart"): CONFIRM,
     ("computer_settings", "shutdown"): CONFIRM,
     ("computer_settings", "hibernate"): CONFIRM,
@@ -71,6 +75,8 @@ TOOL_RISK_POLICY: dict[str | tuple[str, str], str] = {
     ("file_controller", "delete"): CONFIRM,
     ("file_controller", "delete_file"): CONFIRM,
     ("cybersec_defender", "defender_quick_scan"): CONFIRM,
+    ("system_cleaner", "clean"): CONFIRM,
+    ("email_automator", "send"): CONFIRM,
     ("evolution_control", "self_heal_merge"): CONFIRM,
     ("evolution_control", "self_heal"): CONFIRM,
 }
@@ -391,6 +397,23 @@ def enforce_gate(
     tier = classify_risk(tool_name, action)
     if tier == SAFE:
         return run_fn()
+
+    t_norm = str(tool_name or "").strip().lower()
+    a_norm = str(action or "").strip().lower()
+    if (
+        tier == LOCKED
+        or (t_norm == "computer_settings" and a_norm in ("restart", "shutdown", "hibernate", "sign_out", "schedule_shutdown", "schedule_restart"))
+        or (t_norm == "evolution_control" and a_norm in ("approve_upgrade", "rollback_last", "self_heal", "self_heal_merge"))
+    ):
+        try:
+            from plugins import voice_lock as _vl
+            if _vl.is_enrolled() and _vl.is_locked():
+                return (
+                    "[VOICE_LOCKED] Biometric voice lock is active for high-risk actions. "
+                    "Verify your voiceprint via voice_lock(action='verify') before retrying."
+                )
+        except Exception:
+            pass
 
     from core import confirm
 

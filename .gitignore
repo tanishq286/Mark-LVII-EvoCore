@@ -37,6 +37,10 @@ memory/evolution_digest.json
 memory/evolution_commits.json
 memory/vault_index.json
 memory/autonomous_missions.json
+memory/voiceprints.json
+memory/project_profiles.json
+memory/form_profile.jvault
+memory/.spotify_cache
 memory/*.log
 memory/*.db
 memory/*.sqlite
@@ -44,6 +48,7 @@ memory/*.sqlite-wal
 memory/*.sqlite-shm
 .pytest_cache/
 training_data/
+generated_sites/
 knowledge/
 backups/
 reports/

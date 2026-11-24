@@ -90,12 +90,21 @@ def next_fire(rule: dict, after: datetime) -> datetime | None:
             if start <= cand <= end and cand > after:
                 return cand
         return None
+    if kind == "cron":
+        expr = str(rule.get("expr") or "").strip()
+        if not expr:
+            return None
+        from croniter import croniter
+        nxt = croniter(expr, after).get_next(datetime)
+        return nxt.replace(tzinfo=after.tzinfo) if (after.tzinfo and nxt.tzinfo is None) else nxt
     return None
 
 
 def describe_rule(rule: dict, tz=None) -> str:
     """`tz` is the clock a one-off is shown in; None = this machine's."""
     kind = rule.get("type")
+    if kind == "cron":
+        return f"cron '{rule.get('expr', '')}'"
     days = list(rule.get("days") or ALL_DAYS)
     on = "" if days == ALL_DAYS else " on days " + ",".join(map(str, days)) + " (1=Mon)"
     if kind == "once":
@@ -112,6 +121,12 @@ def describe_rule(rule: dict, tz=None) -> str:
 def rule_from_args(a: dict, tz) -> dict:
     """A tool call's WHEN fields as a rule. Raises ValueError with a sentence the
     model can pass on."""
+    cron_expr = str(a.get("cron") or "").strip()
+    if cron_expr:
+        from croniter import croniter
+        if not croniter.is_valid(cron_expr):
+            raise ValueError(f"invalid cron expression: '{cron_expr}'")
+        return {"type": "cron", "expr": cron_expr}
     days = parse_days(a.get("days"))
     time_of_day = a.get("time") or a.get("daily")
     if a.get("every_minutes"):

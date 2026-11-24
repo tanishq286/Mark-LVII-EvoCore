@@ -118,6 +118,8 @@ class MainWindow(QMainWindow):
     _confirm_hide_sig = pyqtSignal()
     _choice_sig     = pyqtSignal(str, str, list)  # (title, detail, options) — multi-option gate
     _choice_hide_sig = pyqtSignal()
+    _avatar_overlay_sig = pyqtSignal(bool)
+    _avatar_gesture_sig = pyqtSignal(str, str)
     _wake_dl_sig    = pyqtSignal(bool, str)  # wake-word install finished (ok, message)
     _quiz_sig       = pyqtSignal(str, object, object)  # (topic, questions, grader)
     _quiz_hide_sig  = pyqtSignal()
@@ -154,6 +156,7 @@ class MainWindow(QMainWindow):
         self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
         self._choice_overlay   = None   # live ChoiceBanner, if one is on screen
+        self._avatar_overlay   = None   # standalone transparent 2D avatar overlay
         self.get_plugins       = None   # callable: () -> list[dict], set by JarvisLive
         self.get_plugin_settings = None # callable: () -> list[dict] settings schemas, set by JarvisLive
         self.on_wake_toggle    = None   # callable: (enable: bool) -> str, set by JarvisLive
@@ -412,6 +415,8 @@ class MainWindow(QMainWindow):
         self._confirm_hide_sig.connect(self._hide_confirm_banner)
         self._choice_sig.connect(self._show_choice_banner)
         self._choice_hide_sig.connect(self._hide_choice_banner)
+        self._avatar_overlay_sig.connect(self._on_avatar_overlay)
+        self._avatar_gesture_sig.connect(self._on_avatar_gesture)
         self._cam_stream_sig.connect(self._on_cam_stream)
         self._cam_frame_sig.connect(self._on_cam_frame)
         self._wake_btns_sig.connect(self._refresh_wake_btns)
@@ -2909,6 +2914,26 @@ class MainWindow(QMainWindow):
             resolve_choice(idx if idx >= 0 else None)
         except Exception as e:
             self._log.append_log(f"ERR: Choice failed — {e}")
+
+    def _on_avatar_overlay(self, visible: bool):
+        if visible:
+            if self._avatar_overlay is None:
+                from gui.avatar_overlay import AvatarOverlayWindow
+                self._avatar_overlay = AvatarOverlayWindow(parent=None)
+            self._avatar_overlay.show()
+            self._avatar_overlay.raise_()
+        else:
+            if self._avatar_overlay is not None:
+                self._avatar_overlay.hide()
+
+    def _on_avatar_gesture(self, cue: str, text: str = ""):
+        try:
+            if getattr(self, "hud", None) is not None and getattr(self.hud, "_avatar", None) is not None:
+                self.hud._avatar.trigger_gesture(cue)
+        except Exception:
+            pass
+        if self._avatar_overlay is not None:
+            self._avatar_overlay.trigger_gesture(cue, text)
 
     def _open_plugin_manager(self):
         plugins = self.get_plugins() if self.get_plugins else []

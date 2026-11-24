@@ -17,7 +17,7 @@ def _trigger(a: dict) -> dict | None:
     if on == "idle":
         return {"type": "idle", "minutes": int(a.get("idle_minutes") or 15),
                 "cooldown": int(a.get("cooldown_minutes") or 20)}
-    if any(a.get(k) for k in ("at", "time", "monthly_day", "every_minutes")):
+    if any(a.get(k) for k in ("at", "time", "monthly_day", "every_minutes", "cron")):
         return {"type": "time", "rule": R.rule_from_args(a, datetime.now().astimezone().tzinfo)}
     return None
 
@@ -149,6 +149,7 @@ TOOL = {
             "monthly_day": {"type": "INTEGER"},
             "every_minutes": {"type": "INTEGER"},
             "between": {"type": "STRING"},
+            "cron": {"type": "STRING", "description": "Standard 5-field cron expression (e.g. '0 9 * * 1-5')."},
             "on": {"type": "STRING", "enum": ["startup", "idle"]},
             "idle_minutes": {"type": "INTEGER"},
             "cooldown_minutes": {"type": "INTEGER"},

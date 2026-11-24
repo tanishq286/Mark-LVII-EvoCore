@@ -44,7 +44,9 @@ TWO OPTIONAL HOOKS, for a host whose clock is not this machine's
 """
 from __future__ import annotations
 
+import json
 import secrets
+import sqlite3
 import threading
 import time
 import traceback
@@ -71,11 +73,13 @@ class RoutineEngine:
     def __init__(self, path, host, clock=time.time, mono=time.monotonic, tick: float = 5.0,
                  log=print, autostart: bool = True, tz_fn=None, grace_fn=None):
         self.path = Path(path)
+        self.db_path = self.path.with_suffix(".sqlite")
         self.host = host
         self._tz_fn, self._grace_fn = tz_fn, grace_fn
         self._firing = threading.local()
         self._clock, self._mono, self._tick, self._log = clock, mono, tick, log
         self._lock = threading.RLock()
+        self._init_db()
         self._doc = self._load()
         self._session_at: float | None = None
         self._startup_awake = False
@@ -110,18 +114,176 @@ class RoutineEngine:
         return dict(r) if r else None
 
     # ── storage ──────────────────────────────────────────────────────────────
+    def _connect(self) -> sqlite3.Connection:
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self.db_path), timeout=5.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _init_db(self) -> None:
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS routines (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        builtin TEXT NOT NULL DEFAULT '',
+                        text TEXT NOT NULL DEFAULT '',
+                        trigger_json TEXT NOT NULL,
+                        options_json TEXT NOT NULL DEFAULT '{}',
+                        deliver TEXT NOT NULL DEFAULT 'voice',
+                        agent TEXT NOT NULL DEFAULT 'general',
+                        minutes INTEGER NOT NULL DEFAULT 10,
+                        quiet INTEGER NOT NULL DEFAULT 0,
+                        system INTEGER NOT NULL DEFAULT 0,
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        source TEXT NOT NULL DEFAULT '',
+                        created REAL NOT NULL DEFAULT 0.0,
+                        next_ts REAL NOT NULL DEFAULT 0.0,
+                        last_run REAL NOT NULL DEFAULT 0.0,
+                        runs INTEGER NOT NULL DEFAULT 0,
+                        last_result TEXT NOT NULL DEFAULT ''
+                    );
+                    CREATE TABLE IF NOT EXISTS routine_meta (
+                        key TEXT PRIMARY KEY,
+                        value_json TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS run_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        routine_id TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        fired_at REAL NOT NULL,
+                        manual INTEGER NOT NULL DEFAULT 0,
+                        result TEXT NOT NULL DEFAULT ''
+                    );
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
     def _load(self) -> dict:
         from core.tasks.store import read_json
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, name, kind, builtin, text, trigger_json, options_json, deliver, "
+                "agent, minutes, quiet, system, enabled, source, created, next_ts, last_run, runs, last_result "
+                "FROM routines"
+            ).fetchall()
+            meta_rows = conn.execute("SELECT key, value_json FROM routine_meta").fetchall()
+        finally:
+            conn.close()
+
+        if rows or meta_rows:
+            doc: dict = {"version": 1, "quiet_hours": "", "routines": []}
+            for k, v in meta_rows:
+                try:
+                    doc[k] = json.loads(v)
+                except Exception:
+                    pass
+            routines_list = []
+            for row in rows:
+                routines_list.append({
+                    "id": row[0], "name": row[1], "kind": row[2], "builtin": row[3], "text": row[4],
+                    "trigger": json.loads(row[5]), "options": json.loads(row[6]),
+                    "deliver": row[7], "agent": row[8], "minutes": int(row[9]),
+                    "quiet": bool(row[10]), "system": bool(row[11]), "enabled": bool(row[12]),
+                    "source": row[13], "created": float(row[14]), "next_ts": float(row[15]),
+                    "last_run": float(row[16]), "runs": int(row[17]), "last_result": row[18],
+                })
+            doc["routines"] = routines_list
+            return doc
+
         doc = read_json(self.path, None)
         if not isinstance(doc, dict):
             doc = {}
         doc.setdefault("version", 1)
         doc.setdefault("quiet_hours", "")
         doc.setdefault("routines", [])
+        if doc["routines"] or any(k not in ("version", "quiet_hours", "routines") for k in doc):
+            self._save_doc_to_db(doc)
         return doc
+
+    def _save_doc_to_db(self, doc: dict) -> None:
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute("DELETE FROM routines")
+                for r in doc.get("routines", []):
+                    conn.execute(
+                        "INSERT INTO routines (id, name, kind, builtin, text, trigger_json, options_json, "
+                        "deliver, agent, minutes, quiet, system, enabled, source, created, next_ts, "
+                        "last_run, runs, last_result) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            r["id"], r["name"], r["kind"], r.get("builtin", ""), r.get("text", ""),
+                            json.dumps(r["trigger"]), json.dumps(r.get("options") or {}),
+                            r.get("deliver", "voice"), r.get("agent", "general"),
+                            int(r.get("minutes") or 10), int(bool(r.get("quiet"))),
+                            int(bool(r.get("system"))), int(bool(r.get("enabled", True))),
+                            r.get("source", ""), float(r.get("created") or 0.0),
+                            float(r.get("next_ts") or 0.0), float(r.get("last_run") or 0.0),
+                            int(r.get("runs") or 0), str(r.get("last_result") or ""),
+                        ),
+                    )
+                conn.execute("DELETE FROM routine_meta")
+                for k, v in doc.items():
+                    if k != "routines":
+                        conn.execute(
+                            "INSERT INTO routine_meta (key, value_json) VALUES (?, ?)",
+                            (k, json.dumps(v)),
+                        )
+        finally:
+            conn.close()
+
+    def _record_run(self, rid: str, name: str, fired_at: float, manual: bool, result: str) -> None:
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO run_history (routine_id, name, fired_at, manual, result) VALUES (?, ?, ?, ?, ?)",
+                    (rid, name, float(fired_at), int(bool(manual)), str(result)),
+                )
+        finally:
+            conn.close()
+
+    def history(self, rid: str | None = None, limit: int = 50) -> list[dict]:
+        """Return recent routine execution history from SQLite."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                if rid:
+                    rows = conn.execute(
+                        "SELECT routine_id, name, fired_at, manual, result FROM run_history "
+                        "WHERE routine_id = ? ORDER BY id DESC LIMIT ?",
+                        (rid, int(limit)),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT routine_id, name, fired_at, manual, result FROM run_history "
+                        "ORDER BY id DESC LIMIT ?",
+                        (int(limit),),
+                    ).fetchall()
+            finally:
+                conn.close()
+        return [
+            {
+                "routine_id": row[0],
+                "name": row[1],
+                "fired_at": float(row[2]),
+                "manual": bool(row[3]),
+                "result": row[4],
+            }
+            for row in rows
+        ]
 
     def _save(self) -> None:
         from core.tasks.store import write_json
+        self._save_doc_to_db(self._doc)
         write_json(self.path, self._doc)
 
     @property
@@ -421,10 +583,12 @@ class RoutineEngine:
         if not r.get("system") or manual:
             self._host("log", f"SYS: Routine — {r['name']}")
         with self._lock:
+            fired_at = self._clock()
             live = self._find(r["id"])
             if live is not None:
-                live.update(last_run=self._clock(), runs=int(live.get("runs") or 0) + 1, last_result=result)
+                live.update(last_run=fired_at, runs=int(live.get("runs") or 0) + 1, last_result=result)
                 self._save()
+            self._record_run(r["id"], r["name"], fired_at, manual, result)
         return result
 
     def prompt_text(self, r: dict) -> str:

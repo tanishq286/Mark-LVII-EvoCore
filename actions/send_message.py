@@ -315,21 +315,117 @@ def _resolve_platform(platform_str: str):
     return lambda r, m: _desktop_send(platform_str.strip().title(), r, m)
 
 
+def _whatsapp_call(receiver: str, call_type: str = "voice") -> str:
+    """Initiate a voice or video call on WhatsApp Desktop via UI automation."""
+    try:
+        if not _PYAUTOGUI:
+            return outcome.failed("send_message", "pyautogui unavailable for WhatsApp call", to=receiver)
+        import pyperclip
+        pyautogui.hotkey("win")
+        time.sleep(0.5)
+        pyautogui.write("WhatsApp", interval=0.05)
+        time.sleep(0.6)
+        pyautogui.press("enter")
+        time.sleep(1.5)
+        pyautogui.hotkey("ctrl", "f")
+        time.sleep(0.3)
+        pyperclip.copy(receiver)
+        pyautogui.hotkey("ctrl", "v")
+        time.sleep(0.8)
+        pyautogui.press("enter")
+        time.sleep(0.6)
+        # Focus top-right call buttons via Ctrl+Shift+C (voice) / video fallback note
+        if call_type == "video":
+            return outcome.unverified(
+                "send_message",
+                f"opened WhatsApp conversation with {receiver}; click Video Call button to ring (hotkey unconfirmed on all WhatsApp versions)",
+                platform="WhatsApp", to=receiver, call_type="video",
+            )
+        pyautogui.hotkey("ctrl", "shift", "c")
+        return outcome.unverified(
+            "send_message",
+            f"attempted WhatsApp voice call to {receiver}; confirmation requires live call state",
+            platform="WhatsApp", to=receiver, call_type="voice",
+        )
+    except Exception as exc:
+        return outcome.failed("send_message", f"WhatsApp call failed: {exc}", to=receiver)
+
+
+def _send_whatsapp_media(receiver: str, media_path: str, caption: str = "") -> str:
+    """Send a local file/photo/document attachment via WhatsApp Desktop clipboard/dialog."""
+    from pathlib import Path
+    import subprocess
+    p = Path(media_path)
+    if not p.is_file() or p.is_symlink():
+        return outcome.failed("send_message", f"invalid attachment path: {media_path}", to=receiver)
+    if not _PYAUTOGUI:
+        return outcome.failed("send_message", "pyautogui unavailable", to=receiver)
+    try:
+        import pyperclip
+        pyautogui.hotkey("win")
+        time.sleep(0.5)
+        pyautogui.write("WhatsApp", interval=0.05)
+        time.sleep(0.6)
+        pyautogui.press("enter")
+        time.sleep(1.5)
+        pyautogui.hotkey("ctrl", "f")
+        time.sleep(0.3)
+        pyperclip.copy(receiver)
+        pyautogui.hotkey("ctrl", "v")
+        time.sleep(0.8)
+        pyautogui.press("enter")
+        time.sleep(0.6)
+        # Copy file path to clipboard for explorer/file-drop or attachment dialog
+        if _OS == "Windows":
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", f"Set-Clipboard -Path '{str(p.resolve())}'"],
+                capture_output=True, text=True, timeout=6,
+            )
+            pyautogui.hotkey("ctrl", "v")
+            time.sleep(1.0)
+            if caption:
+                pyperclip.copy(caption)
+                pyautogui.hotkey("ctrl", "v")
+                time.sleep(0.2)
+            pyautogui.press("enter")
+            return outcome.unverified(
+                "send_message",
+                f"pasted attachment '{p.name}' into WhatsApp chat for {receiver} (delivery unverified visually)",
+                platform="WhatsApp", to=receiver, media=p.name,
+            )
+        return outcome.unverified(
+            "send_message",
+            f"opened WhatsApp chat for {receiver}; non-Windows clipboard file paste requires manual attach of '{p.name}'",
+            platform="WhatsApp", to=receiver, media=p.name,
+        )
+    except Exception as exc:
+        return outcome.failed("send_message", f"WhatsApp media send failed: {exc}", to=receiver)
+
+
 def send_message(
     parameters: dict,
     response=None,
     player=None,
     session_memory=None,
 ) -> str:
+    from pathlib import Path
     params       = parameters or {}
     receiver     = params.get("receiver", "").strip()
     message_text = params.get("message_text", "").strip()
     platform     = params.get("platform", "whatsapp").strip()
+    media_path   = str(params.get("media_path") or "").strip()
+    call_type    = str(params.get("call_type") or "").strip().lower()
 
     if not receiver:
         return outcome.failed("send_message", "no recipient was given")
-    if not message_text:
-        return outcome.failed("send_message", "no message text was given",
+    if call_type and call_type not in ("voice", "video"):
+        return outcome.failed("send_message", f"invalid call_type '{call_type}'; use 'voice' or 'video'", to=receiver)
+    if media_path:
+        mp = Path(media_path)
+        if not mp.is_file() or mp.is_symlink():
+            return outcome.failed("send_message", f"attachment file not found or symlink: {media_path}", to=receiver)
+    if not message_text and not media_path and not call_type:
+        return outcome.failed("send_message", "no message text, media_path, or call_type was given",
                               to=receiver)
     if not _PYAUTOGUI:
         return outcome.failed(
@@ -339,12 +435,39 @@ def send_message(
             to=receiver, platform=platform,
         )
 
-    preview = message_text[:50] + ("…" if len(message_text) > 50 else "")
+    if call_type:
+        action_name = "call"
+        preview = f"{call_type} call"
+        title = f"Start {platform} {call_type} call with {receiver}"
+        detail = f"Platform: {platform} | Recipient: {receiver} | Call: {call_type}"
+    elif media_path:
+        action_name = "media"
+        preview = f"attachment: {Path(media_path).name}" + (f" ({message_text[:30]})" if message_text else "")
+        title = f"Send {platform} media attachment to {receiver}"
+        detail = f"Platform: {platform} | Recipient: {receiver} | File: {media_path} | Caption: {message_text[:60]}"
+    else:
+        action_name = "send"
+        preview = message_text[:50] + ("…" if len(message_text) > 50 else "")
+        title = f"Send {platform} message to {receiver}"
+        detail = f"Platform: {platform} | Recipient: {receiver} | Preview: {preview}"
+
     print(f"[SendMessage] 📨 {platform} → {receiver}: {preview}")
 
     def _dispatch_send() -> str:
         if player:
-            player.write_log(f"[msg] {platform} → {receiver}")   # the message itself IS the news
+            player.write_log(f"[msg] {platform} → {receiver} ({preview})")
+        if call_type:
+            threading.Thread(
+                target=lambda: _whatsapp_call(receiver, call_type),
+                daemon=True, name="whatsapp-call",
+            ).start()
+            return outcome.started("send_message", platform=platform, to=receiver, call_type=call_type)
+        if media_path:
+            threading.Thread(
+                target=lambda: _send_whatsapp_media(receiver, media_path, message_text),
+                daemon=True, name="whatsapp-media",
+            ).start()
+            return outcome.started("send_message", platform=platform, to=receiver, media=Path(media_path).name)
         threading.Thread(
             target=_send_and_report,
             args=(player, platform, receiver, message_text),
@@ -356,19 +479,19 @@ def send_message(
         from core.evolution import safety_guard
         return safety_guard.enforce_gate(
             "send_message",
-            "send",
-            f"Send {platform} message to {receiver}",
-            f"Platform: {platform} | Recipient: {receiver} | Preview: {preview}",
+            action_name,
+            title,
+            detail,
             _dispatch_send,
-            key=f"send_{platform.lower()}_{receiver[:24]}",
+            key=f"send_{action_name}_{platform.lower()}_{receiver[:24]}",
         )
     except Exception:
         # Fail closed if confirm/safety_guard cannot be bypassed
         from core import confirm
         return confirm.request(
-            key=f"send_{platform.lower()}_{receiver[:24]}",
-            title=f"[CONFIRM] Send {platform} message to {receiver}",
-            detail=f"Platform: {platform} | Recipient: {receiver} | Preview: {preview}",
+            key=f"send_{action_name}_{platform.lower()}_{receiver[:24]}",
+            title=f"[CONFIRM] {title}",
+            detail=detail,
             run=_dispatch_send,
         )
 
@@ -447,16 +570,23 @@ TOOL = {
             },
             "message_text": {
                 "type": "STRING",
-                "description": "The message to send"
+                "description": "The message text or media caption to send"
             },
             "platform": {
                 "type": "STRING",
                 "description": "Platform: WhatsApp, Telegram, etc."
+            },
+            "media_path": {
+                "type": "STRING",
+                "description": "Optional local file path to attach on WhatsApp"
+            },
+            "call_type": {
+                "type": "STRING",
+                "description": "Optional call trigger: 'voice' or 'video'"
             }
         },
         "required": [
             "receiver",
-            "message_text",
             "platform"
         ]
     },

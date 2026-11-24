@@ -837,6 +837,97 @@ def cancel_power_timer():
     else:
         subprocess.run(["shutdown", "-c"], capture_output=True)
 
+
+def network_info() -> str:
+    """Return full local interface IPs and public IP/ISP report."""
+    import socket
+    hostname = socket.gethostname()
+    local_ips: list[str] = []
+    try:
+        import psutil
+        for iface, addrs in psutil.net_if_addrs().items():
+            for addr in addrs:
+                if addr.family == socket.AF_INET and not addr.address.startswith("127."):
+                    local_ips.append(f"{iface}: {addr.address} (mask {addr.netmask or 'n/a'})")
+    except Exception:
+        pass
+    if not local_ips:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(1.0)
+            s.connect(("8.8.8.8", 80))
+            local_ips.append(f"Primary: {s.getsockname()[0]}")
+            s.close()
+        except Exception:
+            try:
+                local_ips.append(f"Host: {socket.gethostbyname(hostname)}")
+            except Exception:
+                local_ips.append("unavailable")
+
+    pub_ip = "unavailable"
+    isp_meta = ""
+    try:
+        import httpx
+        with httpx.Client(timeout=4.0) as client:
+            r = client.get("https://ipinfo.io/json")
+            if r.status_code == 200:
+                info = r.json()
+                pub_ip = str(info.get("ip") or "unavailable")
+                parts = [info.get("city"), info.get("region"), info.get("country"), info.get("org")]
+                isp_meta = ", ".join(str(x) for x in parts if x)
+            else:
+                r2 = client.get("https://api.ipify.org?format=json")
+                if r2.status_code == 200:
+                    pub_ip = str(r2.json().get("ip") or "unavailable")
+    except Exception as exc:
+        isp_meta = f"lookup offline ({type(exc).__name__})"
+
+    lines = [
+        f"Hostname: {hostname}",
+        "Local IPs:",
+        *[f"  - {item}" for item in local_ips],
+        f"Public IP: {pub_ip}" + (f" ({isp_meta})" if isp_meta else ""),
+    ]
+    return "\n".join(lines)
+
+
+def network_speed_test() -> str:
+    """Measure latency, download Mbps, and upload Mbps via HTTPS probe."""
+    import time
+    import httpx
+    latency_ms: float | None = None
+    down_mbps: float | None = None
+    up_mbps: float | None = None
+    notes: list[str] = []
+
+    try:
+        with httpx.Client(timeout=12.0) as client:
+            t0 = time.perf_counter()
+            client.get("https://speed.cloudflare.com/__down?bytes=0")
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+
+            t1 = time.perf_counter()
+            dl = client.get("https://speed.cloudflare.com/__down?bytes=5000000")
+            dl_sec = max(1e-4, time.perf_counter() - t1)
+            dl_bytes = len(dl.content)
+            down_mbps = (dl_bytes * 8.0) / (dl_sec * 1_000_000.0)
+
+            payload = b"0" * 1_000_000
+            t2 = time.perf_counter()
+            client.post("https://speed.cloudflare.com/__up", content=payload)
+            up_sec = max(1e-4, time.perf_counter() - t2)
+            up_mbps = (len(payload) * 8.0) / (up_sec * 1_000_000.0)
+    except Exception as exc:
+        notes.append(f"probe error: {exc}")
+
+    parts = ["Network Speed Test:"]
+    parts.append(f"- Latency: {latency_ms:.1f} ms" if latency_ms is not None else "- Latency: unavailable")
+    parts.append(f"- Download: {down_mbps:.2f} Mbps" if down_mbps is not None else "- Download: unavailable")
+    parts.append(f"- Upload: {up_mbps:.2f} Mbps" if up_mbps is not None else "- Upload: unavailable")
+    if notes:
+        parts.append("- Notes: " + "; ".join(notes))
+    return "\n".join(parts)
+
 ACTION_MAP: dict[str, callable] = {
     "volume_up":           volume_up,
     "volume_down":         volume_down,
@@ -909,6 +1000,10 @@ ACTION_MAP: dict[str, callable] = {
     "schedule_shutdown":   schedule_shutdown,
     "schedule_restart":    schedule_restart,
     "cancel_power_timer":  cancel_power_timer,
+    "network_info":        network_info,
+    "ip_info":             network_info,
+    "speed_test":          network_speed_test,
+    "network_speed":       network_speed_test,
 }
 
 # ── What needs a human, and what just needs an undo ──────────────────────────
@@ -991,6 +1086,8 @@ _ALIASES = {
     "schedule_shutdown":  ("schedule shutdown", "shutdown timer", "shut down in"),
     "schedule_restart":   ("schedule restart", "restart timer", "restart in"),
     "cancel_power_timer": ("cancel shutdown", "abort shutdown", "cancel restart", "cancel power timer"),
+    "network_info":       ("ip address", "public ip", "local ip", "network info", "my ip"),
+    "network_speed":      ("speed test", "internet speed", "network speed", "bandwidth test"),
     "unmute":          ("sound on", "unmute"),
     "media_next":      ("next song", "next track", "skip song"),
     "media_previous":  ("previous song", "previous track"),
@@ -1075,12 +1172,6 @@ def computer_settings(
     player=None,
     session_memory=None,
 ) -> str:
-    if not _PYAUTOGUI:
-        return outcome.failed(
-            "computer_settings",
-            "pyautogui is not installed, so the keyboard cannot be driven - "
-            "run: pip install pyautogui")
-
     params      = parameters or {}
     raw_action  = params.get("action", "").strip()
     description = params.get("description", "").strip()
@@ -1093,6 +1184,15 @@ def computer_settings(
             value = detected.get("value")
 
     action = raw_action.lower().strip().replace(" ", "_").replace("-", "_")
+    if action in ("network_info", "ip_info", "speed_test", "network_speed"):
+        report = ACTION_MAP[action]()
+        return outcome.done("computer_settings", wanted=action, details=report)
+
+    if not _PYAUTOGUI:
+        return outcome.failed(
+            "computer_settings",
+            "pyautogui is not installed, so the keyboard cannot be driven - "
+            "run: pip install pyautogui")
 
     if not action:
         return _suggest(description or raw_action)
@@ -1417,7 +1517,8 @@ TOOL = {
                     "type_text | screenshot | lock_screen | open_settings | "
                     "file_explorer | open_run | dark_mode | toggle_wifi | "
                     "restart | shutdown | hibernate | sign_out | "
-                    "schedule_shutdown | schedule_restart | cancel_power_timer"
+                    "schedule_shutdown | schedule_restart | cancel_power_timer | "
+                    "network_info | speed_test"
                 )
             },
             "description": {
