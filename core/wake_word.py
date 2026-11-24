@@ -181,17 +181,17 @@ def install_and_download(logger: Callable[[str], None] = print,
 
 @functools.lru_cache(maxsize=1)
 def build_wake_chime_wav() -> bytes:
-    """Synthesize a crisp 140 ms two-tone rising chime (24 kHz mono 16-bit WAV)."""
+    """Synthesize a crisp 220 ms two-tone rising chime (24 kHz mono 16-bit WAV)."""
     import numpy as np
 
     sr = 24000
-    note_samples = int(sr * 0.070)  # 70 ms per note -> 140 ms total
+    note_samples = int(sr * 0.110)  # 110 ms per note -> 220 ms total
     t = np.arange(note_samples, dtype=np.float32) / sr
     # Smooth half-sine attack/release envelope so each tone is click-free.
     env = np.sin(np.pi * np.arange(note_samples, dtype=np.float32) / max(1, note_samples - 1))
-    amp = 0.18 * 32767.0
-    n1 = amp * env * np.sin(2.0 * np.pi * 660.0 * t)
-    n2 = amp * env * np.sin(2.0 * np.pi * 990.0 * t)
+    amp = 0.48 * 32767.0
+    n1 = amp * env * (0.80 * np.sin(2.0 * np.pi * 587.33 * t) + 0.20 * np.sin(2.0 * np.pi * 1174.66 * t))
+    n2 = amp * env * (0.80 * np.sin(2.0 * np.pi * 880.0 * t) + 0.20 * np.sin(2.0 * np.pi * 1760.0 * t))
     pcm = np.concatenate((n1, n2)).astype(np.int16)
 
     buf = io.BytesIO()

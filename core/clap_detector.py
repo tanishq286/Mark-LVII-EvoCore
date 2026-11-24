@@ -27,14 +27,15 @@ FRAME_SAMPLES = 160      # 10 ms sub-frames at 16 kHz
 FFT_SIZE = 512           # 32 ms spectral analysis window
 
 _COMMON_PRESET = {
-    "decay_window_s": 0.09,
-    "decay_ratio": 0.45,
-    "min_mid_ratio": 0.20,
-    "min_gap_s": 0.18,
-    "max_gap_s": 0.90,
-    "valley_ratio": 0.45,
-    "pair_amp_min": 0.22,
-    "pair_amp_max": 4.5,
+    "decay_window_s": 0.16,
+    "decay_ratio": 0.50,
+    "min_mid_ratio": 0.15,
+    "max_top3_ratio": 0.60,
+    "min_gap_s": 0.135,
+    "max_gap_s": 1.15,
+    "valley_ratio": 0.50,
+    "pair_amp_min": 0.20,
+    "pair_amp_max": 5.0,
     "burst_window_s": 1.5,
     "burst_max_impulses": 4,
     "burst_suppress_s": 1.5,
@@ -44,30 +45,33 @@ _COMMON_PRESET = {
 SENSITIVITY_PRESETS: dict[str, dict[str, float]] = {
     "low": {
         **_COMMON_PRESET,
-        "min_rms": 1300.0,
-        "snr_ratio": 5.2,
-        "onset_ratio": 3.2,
-        "min_high_ratio": 0.60,
-        "min_flatness": 0.18,
-        "min_crest": 2.1,
+        "min_rms": 450.0,
+        "min_peak": 1400.0,
+        "snr_ratio": 4.8,
+        "onset_ratio": 3.0,
+        "min_high_ratio": 0.52,
+        "min_flatness": 0.08,
+        "min_crest": 1.80,
     },
     "medium": {
         **_COMMON_PRESET,
-        "min_rms": 800.0,
-        "snr_ratio": 4.2,
-        "onset_ratio": 2.6,
-        "min_high_ratio": 0.55,
-        "min_flatness": 0.14,
-        "min_crest": 1.9,
+        "min_rms": 170.0,
+        "min_peak": 580.0,
+        "snr_ratio": 3.8,
+        "onset_ratio": 2.4,
+        "min_high_ratio": 0.45,
+        "min_flatness": 0.055,
+        "min_crest": 1.60,
     },
     "high": {
         **_COMMON_PRESET,
-        "min_rms": 500.0,
-        "snr_ratio": 3.5,
-        "onset_ratio": 2.2,
-        "min_high_ratio": 0.50,
-        "min_flatness": 0.11,
-        "min_crest": 1.75,
+        "min_rms": 110.0,
+        "min_peak": 380.0,
+        "snr_ratio": 3.2,
+        "onset_ratio": 2.0,
+        "min_high_ratio": 0.40,
+        "min_flatness": 0.040,
+        "min_crest": 1.45,
     },
 }
 
@@ -85,7 +89,7 @@ class ClapAnalyzer:
         self._sr = max(8000, int(sample_rate))
         self._frame_samples = max(80, int(round(self._sr * 0.010)))
         self._fft_size = FFT_SIZE
-        self._ring_cap = max(1024, self._fft_size * 2)
+        self._ring_cap = 4096    # 256 ms at 16 kHz so centered FFT windows fit cleanly
 
         self._sensitivity = normalize_sensitivity(sensitivity)
         self._cfg = dict(SENSITIVITY_PRESETS[self._sensitivity])
@@ -93,16 +97,17 @@ class ClapAnalyzer:
         # Precompute FFT window and speech/clap band masks once.
         self._hann = np.hanning(self._fft_size).astype(np.float32)
         freqs = np.fft.rfftfreq(self._fft_size, 1.0 / self._sr)
-        self._mask_low = (freqs >= 80.0) & (freqs <= 450.0)
-        self._mask_high = (freqs >= 700.0) & (freqs <= 6500.0)
-        self._mask_mid = (freqs >= 700.0) & (freqs <= 3500.0)
-        self._mask_total = (freqs >= 80.0) & (freqs <= 7500.0)
+        self._mask_low = (freqs >= 60.0) & (freqs <= 320.0)
+        self._mask_high = (freqs >= 450.0) & (freqs <= 7000.0)
+        self._mask_mid = (freqs >= 450.0) & (freqs <= 3500.0)
+        self._mask_core = (freqs >= 450.0) & (freqs <= 2000.0)
+        self._mask_total = (freqs >= 60.0) & (freqs <= 7500.0)
 
         self._pending_samples = np.empty(0, dtype=np.float32)
         self._ring = np.zeros(self._ring_cap, dtype=np.float32)
         self._samples_processed = 0
         self._frames_seen = 0
-        self._noise_floor = 120.0
+        self._noise_floor = 60.0
         self._prev_rms: deque[float] = deque(maxlen=8)
 
         self._active: dict | None = None
@@ -111,6 +116,8 @@ class ClapAnalyzer:
         self._recent_impulses: deque[float] = deque(maxlen=16)
         self._suppress_until = 0.0
         self._cooldown_until = 0.0
+        self.last_reject_reason: str = ""
+        self.last_event: dict | None = None
 
     @property
     def sensitivity(self) -> str:
@@ -134,9 +141,9 @@ class ClapAnalyzer:
         if clear_cooldown:
             self._cooldown_until = 0.0
         if keep_noise_floor:
-            self._noise_floor = max(80.0, min(4000.0, floor))
+            self._noise_floor = max(20.0, min(4000.0, floor))
         else:
-            self._noise_floor = 120.0
+            self._noise_floor = 60.0
             self._frames_seen = 0
 
     def process(self, frame_int16) -> bool:
@@ -167,21 +174,24 @@ class ClapAnalyzer:
         self._pending_samples = data[pos:].copy() if pos < total else np.empty(0, dtype=np.float32)
         return detected
 
-    def _capture_peak_window(self) -> np.ndarray:
-        """Grab the trailing FFT_SIZE samples from the ring buffer."""
-        return self._ring[-self._fft_size :].copy()
+    def _capture_centered_window(self, peak_sample: int) -> np.ndarray:
+        """Slice an FFT_SIZE window centered on `peak_sample` (where hann == 1.0)."""
+        half = self._fft_size // 2
+        ring_idx = self._ring_cap - (self._samples_processed - peak_sample)
+        start = max(0, min(self._ring_cap - self._fft_size, ring_idx - half))
+        return self._ring[start : start + self._fft_size].copy()
 
     def _passes_spectral_check(self, window: np.ndarray) -> bool:
         """Reject thuds, speech vowels, and chimes using band ratios + flatness."""
         if window.size != self._fft_size:
+            self.last_reject_reason = "bad_window_size"
             return False
         centered = window - float(np.mean(window))
         rms = float(np.sqrt(np.mean(centered * centered)))
         if rms <= 1e-6:
+            self.last_reject_reason = "zero_rms"
             return False
         crest = float(np.max(np.abs(centered))) / rms
-        if crest < self._cfg["min_crest"]:
-            return False
 
         spec = np.fft.rfft(centered * self._hann)
         power = (spec.real * spec.real) + (spec.imag * spec.imag)
@@ -191,32 +201,58 @@ class ClapAnalyzer:
         e_mid = float(np.sum(power[self._mask_mid]))
         e_total = float(np.sum(power[self._mask_total]))
         if e_total <= 1e-9 or (e_low + e_high) <= 1e-9:
+            self.last_reject_reason = "zero_energy"
             return False
 
         high_ratio = e_high / (e_low + e_high)
-        if high_ratio < self._cfg["min_high_ratio"]:
-            return False
-
         mid_ratio = e_mid / e_total
+
+        # Spectral flatness over core clap band (450-2000 Hz) + tonal peak concentration.
+        mid_power = power[self._mask_mid]
+        core_power = power[self._mask_core]
+        if mid_power.size == 0 or core_power.size == 0:
+            self.last_reject_reason = "empty_mid_band"
+            return False
+        mean_p = float(np.mean(core_power)) + 1e-12
+        geo_p = float(np.exp(np.mean(np.log(core_power + 1e-12))))
+        flatness = geo_p / mean_p
+        top3_ratio = float(np.sum(np.sort(mid_power)[-3:]) / (float(np.sum(mid_power)) + 1e-12))
+
+        self.last_event = {
+            "rms": round(rms, 1),
+            "crest": round(crest, 2),
+            "high_ratio": round(high_ratio, 3),
+            "mid_ratio": round(mid_ratio, 3),
+            "flatness": round(flatness, 3),
+            "top3": round(top3_ratio, 3),
+        }
+
+        if crest < self._cfg["min_crest"]:
+            self.last_reject_reason = f"low_crest:{crest:.2f}"
+            return False
+        if high_ratio < self._cfg["min_high_ratio"]:
+            self.last_reject_reason = f"low_high_ratio:{high_ratio:.3f}"
+            return False
         if mid_ratio < self._cfg["min_mid_ratio"]:
+            self.last_reject_reason = f"low_mid_ratio:{mid_ratio:.3f}"
+            return False
+        if top3_ratio > self._cfg["max_top3_ratio"]:
+            self.last_reject_reason = f"tonal_top3:{top3_ratio:.3f}"
+            return False
+        if flatness < self._cfg["min_flatness"]:
+            self.last_reject_reason = f"low_flatness:{flatness:.3f}"
             return False
 
-        # Spectral flatness over 700-3500 Hz (present on both wide mics and BT HFP).
-        mid_power = power[self._mask_mid]
-        if mid_power.size == 0:
-            return False
-        mean_p = float(np.mean(mid_power)) + 1e-12
-        geo_p = float(np.exp(np.mean(np.log(mid_power + 1e-12))))
-        flatness = geo_p / mean_p
-        return flatness >= self._cfg["min_flatness"]
+        self.last_reject_reason = ""
+        return True
 
     def _update_noise_floor(self, rms: float) -> None:
-        if self._frames_seen <= 20:
-            alpha = 0.20 if self._frames_seen > 1 else 1.0
+        if self._frames_seen <= 15:
+            alpha = 0.25 if self._frames_seen > 1 else 1.0
         else:
             alpha = 0.03
         updated = (1.0 - alpha) * self._noise_floor + alpha * rms
-        self._noise_floor = max(80.0, min(4000.0, updated))
+        self._noise_floor = max(20.0, min(4000.0, updated))
 
     def _step_subframe(self, sub: np.ndarray) -> bool:
         self._samples_processed += sub.size
@@ -229,6 +265,7 @@ class ClapAnalyzer:
         self._ring[-shift:] = sub
 
         rms = float(np.sqrt(np.mean(sub * sub)))
+        sub_abs = float(np.max(np.abs(sub)))
         cfg = self._cfg
 
         # Expire stale first clap once outside max_gap_s.
@@ -241,29 +278,40 @@ class ClapAnalyzer:
             if rms <= cfg["valley_ratio"] * self._first_clap[1]:
                 self._valley_seen = True
 
-        # Track an active impulse awaiting fast decay confirmation.
+        # Track an active impulse awaiting fast decay + centered spectral window.
         if self._active is not None:
             act = self._active
-            if rms > act["peak_rms"] and (t - act["start_t"]) <= 0.030:
-                act["peak_rms"] = rms
-                act["peak_t"] = t
-                act["peak_window"] = self._capture_peak_window()
-                self._prev_rms.append(rms)
-                return False
+            if not act["decayed"]:
+                if (t - act["start_t"]) <= 0.040:
+                    if sub_abs > act["peak_abs"]:
+                        act["peak_abs"] = sub_abs
+                        act["peak_sample"] = (
+                            (self._samples_processed - sub.size) + int(np.argmax(np.abs(sub)))
+                        )
+                    if rms > act["peak_rms"]:
+                        act["peak_rms"] = rms
+                        act["peak_t"] = t
 
-            if rms <= cfg["decay_ratio"] * act["peak_rms"]:
-                # Fast decay confirmed — verify broadband transient signature.
-                self._active = None
-                self._prev_rms.append(rms)
-                if not self._passes_spectral_check(act["peak_window"]):
+                if rms <= cfg["decay_ratio"] * act["peak_rms"]:
+                    act["decayed"] = True
+                    act["decay_rms"] = rms
+                elif (t - act["peak_t"]) > cfg["decay_window_s"]:
+                    # Sustained energy (speech/music) -> not a clap.
+                    self.last_reject_reason = "sustained_no_decay"
+                    self._active = None
+                    self._prev_rms.append(rms)
                     return False
-                return self._handle_verified_clap(act["peak_t"], act["peak_rms"], current_rms=rms)
 
-            if (t - act["peak_t"]) > cfg["decay_window_s"]:
-                # Sustained energy (speech/music) -> not a clap.
+            if act["decayed"] and self._samples_processed >= act["peak_sample"] + (self._fft_size // 2):
+                window = self._capture_centered_window(act["peak_sample"])
+                peak_t = act["peak_t"]
+                peak_rms = act["peak_rms"]
+                decay_rms = act["decay_rms"]
                 self._active = None
                 self._prev_rms.append(rms)
-                return False
+                if not self._passes_spectral_check(window):
+                    return False
+                return self._handle_verified_clap(peak_t, peak_rms, current_rms=decay_rms)
 
             self._prev_rms.append(rms)
             return False
@@ -278,12 +326,16 @@ class ClapAnalyzer:
             cfg["onset_ratio"] * baseline_prev,
         )
 
-        if rms >= trigger_level and t >= self._cooldown_until:
+        if rms >= trigger_level and sub_abs >= cfg["min_peak"] and t >= self._cooldown_until:
+            peak_sample = (self._samples_processed - sub.size) + int(np.argmax(np.abs(sub)))
             self._active = {
                 "start_t": t,
                 "peak_t": t,
                 "peak_rms": rms,
-                "peak_window": self._capture_peak_window(),
+                "peak_abs": sub_abs,
+                "peak_sample": peak_sample,
+                "decayed": False,
+                "decay_rms": rms,
             }
             self._prev_rms.append(rms)
             return False
@@ -319,12 +371,14 @@ class ClapAnalyzer:
         t1, rms1 = self._first_clap
         dt = peak_t - t1
 
-        if dt < 0.08:
-            # Room echo / single-clap bounce (up to ~13m) — keep original Clap 1.
+        if dt < 0.085:
+            # Room echo / single-clap bounce (up to ~14m) — keep original Clap 1.
+            self.last_reject_reason = f"echo_dt:{dt:.3f}"
             return False
 
         if dt < cfg["min_gap_s"]:
-            # Sub-180 ms follow-up impulse indicates rapid tapping/applause, not a double-clap.
+            # Sub-135 ms follow-up impulse indicates rapid tapping/applause, not a double-clap.
+            self.last_reject_reason = f"too_fast_dt:{dt:.3f}"
             self._first_clap = None
             self._valley_seen = False
             return False

@@ -74,6 +74,33 @@ def _build_double_clap(rng: np.random.Generator, gap_s: float, *,
     return buf
 
 
+def _sim_real_clap(rng: np.random.Generator, amp: float, dur_ms: float,
+                   fc: float = 800.0, bw: float = 1200.0, decay_ms: float = 10.0) -> np.ndarray:
+    n = int(SAMPLE_RATE * dur_ms / 1000.0)
+    t = np.arange(n, dtype=np.float32) / SAMPLE_RATE
+    env = np.exp(-t / (decay_ms / 1000.0))
+    noise = rng.normal(0.0, 1.0, n).astype(np.float32)
+    spec = np.fft.rfft(noise)
+    fr = np.fft.rfftfreq(n, 1.0 / SAMPLE_RATE)
+    mask = np.exp(-0.5 * ((fr - fc) / bw) ** 2)
+    shaped = np.fft.irfft(spec * mask, n=n)
+    shaped = shaped / (float(np.max(np.abs(shaped))) + 1e-6) * amp * env
+    return shaped.astype(np.float32)
+
+
+def _build_band_double_clap(rng: np.random.Generator, amp: float, dur_ms: float,
+                            fc: float, bw: float, decay_ms: float, gap_s: float,
+                            noise_rms: float = 31.5) -> np.ndarray:
+    buf = rng.normal(0.0, noise_rms, int(SAMPLE_RATE * (0.5 + gap_s + 0.6))).astype(np.float32)
+    c1 = _sim_real_clap(rng, amp, dur_ms, fc, bw, decay_ms)
+    c2 = _sim_real_clap(rng, amp, dur_ms, fc, bw, decay_ms)
+    p1 = int(0.45 * SAMPLE_RATE) + 110
+    p2 = p1 + int(gap_s * SAMPLE_RATE)
+    buf[p1 : p1 + c1.size] += c1
+    buf[p2 : p2 + c2.size] += c2
+    return buf
+
+
 def main() -> int:
     results: list[tuple[str, bool, str]] = []
 
@@ -152,7 +179,7 @@ def main() -> int:
             frames = np.frombuffer(wf.readframes(nf), dtype=np.int16)
         dur_ms = (nf / sr) * 1000.0
         peak = int(np.max(np.abs(frames))) if frames.size else 0
-        ok_chime = ch == 1 and sw == 2 and sr == 24000 and 100.0 <= dur_ms <= 200.0 and peak > 1000
+        ok_chime = ch == 1 and sw == 2 and sr == 24000 and 100.0 <= dur_ms <= 300.0 and peak > 5000
         check(
             "3. Wake chime WAV synthesis",
             ok_chime,
@@ -172,13 +199,19 @@ def main() -> int:
             ("wideband_750ms", _build_double_clap(rng, 0.75)),
             ("bt_hfp_3.2khz_400ms", _build_double_clap(rng, 0.40, amp1=15000.0, amp2=14500.0, bt_hfp=True)),
             ("noisy_room_rms300", _build_double_clap(rng, 0.42, amp1=17000.0, amp2=16500.0, noise_rms=300.0)),
+            ("realtek_soft_clap_peak1800_cupped", _build_band_double_clap(rng, 1800, 30, 800, 600, 8, 0.35)),
+            ("realtek_med_clap_peak3000_short6ms", _build_band_double_clap(rng, 3000, 20, 1200, 900, 5, 0.35)),
+            ("realtek_cupped_low_650hz", _build_band_double_clap(rng, 5000, 40, 650, 400, 14, 0.35)),
+            ("reverb_room_decay45ms", _build_band_double_clap(rng, 6000, 180, 1100, 800, 45, 0.40)),
+            ("fast_clap_150ms_gap", _build_band_double_clap(rng, 8000, 35, 1300, 1000, 10, 0.15)),
+            ("slow_clap_1000ms_gap", _build_band_double_clap(rng, 8000, 35, 1300, 1000, 10, 1.00)),
         ]
         tp_failures = []
         for label, sig in tp_cases:
             az = ClapAnalyzer(sensitivity="medium")
             hits = _feed_signal(az, sig)
             if hits != 1:
-                tp_failures.append(f"{label}:hits={hits}")
+                tp_failures.append(f"{label}:hits={hits}(reject={az.last_reject_reason},evt={az.last_event})")
 
         # Threaded DoubleClapDetector end-to-end callback + cooldown + reset re-arm
         cb_event = threading.Event()
@@ -218,7 +251,7 @@ def main() -> int:
         check(
             "4. Double-clap true positive matrix",
             len(tp_failures) == 0,
-            "all 5 DSP + threaded callbacks passed" if not tp_failures else "; ".join(tp_failures),
+            f"all {len(tp_cases)} DSP + threaded callbacks passed" if not tp_failures else "; ".join(tp_failures),
         )
     except Exception as exc:
         check("4. Double-clap true positive matrix", False, str(exc))

@@ -866,10 +866,11 @@ class JarvisLive:
 
     def _on_clap_detected(self) -> None:
         """Called from the clap thread when two claps are detected."""
-        self.wake(reason="double clap", play_chime=True, focus_window=True)
+        self.wake(reason="double clap", play_chime=True, focus_window=True, speak_ack=True)
 
     def wake(self, reason: str = "wake word", *,
-             play_chime: bool = False, focus_window: bool = False) -> None:
+             play_chime: bool = False, focus_window: bool = False,
+             speak_ack: bool = False) -> None:
         with self._wake_lock:
             if self._awake:
                 return
@@ -889,6 +890,37 @@ class JarvisLive:
             self.ui.bring_to_front()
         self.ui.refresh_wake_ui()
         self.ui.write_log(f"SYS: Awake — {reason}.")
+        if (
+            speak_ack
+            and not self.ui.muted
+            and self.session is not None
+            and self._loop is not None
+            and self._loop.is_running()
+        ):
+            async def _send_wake_ack():
+                try:
+                    await asyncio.sleep(0.25)
+                    if self.session is not None and self._awake:
+                        await self.session.send_client_content(
+                            turns={
+                                "role": "user",
+                                "parts": [{
+                                    "text": (
+                                        "[WAKE_ACK] The user just woke you by clapping twice. "
+                                        "Reply briefly in 2-4 words (for example: 'Yes, I am listening.') "
+                                        "in their language. Do not call any tools."
+                                    )
+                                }],
+                            },
+                            turn_complete=True,
+                        )
+                except Exception as exc:
+                    print(f"[Wake] ack skipped: {exc}")
+
+            try:
+                asyncio.run_coroutine_threadsafe(_send_wake_ack(), self._loop)
+            except Exception as exc:
+                print(f"[Wake] ack schedule skipped: {exc}")
 
     def sleep(self, reason: str = "timeout") -> None:
         with self._wake_lock:
