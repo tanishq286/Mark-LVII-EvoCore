@@ -3054,8 +3054,21 @@ class JarvisLive:
         # Start dashboard (optional — needs: pip install fastapi "uvicorn[standard]" cryptography)
         try:
             from dashboard.server import DashboardServer
+            import types as _py_types
             self._dashboard = DashboardServer()
             self._dashboard.set_connect_callback(self._on_phone_connected)
+            async def _dash_tool_exec(tool_name: str, params: dict):
+                resp = await self._execute_tool(
+                    _py_types.SimpleNamespace(id="android-ws", name=tool_name, args=params or {})
+                )
+                payload = getattr(resp, "response", None) or {}
+                return payload.get("result", str(payload))
+            def _dash_android_event(ev: dict):
+                ev_name = str(ev.get("event") or "event")
+                dev = str(ev.get("device_id") or "android")
+                self.ui.write_log(f"PHONE [{dev}]: {ev_name} {ev.get('payload') or ''}".strip())
+            self._dashboard.set_tool_executor(_dash_tool_exec)
+            self._dashboard.set_event_callback(_dash_android_event)
             self._keep_task(asyncio.create_task(self._dashboard.serve()))
             # Runs for the whole lifetime, not just inside an active session
             self._keep_task(asyncio.create_task(self._process_dashboard_commands()))

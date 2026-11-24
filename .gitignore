@@ -41,6 +41,7 @@ memory/voiceprints.json
 memory/project_profiles.json
 memory/form_profile.jvault
 memory/.spotify_cache
+memory/android_devices.json
 memory/*.log
 memory/*.db
 memory/*.sqlite
@@ -88,3 +89,14 @@ desktop.ini
 logs/
 downloads/
 screenshots/
+
+# ── Android companion build artifacts & keystores ─────────────────────────────
+android_companion/.gradle/
+android_companion/build/
+android_companion/app/build/
+android_companion/local.properties
+android_companion/.idea/
+*.keystore
+*.jks
+*.apk
+*.aab

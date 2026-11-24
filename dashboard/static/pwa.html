@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <meta name="theme-color" content="#00d4ff" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" href="/pwa-icon.svg" type="image/svg+xml" />
+  <title>JARVIS Mobile Companion PWA</title>
+  <style>
+    :root { --bg:#07090f; --panel:#0d1520; --pri:#00d4ff; --acc:#ff6b00; --text:#e2f6ff; --mut:#6f8ca0; --red:#ff3355; }
+    * { box-sizing:border-box; margin:0; padding:0; }
+    body { background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,sans-serif; padding:16px; max-width:540px; margin:0 auto; }
+    header { display:flex; align-items:center; justify-content:space-between; padding-bottom:12px; border-bottom:1px solid rgba(0,212,255,0.2); margin-bottom:14px; }
+    .title { font-weight:700; letter-spacing:3px; color:var(--pri); font-size:15px; }
+    .badge { font-size:11px; padding:4px 10px; border-radius:99px; border:1px solid var(--pri); color:var(--pri); }
+    .badge.off { border-color:var(--mut); color:var(--mut); }
+    .card { background:var(--panel); border:1px solid rgba(0,212,255,0.18); border-radius:14px; padding:14px; margin-bottom:12px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+    input { flex:1; background:#050b12; border:1px solid rgba(0,212,255,0.3); color:var(--text); padding:10px 12px; border-radius:10px; font-size:14px; }
+    button { background:var(--pri); color:#041017; border:none; border-radius:10px; padding:10px 14px; font-weight:700; cursor:pointer; font-size:13px; }
+    button.sec { background:rgba(0,212,255,0.14); color:var(--text); border:1px solid rgba(0,212,255,0.3); }
+    button.warn { background:rgba(255,51,85,0.2); color:#ff889d; border:1px solid var(--red); }
+    .grid { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; margin-top:10px; }
+    pre { background:#04080e; border:1px solid rgba(255,255,255,0.08); border-radius:10px; padding:10px; font-size:12px; color:#9de8ff; max-height:200px; overflow:auto; margin-top:10px; white-space:pre-wrap; }
+    label.switch { display:flex; align-items:center; justify-content:space-between; font-size:13px; cursor:pointer; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title">MARK-LVII · ANDROID PWA</div>
+    <span id="ws-badge" class="badge off">OFFLINE</span>
+  </header>
+
+  <section class="card">
+    <div style="font-size:12px;color:var(--mut)">Host __IP__:__PORT__ · Instant Mobile Companion Fallback</div>
+    <div class="row">
+      <input id="pin" placeholder="8-char Pairing PIN" maxlength="12" />
+      <button id="pair-btn">Pair</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <label class="switch" style="width:100%">
+        <span>100% On-Device Privacy Mode (Pause PC Sync)</span>
+        <input type="checkbox" id="privacy-toggle" style="flex:0;width:20px;height:20px;" />
+      </label>
+    </div>
+  </section>
+
+  <section class="card">
+    <div style="font-size:12px;font-weight:700;color:var(--pri);letter-spacing:1px">PC COMMAND & VOICE</div>
+    <div class="row">
+      <input id="cmd" placeholder="Ask JARVIS or say Hey Jarvis / Bolo Jarvis..." />
+      <button id="send-btn">Send</button>
+      <button id="mic-btn" class="sec">Mic</button>
+    </div>
+    <div class="grid">
+      <button class="sec" onclick="quickAction('toggle',{target:'flashlight',value:'toggle'})">Flashlight</button>
+      <button class="sec" onclick="quickAction('battery_gps',{})">Battery + GPS</button>
+      <button class="sec" onclick="quickAction('camera',{mode:'photo'})">Camera Snap</button>
+      <button class="sec" onclick="quickAction('scroll',{direction:'down'})">Auto-Scroll</button>
+      <button class="sec" onclick="quickAction('siren',{active:true})">Anti-Theft Siren</button>
+      <button class="warn" onclick="quickAction('sos',{reason:'pwa_panic'})">Emergency SOS</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <div style="font-size:12px;font-weight:700;color:var(--pri);letter-spacing:1px">LIVE BRIDGE LOG</div>
+    <pre id="log">Ready. Enter pairing PIN from JARVIS Remote Control.</pre>
+  </section>
+
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
+    const logEl = document.getElementById('log');
+    const badge = document.getElementById('ws-badge');
+    const privEl = document.getElementById('privacy-toggle');
+    let token = sessionStorage.getItem('jarvis_token') || '';
+    let devId = localStorage.getItem('jarvis_pwa_id') || ('pwa-' + Math.random().toString(16).slice(2, 8));
+    localStorage.setItem('jarvis_pwa_id', devId);
+    let ws = null;
+    let hbTimer = null;
+
+    function addLog(line) {
+      logEl.textContent = `[${new Date().toLocaleTimeString()}] ${line}\n` + logEl.textContent.slice(0, 3000);
+    }
+
+    function connectWs() {
+      if (!token || privEl.checked) return;
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`);
+      ws.onopen = () => {
+        badge.textContent = 'LIVE WS';
+        badge.className = 'badge';
+        ws.send(JSON.stringify({
+          type: 'device_register',
+          device_id: devId,
+          name: 'Mobile Web PWA',
+          model: navigator.userAgent.slice(0, 48),
+          android_version: 'PWA',
+          capabilities: ['voice', 'command', 'gps', 'flashlight_req', 'sos'],
+          privacy_mode: privEl.checked
+        }));
+        hbTimer = setInterval(() => {
+          if (ws && ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: 'heartbeat', device_id: devId, privacy_mode: privEl.checked }));
+          }
+        }, 25000);
+        addLog('WebSocket connected as ' + devId);
+      };
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          addLog('IN: ' + JSON.stringify(msg));
+          if (msg.type === 'pc_to_android') {
+            ws.send(JSON.stringify({
+              type: 'android_result',
+              request_id: msg.request_id,
+              ok: true,
+              data: { handled_by: 'pwa', action: msg.action }
+            }));
+          }
+        } catch {}
+      };
+      ws.onclose = () => {
+        badge.textContent = privEl.checked ? 'PRIVACY LOCAL' : 'OFFLINE';
+        badge.className = 'badge off';
+        if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+      };
+    }
+
+    document.getElementById('pair-btn').onclick = async () => {
+      const pin = document.getElementById('pin').value.trim();
+      if (!pin) return;
+      const res = await fetch('/api/android/pair', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pin, device_id: devId, name: 'Mobile PWA', model: 'Browser' })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        token = data.token;
+        sessionStorage.setItem('jarvis_token', token);
+        addLog('Paired cleanly.');
+        connectWs();
+      } else {
+        addLog('Pair error: ' + (data.error || res.status));
+      }
+    };
+
+    privEl.onchange = () => {
+      if (privEl.checked && ws) { ws.close(); addLog('Privacy Mode ON — outbound sync halted.'); }
+      else if (!privEl.checked && token) { connectWs(); }
+    };
+
+    document.getElementById('send-btn').onclick = () => {
+      if (privEl.checked) { addLog('Blocked by Privacy Mode.'); return; }
+      const text = document.getElementById('cmd').value.trim();
+      if (!text || !ws || ws.readyState !== 1) return;
+      ws.send(JSON.stringify({ type: 'command', text }));
+      document.getElementById('cmd').value = '';
+      addLog('Sent: ' + text);
+    };
+
+    async function quickAction(action, params) {
+      if (privEl.checked) { addLog('Privacy Mode active — local-only guard blocked remote relay.'); return; }
+      if (!ws || ws.readyState !== 1) { addLog('Pair first to send ' + action); return; }
+      ws.send(JSON.stringify({ type: 'android_event', event: action, payload: params }));
+      addLog('Event -> PC: ' + action);
+    }
+
+    document.getElementById('mic-btn').onclick = () => {
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SR) { addLog('SpeechRecognition unsupported in this browser.'); return; }
+      const rec = new SR();
+      rec.lang = 'en-IN';
+      rec.onresult = (e) => {
+        const heard = e.results[0][0].transcript;
+        document.getElementById('cmd').value = heard;
+        addLog('Voice: ' + heard);
+      };
+      rec.start();
+    };
+
+    if (token) connectWs();
+  </script>
+</body>
+</html>

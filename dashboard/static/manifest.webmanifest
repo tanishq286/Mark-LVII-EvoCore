@@ -1,0 +1,17 @@
+{
+  "name": "JARVIS Mark-LVII Companion",
+  "short_name": "JARVIS",
+  "start_url": "/pwa",
+  "display": "standalone",
+  "background_color": "#07090f",
+  "theme_color": "#00d4ff",
+  "description": "Mark-LVII bidirectional Android & mobile HUD controller",
+  "icons": [
+    {
+      "src": "/pwa-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
