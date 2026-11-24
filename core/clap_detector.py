@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections import deque
 import queue
+import sys
 import threading
 from typing import Callable
 
@@ -25,6 +26,8 @@ import numpy as np
 SAMPLE_RATE = 16000
 FRAME_SAMPLES = 160      # 10 ms sub-frames at 16 kHz
 FFT_SIZE = 512           # 32 ms spectral analysis window
+_HP_TAPS = 129           # zero-phase linear FIR length (~8 ms overlap)
+_HP_CUTOFF_HZ = 280.0    # removes DC + <280 Hz fan rumble while keeping >=450 Hz 100% flat
 
 _COMMON_PRESET = {
     "decay_window_s": 0.16,
@@ -47,7 +50,7 @@ SENSITIVITY_PRESETS: dict[str, dict[str, float]] = {
         **_COMMON_PRESET,
         "min_rms": 450.0,
         "min_peak": 1400.0,
-        "snr_ratio": 4.8,
+        "snr_ratio": 4.2,
         "onset_ratio": 3.0,
         "min_high_ratio": 0.52,
         "min_flatness": 0.08,
@@ -57,7 +60,7 @@ SENSITIVITY_PRESETS: dict[str, dict[str, float]] = {
         **_COMMON_PRESET,
         "min_rms": 170.0,
         "min_peak": 580.0,
-        "snr_ratio": 3.8,
+        "snr_ratio": 3.2,
         "onset_ratio": 2.4,
         "min_high_ratio": 0.45,
         "min_flatness": 0.055,
@@ -67,7 +70,7 @@ SENSITIVITY_PRESETS: dict[str, dict[str, float]] = {
         **_COMMON_PRESET,
         "min_rms": 110.0,
         "min_peak": 380.0,
-        "snr_ratio": 3.2,
+        "snr_ratio": 2.8,
         "onset_ratio": 2.0,
         "min_high_ratio": 0.40,
         "min_flatness": 0.040,
@@ -82,6 +85,21 @@ def normalize_sensitivity(level: str | None) -> str:
     return val if val in SENSITIVITY_PRESETS else "medium"
 
 
+def _build_highpass_kernel(
+    sr: int, cutoff_hz: float = _HP_CUTOFF_HZ, taps: int = _HP_TAPS
+) -> np.ndarray:
+    """Build a linear-phase Hann-windowed high-pass FIR kernel (exact 0 DC gain)."""
+    mid = (taps - 1) // 2
+    n = np.arange(taps, dtype=np.float64) - mid
+    fc = float(cutoff_hz) / float(sr)
+    lp = (2.0 * fc) * np.sinc(2.0 * fc * n)
+    lp *= np.hanning(taps)
+    lp /= np.sum(lp)
+    hp = -lp
+    hp[mid] += 1.0
+    return hp.astype(np.float32)
+
+
 class ClapAnalyzer:
     """Pure synchronous double-clap state machine timed by sample clock."""
 
@@ -94,6 +112,10 @@ class ClapAnalyzer:
         self._sensitivity = normalize_sensitivity(sensitivity)
         self._cfg = dict(SENSITIVITY_PRESETS[self._sensitivity])
 
+        self._hp_taps = _HP_TAPS
+        self._hp_kernel = _build_highpass_kernel(self._sr, _HP_CUTOFF_HZ, self._hp_taps)
+        self._hp_tail = np.zeros(self._hp_taps - 1, dtype=np.float32)
+
         # Precompute FFT window and speech/clap band masks once.
         self._hann = np.hanning(self._fft_size).astype(np.float32)
         freqs = np.fft.rfftfreq(self._fft_size, 1.0 / self._sr)
@@ -103,11 +125,15 @@ class ClapAnalyzer:
         self._mask_core = (freqs >= 450.0) & (freqs <= 2000.0)
         self._mask_total = (freqs >= 60.0) & (freqs <= 7500.0)
 
-        self._pending_samples = np.empty(0, dtype=np.float32)
-        self._ring = np.zeros(self._ring_cap, dtype=np.float32)
+        self._pending_raw = np.empty(0, dtype=np.float32)
+        self._pending_hp = np.empty(0, dtype=np.float32)
+        self._ring_raw = np.zeros(self._ring_cap, dtype=np.float32)
+        self._ring_hp = np.zeros(self._ring_cap, dtype=np.float32)
         self._samples_processed = 0
         self._frames_seen = 0
         self._noise_floor = 60.0
+        self._bg_e_low = 0.0
+        self._bg_low_updates = 0
         self._prev_rms: deque[float] = deque(maxlen=8)
 
         self._active: dict | None = None
@@ -130,8 +156,13 @@ class ClapAnalyzer:
     def reset(self, *, keep_noise_floor: bool = True, clear_cooldown: bool = True) -> None:
         """Clear transient audio buffers and pairing state (used on sleep/wake)."""
         floor = self._noise_floor
-        self._pending_samples = np.empty(0, dtype=np.float32)
-        self._ring.fill(0.0)
+        bg_low = self._bg_e_low
+        bg_cnt = self._bg_low_updates
+        self._hp_tail.fill(0.0)
+        self._pending_raw = np.empty(0, dtype=np.float32)
+        self._pending_hp = np.empty(0, dtype=np.float32)
+        self._ring_raw.fill(0.0)
+        self._ring_hp.fill(0.0)
         self._prev_rms.clear()
         self._active = None
         self._first_clap = None
@@ -142,8 +173,12 @@ class ClapAnalyzer:
             self._cooldown_until = 0.0
         if keep_noise_floor:
             self._noise_floor = max(20.0, min(4000.0, floor))
+            self._bg_e_low = bg_low
+            self._bg_low_updates = bg_cnt
         else:
             self._noise_floor = 60.0
+            self._bg_e_low = 0.0
+            self._bg_low_updates = 0
             self._frames_seen = 0
 
     def process(self, frame_int16) -> bool:
@@ -156,56 +191,86 @@ class ClapAnalyzer:
         if arr.size == 0:
             return False
 
-        if self._pending_samples.size:
-            data = np.concatenate((self._pending_samples, arr))
+        hp_in = np.concatenate((self._hp_tail, arr))
+        hp_arr = np.convolve(hp_in, self._hp_kernel, mode="valid").astype(np.float32)
+        self._hp_tail = hp_in[-(self._hp_taps - 1) :].copy()
+
+        if self._pending_raw.size:
+            raw_data = np.concatenate((self._pending_raw, arr))
+            hp_data = np.concatenate((self._pending_hp, hp_arr))
         else:
-            data = arr
+            raw_data = arr
+            hp_data = hp_arr
 
         detected = False
         pos = 0
         step = self._frame_samples
-        total = data.size
+        total = raw_data.size
         while pos + step <= total:
-            sub = data[pos : pos + step]
-            pos += step
-            if self._step_subframe(sub):
+            if self._step_subframe(raw_data[pos : pos + step], hp_data[pos : pos + step]):
                 detected = True
+            pos += step
 
-        self._pending_samples = data[pos:].copy() if pos < total else np.empty(0, dtype=np.float32)
+        if pos < total:
+            self._pending_raw = raw_data[pos:].copy()
+            self._pending_hp = hp_data[pos:].copy()
+        else:
+            self._pending_raw = np.empty(0, dtype=np.float32)
+            self._pending_hp = np.empty(0, dtype=np.float32)
         return detected
 
-    def _capture_centered_window(self, peak_sample: int) -> np.ndarray:
-        """Slice an FFT_SIZE window centered on `peak_sample` (where hann == 1.0)."""
+    def _capture_centered_windows(self, peak_sample: int) -> tuple[np.ndarray, np.ndarray]:
+        """Slice aligned raw & high-passed FFT_SIZE windows centered on `peak_sample`."""
         half = self._fft_size // 2
         ring_idx = self._ring_cap - (self._samples_processed - peak_sample)
         start = max(0, min(self._ring_cap - self._fft_size, ring_idx - half))
-        return self._ring[start : start + self._fft_size].copy()
+        return (
+            self._ring_raw[start : start + self._fft_size].copy(),
+            self._ring_hp[start : start + self._fft_size].copy(),
+        )
 
-    def _passes_spectral_check(self, window: np.ndarray) -> bool:
-        """Reject thuds, speech vowels, and chimes using band ratios + flatness."""
-        if window.size != self._fft_size:
+    def _update_bg_low(self) -> None:
+        """Track ambient <320 Hz fan/rumble power so desk thuds still stand out."""
+        win = self._ring_raw[-self._fft_size :]
+        centered = win - float(np.mean(win))
+        spec = np.fft.rfft(centered * self._hann)
+        power = (spec.real * spec.real) + (spec.imag * spec.imag)
+        e_low = float(np.sum(power[self._mask_low]))
+        self._bg_low_updates += 1
+        if self._bg_low_updates <= 10:
+            alpha = 0.15 if self._bg_low_updates > 1 else 1.0
+        else:
+            alpha = 0.05
+        self._bg_e_low = (1.0 - alpha) * self._bg_e_low + alpha * e_low
+
+    def _passes_spectral_check(self, raw_win: np.ndarray, hp_win: np.ndarray) -> bool:
+        """Reject thuds, speech vowels, and chimes using ambient-aware bands + flatness."""
+        if raw_win.size != self._fft_size or hp_win.size != self._fft_size:
             self.last_reject_reason = "bad_window_size"
             return False
-        centered = window - float(np.mean(window))
-        rms = float(np.sqrt(np.mean(centered * centered)))
-        if rms <= 1e-6:
+
+        hp_c = hp_win - float(np.mean(hp_win))
+        hp_rms = float(np.sqrt(np.mean(hp_c * hp_c)))
+        if hp_rms <= 1e-6:
             self.last_reject_reason = "zero_rms"
             return False
-        crest = float(np.max(np.abs(centered))) / rms
+        crest = float(np.max(np.abs(hp_c))) / hp_rms
 
-        spec = np.fft.rfft(centered * self._hann)
+        raw_c = raw_win - float(np.mean(raw_win))
+        spec = np.fft.rfft(raw_c * self._hann)
         power = (spec.real * spec.real) + (spec.imag * spec.imag)
 
         e_low = float(np.sum(power[self._mask_low]))
         e_high = float(np.sum(power[self._mask_high]))
         e_mid = float(np.sum(power[self._mask_mid]))
-        e_total = float(np.sum(power[self._mask_total]))
-        if e_total <= 1e-9 or (e_low + e_high) <= 1e-9:
+        if (e_low + e_high) <= 1e-9:
             self.last_reject_reason = "zero_energy"
             return False
 
-        high_ratio = e_high / (e_low + e_high)
-        mid_ratio = e_mid / e_total
+        e_low_excess = max(0.0, e_low - 1.5 * self._bg_e_low)
+        denom = e_low_excess + e_high + 1e-9
+        high_ratio = e_high / denom
+        mid_ratio = e_mid / denom
 
         # Spectral flatness over core clap band (450-2000 Hz) + tonal peak concentration.
         mid_power = power[self._mask_mid]
@@ -219,7 +284,7 @@ class ClapAnalyzer:
         top3_ratio = float(np.sum(np.sort(mid_power)[-3:]) / (float(np.sum(mid_power)) + 1e-12))
 
         self.last_event = {
-            "rms": round(rms, 1),
+            "rms": round(hp_rms, 1),
             "crest": round(crest, 2),
             "high_ratio": round(high_ratio, 3),
             "mid_ratio": round(mid_ratio, 3),
@@ -254,18 +319,20 @@ class ClapAnalyzer:
         updated = (1.0 - alpha) * self._noise_floor + alpha * rms
         self._noise_floor = max(20.0, min(4000.0, updated))
 
-    def _step_subframe(self, sub: np.ndarray) -> bool:
-        self._samples_processed += sub.size
+    def _step_subframe(self, sub_raw: np.ndarray, sub_hp: np.ndarray) -> bool:
+        self._samples_processed += sub_raw.size
         self._frames_seen += 1
         t = self._samples_processed / self._sr
 
-        # Append subframe to rolling ring buffer.
-        shift = sub.size
-        self._ring[:-shift] = self._ring[shift:]
-        self._ring[-shift:] = sub
+        # Append synchronized subframes to raw & high-pass ring buffers.
+        shift = sub_raw.size
+        self._ring_raw[:-shift] = self._ring_raw[shift:]
+        self._ring_raw[-shift:] = sub_raw
+        self._ring_hp[:-shift] = self._ring_hp[shift:]
+        self._ring_hp[-shift:] = sub_hp
 
-        rms = float(np.sqrt(np.mean(sub * sub)))
-        sub_abs = float(np.max(np.abs(sub)))
+        rms = float(np.sqrt(np.mean(sub_hp * sub_hp)))
+        sub_abs = float(np.max(np.abs(sub_hp)))
         cfg = self._cfg
 
         # Expire stale first clap once outside max_gap_s.
@@ -286,7 +353,7 @@ class ClapAnalyzer:
                     if sub_abs > act["peak_abs"]:
                         act["peak_abs"] = sub_abs
                         act["peak_sample"] = (
-                            (self._samples_processed - sub.size) + int(np.argmax(np.abs(sub)))
+                            (self._samples_processed - sub_hp.size) + int(np.argmax(np.abs(sub_hp)))
                         )
                     if rms > act["peak_rms"]:
                         act["peak_rms"] = rms
@@ -303,13 +370,13 @@ class ClapAnalyzer:
                     return False
 
             if act["decayed"] and self._samples_processed >= act["peak_sample"] + (self._fft_size // 2):
-                window = self._capture_centered_window(act["peak_sample"])
+                raw_win, hp_win = self._capture_centered_windows(act["peak_sample"])
                 peak_t = act["peak_t"]
                 peak_rms = act["peak_rms"]
                 decay_rms = act["decay_rms"]
                 self._active = None
                 self._prev_rms.append(rms)
-                if not self._passes_spectral_check(window):
+                if not self._passes_spectral_check(raw_win, hp_win):
                     return False
                 return self._handle_verified_clap(peak_t, peak_rms, current_rms=decay_rms)
 
@@ -327,7 +394,7 @@ class ClapAnalyzer:
         )
 
         if rms >= trigger_level and sub_abs >= cfg["min_peak"] and t >= self._cooldown_until:
-            peak_sample = (self._samples_processed - sub.size) + int(np.argmax(np.abs(sub)))
+            peak_sample = (self._samples_processed - sub_hp.size) + int(np.argmax(np.abs(sub_hp)))
             self._active = {
                 "start_t": t,
                 "peak_t": t,
@@ -340,10 +407,12 @@ class ClapAnalyzer:
             self._prev_rms.append(rms)
             return False
 
-        # Quiet frame: update adaptive background floor (avoid pulling floor up during decays).
+        # Quiet frame: update adaptive background floor & ambient low-band baseline.
         if self._first_clap is None or rms <= cfg["valley_ratio"] * self._first_clap[1]:
             if rms < max(cfg["min_rms"] * 1.5, cfg["snr_ratio"] * self._noise_floor):
                 self._update_noise_floor(rms)
+                if self._frames_seen >= 8 and (self._frames_seen % 5) == 0:
+                    self._update_bg_low()
         self._prev_rms.append(rms)
         return False
 
@@ -404,8 +473,8 @@ class ClapAnalyzer:
 class DoubleClapDetector:
     """
     Threaded double-clap detector matching WakeWordDetector's lifecycle.
-    Mic callbacks push int16 frames via feed() without blocking; detections invoke
-    on_detect() on the worker thread.
+    Uses Windows WASAPI RAW mode when available to bypass voice-only OEM APOs
+    (e.g. Lenovo Elevoc), falling back transparently to feed() from main.py.
     """
 
     def __init__(
@@ -415,16 +484,88 @@ class DoubleClapDetector:
         sample_rate: int = SAMPLE_RATE,
         logger: Callable[[str], None] = print,
         notify: Callable[[str], None] | None = None,
+        use_wasapi_raw: bool = True,
+        device_name_fn: Callable[[], str] | None = None,
+        is_listening: Callable[[], bool] | None = None,
     ):
         self._on_detect = on_detect
+        self._sample_rate = max(8000, int(sample_rate))
         self._logger = logger
         self._notify = notify or (lambda _msg: None)
-        self._analyzer = ClapAnalyzer(sensitivity=sensitivity, sample_rate=sample_rate)
+        self._use_wasapi_raw = bool(use_wasapi_raw)
+        self._device_name_fn = device_name_fn
+        self._is_listening = is_listening
+        self._analyzer = ClapAnalyzer(sensitivity=sensitivity, sample_rate=self._sample_rate)
         self._queue: queue.Queue = queue.Queue(maxsize=64)
         self._thread: threading.Thread | None = None
+        self._raw_cap = None
+        self._was_paused = False
         self._running = False
         self._ready = False
         self._reset_pending = False
+
+    @property
+    def uses_own_stream(self) -> bool:
+        """True while a dedicated WASAPI RAW stream is feeding this detector."""
+        cap = self._raw_cap
+        return bool(cap is not None and cap.is_active)
+
+    def _start_raw_capture(self) -> bool:
+        if sys.platform != "win32" or not self._use_wasapi_raw:
+            return False
+        try:
+            from core.wasapi_raw import WasapiRawCapture
+
+            dev_name = ""
+            if callable(self._device_name_fn):
+                try:
+                    dev_name = str(self._device_name_fn() or "")
+                except Exception:
+                    dev_name = ""
+            cap = WasapiRawCapture(
+                on_chunk=self._on_raw_chunk,
+                device_name=dev_name,
+                target_rate=self._sample_rate,
+                logger=self._logger,
+            )
+            if cap.start():
+                self._raw_cap = cap
+                return True
+            cap.stop()
+        except Exception as exc:
+            self._logger(f"Double-clap: WASAPI RAW unavailable ({exc}).")
+        self._raw_cap = None
+        self._logger("Double-clap: WASAPI RAW unavailable — using shared mic stream.")
+        return False
+
+    def _on_raw_chunk(self, pcm_16k: np.ndarray) -> None:
+        if not self._running:
+            return
+        if callable(self._is_listening):
+            try:
+                listening = bool(self._is_listening())
+            except Exception:
+                listening = True
+            if not listening:
+                self._was_paused = True
+                return
+            if self._was_paused:
+                self._was_paused = False
+                self.reset()
+        self.feed(pcm_16k)
+
+    def reopen_audio(self) -> bool:
+        """Restart the dedicated WASAPI RAW capture (after audio device change/hotplug)."""
+        old = self._raw_cap
+        self._raw_cap = None
+        if old is not None:
+            try:
+                old.stop()
+            except Exception:
+                pass
+        if not self._running:
+            return False
+        return self._start_raw_capture()
 
     def start(self) -> bool:
         """Start the background double-clap worker thread. Idempotent, never raises."""
@@ -432,12 +573,14 @@ class DoubleClapDetector:
             return True
         try:
             self._analyzer.reset(keep_noise_floor=False)
+            self._was_paused = False
             self._running = True
             self._ready = True
             self._thread = threading.Thread(
                 target=self._loop, daemon=True, name="ClapDetectThread"
             )
             self._thread.start()
+            self._start_raw_capture()
             self._logger(f"Double-clap: listening (sensitivity={self._analyzer.sensitivity}).")
             return True
         except Exception as e:
@@ -449,6 +592,12 @@ class DoubleClapDetector:
     def stop(self) -> None:
         self._running = False
         self._ready = False
+        cap, self._raw_cap = self._raw_cap, None
+        if cap is not None:
+            try:
+                cap.stop()
+            except Exception:
+                pass
         try:
             self._queue.put_nowait(None)
         except Exception:

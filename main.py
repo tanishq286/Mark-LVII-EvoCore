@@ -593,6 +593,15 @@ def _keep_context_of(exc: BaseException) -> bool:
     return True
 
 
+def _flatten_error_text(exc: BaseException) -> str:
+    """Collect `str(exc)` across nested BaseExceptionGroup sub-exceptions."""
+    parts: list[str] = [str(exc)]
+    if isinstance(exc, BaseExceptionGroup):
+        for sub in exc.exceptions:
+            parts.append(_flatten_error_text(sub))
+    return " | ".join(p for p in parts if p)
+
+
 class JarvisLive:
     def __init__(self, ui: JarvisUI):
         # Platform limits are announced once per run, not once per
@@ -842,6 +851,11 @@ class JarvisLive:
                 sensitivity=get_clap_sensitivity(),
                 logger=lambda m: print(f"[Clap] {m}"),
                 notify=lambda m: self.ui.write_log(f"SYS: {m}"),
+                use_wasapi_raw=True,
+                device_name_fn=get_input_device,
+                is_listening=lambda: bool(
+                    self._clap_enabled and not self._awake and not self.ui.muted
+                ),
             )
         if not self._clap_detector.ready:
             return self._clap_detector.start()
@@ -2041,7 +2055,11 @@ class JarvisLive:
                 if not self.ui.muted:
                     if self._wake_enabled and self._wake_detector is not None:
                         self._wake_detector.feed(indata)
-                    if self._clap_enabled and self._clap_detector is not None:
+                    if (
+                        self._clap_enabled
+                        and self._clap_detector is not None
+                        and not self._clap_detector.uses_own_stream
+                    ):
                         self._clap_detector.feed(indata)
                 return
             with self._speaking_lock:
@@ -3029,8 +3047,11 @@ class JarvisLive:
                     self._audio_reinit_needed = False
                     await asyncio.to_thread(audio_devices.reinit_portaudio)
                     audio_devices.prefetch()
+                    if self._clap_detector is not None:
+                        await asyncio.to_thread(self._clap_detector.reopen_audio)
                 print("[JARVIS] Connecting...")
-                self.ui.set_state("THINKING")
+                if self._awake or not getattr(self, "_connected_once", False):
+                    self.ui.set_state("THINKING")
                 # Pick the rung to open the conversation on. A model resting
                 # off a quota limit is skipped; the name is published back to
                 # LIVE_MODEL so plugins follow whatever is actually in use.
@@ -3236,8 +3257,18 @@ class JarvisLive:
                     self._conn_backoff = 0
                     continue
 
-                err_str = str(e)
-                print(f"[JARVIS] Error ({type(e).__name__}): {e}")
+                err_str = _flatten_error_text(e)
+
+                # Idle inactivity / GoAway socket rotation — reconnect immediately
+                # with the stored resumption handle instead of spamming startup.log
+                # or sleeping 3 seconds. Checked before traceback.print_exc() because
+                # TaskGroup wraps Client APIError 1008 inside ExceptionGroup.
+                if "inactivity" in err_str.lower() or "goaway" in err_str.lower():
+                    print("[JARVIS] Live socket rotated (inactivity/GoAway) — reconnecting immediately.")
+                    self._conn_backoff = 0
+                    continue
+
+                print(f"[JARVIS] Error ({type(e).__name__}): {err_str}")
                 traceback.print_exc()
 
                 # Out of quota, or this model is not available to this key —
@@ -3298,13 +3329,6 @@ class JarvisLive:
                     self._conn_backoff = 3
                     continue
 
-                # Idle inactivity / GoAway socket rotation — reconnect immediately
-                # with the stored resumption handle instead of sleeping 3 seconds.
-                if "inactivity" in err_str.lower() or "goaway" in err_str.lower():
-                    print("[JARVIS] Live socket rotated (inactivity/GoAway) — reconnecting immediately.")
-                    self._conn_backoff = 0
-                    continue
-
                 # Network / timeout errors — log clearly and back off
                 is_net_err = any(k in err_str for k in (
                     "TimeoutError", "timed out", "getaddrinfo", "CancelledError",
@@ -3333,13 +3357,15 @@ class JarvisLive:
                     self._keep_task(asyncio.create_task(self._save_session_summary()))
 
             self.set_speaking(False)
-            self.ui.set_state("SLEEPING")
+            delay = getattr(self, "_conn_backoff", 3)
+            if not self._awake or delay > 0:
+                self.ui.set_state("SLEEPING")
 
             if self._dashboard:
                 await self._dashboard.broadcast({"type": "status", "state": "sleeping"})
 
-            delay = getattr(self, "_conn_backoff", 3)
-            print(f"[JARVIS] Reconnecting in {delay}s...")
+            if delay > 0:
+                print(f"[JARVIS] Reconnecting in {delay}s...")
             await asyncio.sleep(delay)
 
 def _exit_process(code: int = 0) -> None:

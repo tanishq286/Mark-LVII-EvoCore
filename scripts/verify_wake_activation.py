@@ -101,6 +101,26 @@ def _build_band_double_clap(rng: np.random.Generator, amp: float, dur_ms: float,
     return buf
 
 
+def _build_wasapi_raw_fan_double_clap(rng: np.random.Generator, gap_s: float = 0.40) -> np.ndarray:
+    """Simulate real WASAPI RAW Realtek mic (~385 RMS total: 89% <350Hz fan/DC + ~128 >350Hz)."""
+    total_s = 0.6 + gap_s + 0.6
+    n = int(SAMPLE_RATE * total_s)
+    noise = rng.normal(0.0, 1.0, n).astype(np.float32)
+    spec = np.fft.rfft(noise)
+    fr = np.fft.rfftfreq(n, 1.0 / SAMPLE_RATE)
+    shape = np.where(fr < 60.0, 1.0, np.where(fr < 350.0, 0.35, 0.032))
+    fan = np.fft.irfft(spec * shape, n=n).astype(np.float32)
+    fan *= 385.0 / (float(np.sqrt(np.mean(fan * fan))) + 1e-6)
+
+    c1 = _sim_real_clap(rng, 4200.0, 35.0, 1000.0, 800.0, 10.0)
+    c2 = _sim_real_clap(rng, 4200.0, 35.0, 1000.0, 800.0, 10.0)
+    p1 = int(0.50 * SAMPLE_RATE) + 90
+    p2 = p1 + int(gap_s * SAMPLE_RATE)
+    fan[p1 : p1 + c1.size] += c1
+    fan[p2 : p2 + c2.size] += c2
+    return fan
+
+
 def main() -> int:
     results: list[tuple[str, bool, str]] = []
 
@@ -113,6 +133,7 @@ def main() -> int:
     targets = [
         "core/wake_word.py",
         "core/clap_detector.py",
+        "core/wasapi_raw.py",
         "memory/config_manager.py",
         "main.py",
         "ui.py",
@@ -205,6 +226,7 @@ def main() -> int:
             ("reverb_room_decay45ms", _build_band_double_clap(rng, 6000, 180, 1100, 800, 45, 0.40)),
             ("fast_clap_150ms_gap", _build_band_double_clap(rng, 8000, 35, 1300, 1000, 10, 0.15)),
             ("slow_clap_1000ms_gap", _build_band_double_clap(rng, 8000, 35, 1300, 1000, 10, 1.00)),
+            ("wasapi_raw_fan_room_clap", _build_wasapi_raw_fan_double_clap(rng, 0.40)),
         ]
         tp_failures = []
         for label, sig in tp_cases:
@@ -222,7 +244,7 @@ def main() -> int:
             cb_count += 1
             cb_event.set()
 
-        cd = DoubleClapDetector(on_detect=_on_clap, sensitivity="medium")
+        cd = DoubleClapDetector(on_detect=_on_clap, sensitivity="medium", use_wasapi_raw=False)
         cd_started = cd.start()
         sig1 = np.clip(_build_double_clap(rng, 0.38), -32767, 32767).astype(np.int16)
         for i in range(0, sig1.size, CHUNK_SIZE):
@@ -396,6 +418,35 @@ def main() -> int:
         )
     except Exception as exc:
         check("7. TOOL_DECLARATIONS AST & plugin collision check", False, str(exc))
+
+    # 8. Live WASAPI RAW capture + zero false wakes on real room audio
+    try:
+        if sys.platform != "win32":
+            check("8. Live WASAPI RAW capture + zero false wakes", True, "skipped on non-Windows")
+        else:
+            from core.clap_detector import ClapAnalyzer
+            from core.wasapi_raw import WasapiRawCapture
+
+            captured: list[np.ndarray] = []
+            raw_cap = WasapiRawCapture(on_chunk=lambda c: captured.append(c.copy()), target_rate=SAMPLE_RATE)
+            started = raw_cap.start()
+            if started:
+                time.sleep(1.5)
+            dev_label = raw_cap.device_label
+            raw_cap.stop()
+
+            all_pcm = np.concatenate(captured) if captured else np.empty(0, dtype=np.int16)
+            rms = float(np.sqrt(np.mean(all_pcm.astype(np.float32) ** 2))) if all_pcm.size else 0.0
+            az = ClapAnalyzer(sensitivity="medium")
+            false_hits = _feed_signal(az, all_pcm.astype(np.float32)) if all_pcm.size else 0
+            ok_raw = started and all_pcm.size >= SAMPLE_RATE and rms > 10.0 and false_hits == 0
+            check(
+                "8. Live WASAPI RAW capture + zero false wakes",
+                ok_raw,
+                f"started={started}, device={dev_label!r}, samples={all_pcm.size}, rms={rms:.1f}, false_hits={false_hits}",
+            )
+    except Exception as exc:
+        check("8. Live WASAPI RAW capture + zero false wakes", False, str(exc))
 
     failed = [r for r in results if not r[1]]
     print(f"\nSUMMARY: {len(results) - len(failed)}/{len(results)} passed")
