@@ -292,6 +292,7 @@ def _describe_limits(has_vision: bool, has_mic: bool) -> str:
         "  2. For complex multi-step goals requiring planning and chaining several tools, call `autonomous_brain`.",
         "  3. If a request needs a brand-new tool or capability you do not yet have, call `self_evolve` (action='evolve') to build, score, and hot-load it on the spot.",
         "  4. For deep multi-file coding or connected cloud accounts (Gmail, Calendar, Drive, Notion, Vercel, Supabase, GitHub), call `claude_code`.",
+        "  5. For interactive multi-step desktop GUI tasks (open apps, click controls, type text, verify screen state), call `autonomous_screen_agent` (say 'Jarvis stop' or press ESC anytime to abort).",
         "- Never mime an action without calling a tool, and never report a result you did not get.",
     ]
     try:
@@ -2327,12 +2328,24 @@ class JarvisLive:
                                 # alone cannot show. Pure string work — it adds
                                 # nothing measurable to the response path.
                                 self._visemes.feed_text(txt)
+                                # ...and to the goddess, whose mood follows
+                                # what she says. Cheap regex, this thread.
+                                if hasattr(self.ui, "feel"):
+                                    self.ui.feel(txt, "jarvis")
 
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
                             if txt:
                                 in_buf.append(txt)
                                 self._last_user_speech = time.monotonic()
+                                if hasattr(self.ui, "feel"):
+                                    self.ui.feel(txt, "user")
+                                try:
+                                    from core.evolution import screen_agent as _sa
+                                    if _sa.is_running() and _sa.matches_voice_abort(" ".join(in_buf)):
+                                        _sa.request_global_abort("voice: jarvis stop")
+                                except Exception:
+                                    pass
 
                         if sc.turn_complete:
                             if self._turn_done_event:

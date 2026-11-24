@@ -7,10 +7,35 @@ recovery callback), and records full telemetry.
 """
 from __future__ import annotations
 
+import re
 import threading
 from typing import Any, Callable
 
 from core.evolution import reflection_loop, telemetry
+
+_GUI_SCREEN_CUE_RE = re.compile(
+    r"\b(click|double[\s-]?click|right[\s-]?click|type\s+into|press\s+|hotkey|"
+    r"on\s+screen|search\s+bar|address\s+bar|dialog|button|checkbox|drag|scroll|"
+    r"go\s+to\s+.+?\s+and\s+(?:search|click|play|type|fill|submit)|"
+    r"open\s+(?:chrome|edge|firefox|notepad|word|excel|calculator|settings|paint|"
+    r"vscode|vs\s*code|spotify|explorer|browser|youtube).+?\b(?:and|then|go\s+to|write|type|search|click|save))\b",
+    re.IGNORECASE,
+)
+_NON_GUI_CODE_RE = re.compile(
+    r"\b(git\s+status|pytest|unit\s+test|security\s+scan|weather\s+report|"
+    r"market\s+quote|research\s+report|deck_generator)\b",
+    re.IGNORECASE,
+)
+
+
+def is_gui_screen_goal(goal: str) -> bool:
+    """Return True when `goal` asks for multi-step interactive desktop GUI control."""
+    text = str(goal or "").strip()
+    if not text:
+        return False
+    if _NON_GUI_CODE_RE.search(text) and not re.search(r"\b(click|type\s+into|hotkey|button|open\s+chrome|open\s+notepad)\b", text, re.IGNORECASE):
+        return False
+    return bool(_GUI_SCREEN_CUE_RE.search(text))
 
 
 class VerifiedPlanner:
@@ -28,9 +53,12 @@ class VerifiedPlanner:
         llm_json_fn: Callable[[str], dict | None] | None = None,
     ) -> dict[str, Any]:
         immunity = reflection_loop.format_failure_immunity_context(db_path=self._db_path)
+        requires_screen_loop = is_gui_screen_goal(goal)
         prompt = (
             f"You are JARVIS's Verified Multi-Step Planner. Break the goal into at most "
             f"{max(1, min(12, int(max_steps or 6)))} verifiable steps.\n"
+            "If the request requires interactive desktop GUI chains (opening desktop apps, clicking UI controls, "
+            "typing into windows, or verifying live screen changes), prefer `autonomous_screen_agent` with `action='run'` and `goal`.\n"
             "If the request is genuinely ambiguous with mutually exclusive choices that require "
             "the user to pick an option first, set `ambiguous: true` and provide 2-4 concise `options`.\n"
             f"For risky/uncertain steps, specify `fallback_tool` and `fallback_parameters`.\n\n"
@@ -65,6 +93,7 @@ class VerifiedPlanner:
             "ambiguous": bool(raw.get("ambiguous")) and len(options) >= 2,
             "options": options[:5],
             "steps": [s for s in steps[:max_steps] if isinstance(s, dict)],
+            "requires_screen_loop": requires_screen_loop,
             "immunity_injected": bool(immunity),
             "immunity_context": immunity,
         }

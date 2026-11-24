@@ -143,7 +143,64 @@ def _execute_mission(goal: str, max_steps: int, player) -> None:
 
     try:
         from core import confirm, gemini
-        from core.evolution.planner import VerifiedPlanner
+        from core.evolution.planner import VerifiedPlanner, is_gui_screen_goal
+        from core.evolution import screen_agent
+
+        if is_gui_screen_goal(goal):
+            gui_max = max(max_steps, 12) if max_steps == 6 else max_steps
+            _step_log(
+                player,
+                f"Routing interactive desktop GUI mission to Closed-Loop Screen Agent (max_steps={gui_max})…",
+                status="executing",
+            )
+            gui_report = screen_agent.run_screen_goal(
+                goal,
+                max_steps=gui_max,
+                player=player,
+                cancel_event=_CANCEL,
+                on_step=lambda text: _step_log(player, text, status="verifying"),
+            )
+            gui_status = str(gui_report.get("status") or "")
+            if gui_status == "aborted" or _CANCEL.is_set():
+                raise RuntimeError(f"Mission cancelled by user ({gui_report.get('abort_reason') or 'aborted'}).")
+            elapsed = round(time.time() - started, 1)
+            gui_summary = screen_agent.format_report(gui_report)
+            if gui_status in ("awaiting_confirmation", "awaiting_choice", "blocked_voice_lock", "cancelled_by_user"):
+                with _state_lock:
+                    _MISSION["status"] = "done"
+                    _MISSION["finished"] = time.time()
+                    _MISSION["result"] = gui_summary[:2000]
+                _publish(player)
+                _call(player, "request_say", gui_summary[:260])
+                return
+
+            with _state_lock:
+                _MISSION["status"] = "done"
+                _MISSION["finished"] = time.time()
+                _MISSION["result"] = gui_summary[:2000]
+            _publish(player)
+            _save_mission_history({
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "goal": goal,
+                "strategy": "Closed-loop Observe -> Verify -> Act -> Re-Observe screen agent",
+                "steps": gui_report.get("steps_executed", 0),
+                "elapsed_s": elapsed,
+                "result": gui_summary[:1500],
+            })
+            _call(
+                player,
+                "show_content",
+                f"AUTONOMOUS SCREEN MISSION ({gui_status.upper()}, {elapsed}s)",
+                f"GOAL: {goal}\n\nSTEPS:\n"
+                + "\n".join(gui_report.get("hud_steps") or [])
+                + f"\n\nSUMMARY:\n{gui_summary}",
+            )
+            _call(
+                player,
+                "request_say",
+                f"[AUTONOMOUS MISSION COMPLETE] Screen mission '{goal[:120]}' finished ({gui_status}) in {elapsed}s: {gui_summary[:400]}",
+            )
+            return
 
         _, catalog_text = _catalog_summary(player)
         run_tool_fn = getattr(player, "run_tool", None) if player else None
@@ -306,7 +363,12 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
         return _status(player)
     if action == "cancel":
         _CANCEL.set()
-        return "Signaled the Autonomous Brain to stop the active mission."
+        try:
+            from core.evolution import screen_agent
+            screen_agent.request_global_abort("autonomous_brain cancel")
+        except Exception:
+            pass
+        return "Signaled the Autonomous Brain and Screen Agent to stop active execution."
     if not goal:
         return _status(player)
     if not _lock.acquire(blocking=False):
