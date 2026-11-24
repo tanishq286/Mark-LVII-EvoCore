@@ -178,6 +178,11 @@ def update_memory(memory_update: dict) -> dict:
     if _recursive_update(memory, memory_update):
         save_memory(memory)
         print(f"[Memory] 💾 Saved: {list(memory_update.keys())}")
+        try:
+            from core.memory import knowledge_graph as _kg
+            _kg.ingest_memory_dict(memory)
+        except Exception:
+            pass
     return memory
 
 def _entry_value(entry) -> str:
@@ -466,6 +471,11 @@ def save_session_summary(summary: str, language: str = "") -> None:
             json.dumps(memory, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+    try:
+        from core.memory import knowledge_graph as _kg
+        _kg.ingest_conversation_turn(summary)
+    except Exception:
+        pass
     print(f"[Memory] 📝 Session saved ({entry['date']}): {summary[:60]}…")
 
 

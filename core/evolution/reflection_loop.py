@@ -68,9 +68,19 @@ def format_failure_immunity_context(*, db_path: Path | None = None, limit: int =
     except Exception:
         pass
 
+    try:
+        from core.evolution import meta_optimizer
+        for ov in meta_optimizer.list_tuning_overrides()[:3]:
+            if ov.get("kind") == "prompt":
+                gr = str((ov.get("payload") or {}).get("guardrail") or "").strip()
+                if gr:
+                    lines.append(f"- Meta-Guardrail: {gr[:150]}")
+    except Exception:
+        pass
+
     if not lines:
         return ""
-    return "[FAILURE IMMUNITY — AVOID PAST ERRORS]\n" + "\n".join(lines[: limit + 3])
+    return "[FAILURE IMMUNITY — AVOID PAST ERRORS]\n" + "\n".join(lines[: limit + 5])
 
 
 def _pending_evolution_branches(repo_root: Path) -> list[str]:
@@ -78,7 +88,7 @@ def _pending_evolution_branches(repo_root: Path) -> list[str]:
 
     branches: list[str] = []
     try:
-        for pattern in ("skill/*", "autofix/*"):
+        for pattern in ("skill/*", "autofix/*", "evolve/*"):
             res = run_git(repo_root, "branch", "--list", pattern, "--format=%(refname:short)")
             if res.returncode == 0:
                 for ln in (res.stdout or "").splitlines():
@@ -235,7 +245,7 @@ def approve_upgrade(
     payload = dict(target_prop.get("payload") or {})
 
     def _run_upgrade() -> str:
-        if kind == "approve_branch":
+        if kind in ("approve_branch", "approve_evolve"):
             res = skill_synthesizer.approve_and_hotload(
                 root,
                 payload["branch"],
@@ -249,6 +259,13 @@ def approve_upgrade(
                 _mark_proposal_status(upgrade_id, "approved", msg, digest_path=digest_path)
                 return msg
             return f"Upgrade #{upgrade_id} failed: {res.get('error')}"
+
+        if kind == "apply_meta_tuning":
+            from core.evolution import meta_optimizer
+            applied = meta_optimizer.apply_tuning_proposal(payload)
+            msg = f"Applied meta-optimizer tuning override '{applied['override_key']}'."
+            _mark_proposal_status(upgrade_id, "approved", msg, digest_path=digest_path)
+            return msg
 
         if kind == "compile_habit":
             rec = habit_compiler.compile_habit(

@@ -1,8 +1,13 @@
-"""JARVIS Autonomous Multi-Step Executive Brain & Cross-OS Orchestrator.
+"""JARVIS Autonomous Multi-Step Executive Brain, Parallel Swarm & Mission Orchestrator.
 
-Decomposes complex goals into an adaptive Plan -> Execute -> Verify -> Adapt
-loop over JARVIS's entire live tool catalog (core actions + hot-loaded plugins),
-streaming every step and decision to the JARVIS HUD in real time.
+Decomposes complex goals into:
+  1. Parallel Multi-Agent Swarm + Critic (`core/evolution/swarm.py`) for complex
+     multi-domain goals (Researcher, Coder, Visual Screen Operator, Security Auditor),
+  2. Closed-Loop Autonomous Screen Agent (`core/evolution/screen_agent.py`) for
+     interactive desktop GUI goals,
+  3. Verified Multi-Step Planner (`core/evolution/planner.py`) for sequential tool chains,
+  4. Persistent Long-Horizon Missions (`core/evolution/mission_runner.py`) that
+     survive restarts in SQLite and push alerts/approvals straight to the phone.
 """
 from __future__ import annotations
 
@@ -13,31 +18,60 @@ from pathlib import Path
 
 PLUGIN = {
     "name": "autonomous_brain",
-    "brief": "Plan and chain multiple JARVIS tools for complex multi-step goals.",
+    "brief": "Plan, spawn parallel Swarm + Critic sub-agents, or schedule persistent missions.",
     "description": (
-        "JARVIS's high-intelligence multi-step executive planner and autonomous orchestrator. "
-        "Use this when the user gives a complex multi-stage goal that requires planning, chaining "
-        "multiple JARVIS tools in sequence, verifying results, or adapting automatically. "
+        "JARVIS's OmniCore multi-step executive planner, parallel multi-agent Swarm + Critic "
+        "orchestrator, and persistent background mission controller. "
         "Actions: "
-        "'status' = view the active or most recent autonomous mission plan and step trace; "
-        "'execute' = decompose a complex goal into steps and execute them autonomously with live HUD tracking; "
-        "'cancel' = abort the currently running autonomous mission."
+        "'status' = view active or recent mission/swarm plan and step trace; "
+        "'execute' = execute a complex goal (automatically spawning parallel Researcher/Coder/"
+        "Screen/Security sub-agents with Critic verification for multi-domain goals); "
+        "'swarm' = explicitly run the goal on the parallel Multi-Agent Swarm + SQLite blackboard; "
+        "'schedule_mission' / 'list_missions' / 'pause_mission' / 'resume_mission' = manage "
+        "SQLite-persisted long-horizon background missions that survive restarts; "
+        "'cancel' = abort active brain, swarm, or screen execution."
     ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "enum": ["status", "execute", "cancel"],
+                "enum": [
+                    "status",
+                    "execute",
+                    "swarm",
+                    "schedule_mission",
+                    "list_missions",
+                    "pause_mission",
+                    "resume_mission",
+                    "cancel",
+                ],
                 "description": "Operation to run (default 'status', or 'execute' when goal is provided).",
             },
             "goal": {
                 "type": "STRING",
-                "description": "For 'execute': the complete high-level mission or multi-step request to accomplish.",
+                "description": "Complete high-level mission or multi-step request to accomplish.",
             },
             "max_steps": {
                 "type": "INTEGER",
-                "description": "Maximum autonomous tool steps to run (default 6, max 12).",
+                "description": "Maximum autonomous steps or parallel swarm tasks (default 6, max 12).",
+            },
+            "trigger_type": {
+                "type": "STRING",
+                "enum": ["immediate", "interval", "cron", "event", "screen_trigger"],
+                "description": "For schedule_mission: wake trigger type (default 'interval').",
+            },
+            "interval_s": {
+                "type": "INTEGER",
+                "description": "For interval missions: seconds between wakes (default 300).",
+            },
+            "cron_expr": {
+                "type": "STRING",
+                "description": "For cron missions: 5-field cron schedule (e.g. '0 9 * * *').",
+            },
+            "mission_id": {
+                "type": "STRING",
+                "description": "Target mission_id for pause_mission or resume_mission.",
             },
         },
         "required": ["action"],
@@ -103,6 +137,11 @@ def _step_log(player, text: str, status: str | None = None, step_key: str | None
                 )["state"] = step_state
     _publish(player)
     _call(player, "write_log", f"SYS: [Brain] {text[:140]}")
+    try:
+        from dashboard.server import broadcast_mission_log
+        broadcast_mission_log(text, source="brain", status=status or "")
+    except Exception:
+        pass
 
 
 def _save_mission_history(entry: dict) -> None:
@@ -119,7 +158,7 @@ def _save_mission_history(entry: dict) -> None:
         pass
 
 
-def _execute_mission(goal: str, max_steps: int, player) -> None:
+def _execute_mission(goal: str, max_steps: int, player, *, force_swarm: bool = False) -> None:
     started = time.time()
     _CANCEL.clear()
     with _state_lock:
@@ -144,9 +183,10 @@ def _execute_mission(goal: str, max_steps: int, player) -> None:
     try:
         from core import confirm, gemini
         from core.evolution.planner import VerifiedPlanner, is_gui_screen_goal
-        from core.evolution import screen_agent
+        from core.evolution import screen_agent, swarm
 
-        if is_gui_screen_goal(goal):
+        # 1. Closed-Loop Screen Agent for interactive desktop GUI chains
+        if not force_swarm and is_gui_screen_goal(goal):
             gui_max = max(max_steps, 12) if max_steps == 6 else max_steps
             _step_log(
                 player,
@@ -165,20 +205,15 @@ def _execute_mission(goal: str, max_steps: int, player) -> None:
                 raise RuntimeError(f"Mission cancelled by user ({gui_report.get('abort_reason') or 'aborted'}).")
             elapsed = round(time.time() - started, 1)
             gui_summary = screen_agent.format_report(gui_report)
-            if gui_status in ("awaiting_confirmation", "awaiting_choice", "blocked_voice_lock", "cancelled_by_user"):
-                with _state_lock:
-                    _MISSION["status"] = "done"
-                    _MISSION["finished"] = time.time()
-                    _MISSION["result"] = gui_summary[:2000]
-                _publish(player)
-                _call(player, "request_say", gui_summary[:260])
-                return
-
             with _state_lock:
                 _MISSION["status"] = "done"
                 _MISSION["finished"] = time.time()
                 _MISSION["result"] = gui_summary[:2000]
             _publish(player)
+            if gui_status in ("awaiting_confirmation", "awaiting_choice", "blocked_voice_lock", "cancelled_by_user"):
+                _call(player, "request_say", gui_summary[:260])
+                return
+
             _save_mission_history({
                 "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "goal": goal,
@@ -204,8 +239,56 @@ def _execute_mission(goal: str, max_steps: int, player) -> None:
 
         _, catalog_text = _catalog_summary(player)
         run_tool_fn = getattr(player, "run_tool", None) if player else None
-        planner = VerifiedPlanner()
 
+        # 2. Parallel Multi-Agent Swarm + Critic for complex multi-specialist goals
+        if force_swarm or swarm.is_complex_swarm_goal(goal):
+            _step_log(
+                player,
+                "Spawning parallel OmniCore Sub-Agents (Researcher, Coder, Visual, Security) + Critic over SQLite blackboard…",
+                status="executing",
+            )
+            coord = swarm.SwarmCoordinator()
+            sw_report = coord.execute_swarm(
+                goal,
+                catalog_text=catalog_text,
+                max_tasks=min(8, max(3, max_steps)),
+                run_tool_fn=run_tool_fn if callable(run_tool_fn) else None,
+                on_progress=lambda msg, st, k, fst: _step_log(player, msg, status=st, step_key=k, step_state=fst),
+            )
+            elapsed = round(time.time() - started, 1)
+            final_answer = str(sw_report.get("final_report") or "Swarm complete.")
+            sw_status = str(sw_report.get("status") or "done")
+            with _state_lock:
+                _MISSION["status"] = "done" if sw_status != "failed" else "failed"
+                _MISSION["finished"] = time.time()
+                _MISSION["summary"] = sw_report.get("strategy", "")
+                _MISSION["result"] = final_answer[:2000]
+            _publish(player)
+            _save_mission_history({
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "goal": goal,
+                "strategy": f"OmniCore Parallel Swarm ({sw_report.get('run_id')})",
+                "steps": len(sw_report.get("tasks") or []),
+                "elapsed_s": elapsed,
+                "result": final_answer[:1500],
+            })
+            _call(
+                player,
+                "show_content",
+                f"OMNICORE SWARM COMPLETE ({elapsed}s)",
+                f"GOAL: {goal}\nRUN ID: {sw_report.get('run_id')}\n"
+                f"CRITIC VERDICT: {json.dumps(sw_report.get('critic_verdict'))}\n\n"
+                f"SYNTHESIS:\n{final_answer}",
+            )
+            _call(
+                player,
+                "request_say",
+                f"[SWARM MISSION COMPLETE] '{goal[:120]}' verified by Critic in {elapsed}s:\n{final_answer[:600]}",
+            )
+            return
+
+        # 3. Verified Sequential Multi-Step Planner
+        planner = VerifiedPlanner()
         plan = planner.plan(goal, catalog_text, max_steps=max_steps)
         strategy = str(plan.get("strategy") or "Direct verified execution.")
         steps = list(plan.get("steps") or [])
@@ -344,12 +427,13 @@ def _status(player) -> str:
                 return f"No mission is currently running. Last completed mission: {last.get('goal', '')[:90]}."
         except Exception:
             pass
-    msg = "Autonomous Executive Brain is online and ready for multi-step goals."
+    msg = "Autonomous Executive Brain (Planner + Parallel Swarm + Persistent Missions) is online."
     _call(player, "show_content", "AUTONOMOUS BRAIN", msg)
     return msg
 
 
 def run(parameters: dict, player=None, session_memory=None) -> str:
+    _ = session_memory
     params = parameters or {}
     goal = str(params.get("goal") or "").strip()
     raw_action = str(params.get("action") or "").strip().lower()
@@ -361,14 +445,45 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
 
     if action == "status":
         return _status(player)
+
     if action == "cancel":
         _CANCEL.set()
         try:
-            from core.evolution import screen_agent
+            from core.evolution import screen_agent, swarm
             screen_agent.request_global_abort("autonomous_brain cancel")
+            swarm.request_swarm_cancel()
         except Exception:
             pass
-        return "Signaled the Autonomous Brain and Screen Agent to stop active execution."
+        return "Signaled the Autonomous Brain, Multi-Agent Swarm, and Screen Agent to stop active execution."
+
+    if action in ("schedule_mission", "list_missions", "pause_mission", "resume_mission"):
+        from core.evolution import mission_runner
+        runner = mission_runner.get_default_runner()
+        if action == "list_missions":
+            items = runner.list_missions(limit=15)
+            if not items:
+                return "No persistent background missions are stored yet."
+            body = json.dumps(items, indent=2, ensure_ascii=False)
+            _call(player, "show_content", "PERSISTENT MISSIONS", body[:4000])
+            return f"{len(items)} persistent mission(s): " + ", ".join(f"{m['mission_id']}({m['status']})" for m in items[:6])
+        if action == "pause_mission":
+            mid = str(params.get("mission_id") or "").strip()
+            return f"Paused {mid}." if runner.set_status(mid, "paused") else f"Mission '{mid}' not found."
+        if action == "resume_mission":
+            mid = str(params.get("mission_id") or "").strip()
+            return f"Resumed {mid}." if runner.set_status(mid, "active") else f"Mission '{mid}' not found."
+        if not goal:
+            return "Provide a 'goal' for schedule_mission."
+        ttype = str(params.get("trigger_type") or "interval").strip().lower()
+        tspec: dict = {}
+        if ttype == "interval":
+            tspec["interval_s"] = max(10, int(params.get("interval_s") or 300))
+        elif ttype == "cron":
+            tspec["cron"] = str(params.get("cron_expr") or "0 * * * *")
+        rec = runner.create_mission(goal, trigger_type=ttype, trigger_spec=tspec, notify_phone=True)
+        runner.start_background_loop()
+        return f"Scheduled persistent SQLite mission '{rec['mission_id']}' (trigger={ttype}, survives restarts, phone alerts enabled)."
+
     if not goal:
         return _status(player)
     if not _lock.acquire(blocking=False):
@@ -377,10 +492,11 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
     threading.Thread(
         target=_execute_mission,
         args=(goal, max_steps, player),
+        kwargs={"force_swarm": action == "swarm"},
         daemon=True,
         name="jarvis-autonomous-brain",
     ).start()
     return (
-        "Autonomous Executive Brain engaged. I am decomposing the goal and streaming "
-        "each execution step live to your HUD."
+        "Autonomous Executive Brain engaged. Decomposing the goal and streaming "
+        "each execution step live to your HUD and phone."
     )

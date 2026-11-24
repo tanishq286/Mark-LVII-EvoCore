@@ -1,6 +1,130 @@
 {
-  "_comment": "Copy to config/mcp_servers.json (git-ignored) and set enabled=true only for servers you trust. Tools NOT listed in allowed_tools are denied by default.",
+  "_comment": "Copy to config/mcp_servers.json (git-ignored) and set enabled=true only for servers you trust. Tools NOT listed in allowed_tools are denied by default; mutating_tools require HUD confirmation and locked_tools require Biometric Voice Lock + HUD confirmation.",
   "servers": {
+    "github": {
+      "enabled": false,
+      "transport": "stdio",
+      "command": [
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-github"
+      ],
+      "allowed_tools": [
+        "search_repositories",
+        "get_file_contents",
+        "list_issues",
+        "list_pull_requests",
+        "create_issue"
+      ],
+      "mutating_tools": [
+        "create_issue",
+        "create_pull_request",
+        "push_files",
+        "merge_pull_request"
+      ],
+      "locked_tools": [
+        "delete_repository"
+      ],
+      "timeout_sec": 20
+    },
+    "google_workspace": {
+      "enabled": false,
+      "transport": "stdio",
+      "command": [
+        "npx",
+        "-y",
+        "@gongrzhe/server-gmail-autoauth-mcp"
+      ],
+      "allowed_tools": [
+        "search_emails",
+        "read_email",
+        "list_calendar_events",
+        "draft_email",
+        "send_email"
+      ],
+      "mutating_tools": [
+        "send_email",
+        "create_calendar_event",
+        "delete_email"
+      ],
+      "locked_tools": [
+        "permanently_delete_email"
+      ],
+      "timeout_sec": 20
+    },
+    "notion": {
+      "enabled": false,
+      "transport": "stdio",
+      "command": [
+        "npx",
+        "-y",
+        "@notionhq/notion-mcp-server"
+      ],
+      "allowed_tools": [
+        "API-post-search",
+        "API-retrieve-a-page",
+        "API-query-a-database",
+        "API-patch-block-children"
+      ],
+      "mutating_tools": [
+        "API-post-page",
+        "API-patch-page",
+        "API-patch-block-children"
+      ],
+      "locked_tools": [
+        "API-delete-a-block"
+      ],
+      "timeout_sec": 20
+    },
+    "postgres_database": {
+      "enabled": false,
+      "transport": "stdio",
+      "command": [
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-postgres",
+        "postgresql://localhost:5432/mydb"
+      ],
+      "allowed_tools": [
+        "query",
+        "list_tables",
+        "describe_table"
+      ],
+      "mutating_tools": [
+        "execute_sql",
+        "insert_row",
+        "update_row"
+      ],
+      "locked_tools": [
+        "drop_table",
+        "truncate_table"
+      ],
+      "timeout_sec": 15
+    },
+    "smart_home_hass": {
+      "enabled": false,
+      "transport": "http",
+      "url": "http://homeassistant.local:8123/mcp_server/sse",
+      "headers": {},
+      "allowed_tools": [
+        "get_states",
+        "turn_on_light",
+        "turn_off_light",
+        "set_thermostat",
+        "unlock_front_door"
+      ],
+      "mutating_tools": [
+        "turn_on_light",
+        "turn_off_light",
+        "set_thermostat",
+        "activate_scene"
+      ],
+      "locked_tools": [
+        "unlock_front_door",
+        "disarm_alarm"
+      ],
+      "timeout_sec": 15
+    },
     "local_filesystem": {
       "enabled": false,
       "transport": "stdio",
@@ -19,6 +143,7 @@
         "write_file",
         "delete_file"
       ],
+      "locked_tools": [],
       "timeout_sec": 15
     },
     "local_http_mcp": {
@@ -34,6 +159,7 @@
         "create_note",
         "delete_note"
       ],
+      "locked_tools": [],
       "timeout_sec": 15
     }
   }

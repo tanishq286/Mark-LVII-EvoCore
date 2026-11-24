@@ -2,16 +2,20 @@ package com.marklvii.jarvis
 
 import com.marklvii.jarvis.core.AndroidEvent
 import com.marklvii.jarvis.core.AndroidResult
+import com.marklvii.jarvis.core.ConfirmResolveCommand
 import com.marklvii.jarvis.core.CryptoEnvelope
 import com.marklvii.jarvis.core.DeviceRegister
+import com.marklvii.jarvis.core.PairingQrPayload
 import com.marklvii.jarvis.core.PcToAndroidCommand
 import com.marklvii.jarvis.core.PrivacyState
+import com.marklvii.jarvis.core.ScreenInputCommand
 import com.marklvii.jarvis.core.ToolInvoke
 import com.marklvii.jarvis.modules.antitheft.MotionTamperDetector
 import com.marklvii.jarvis.modules.wakeword.WakePhraseMatcher
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import javax.crypto.AEADBadTagException
@@ -40,13 +44,10 @@ class MaxModulesUnitTest {
     @Test
     fun motionTamperDetectorTriggersOnSustainedDeltaAndRespectsCooldown() {
         val det = MotionTamperDetector(deltaThresholdMs2 = 4.0f, requiredHits = 2, cooldownMs = 5_000L)
-        // Baseline ~ 9.81
         assertFalse(det.evaluate(0.0f, 9.81f, 0.0f, 1_000L))
         assertFalse(det.evaluate(0.1f, 9.80f, 0.0f, 1_100L))
-        // Sudden movement hits 1 then 2
         assertFalse(det.evaluate(8.0f, 14.0f, 6.0f, 2_000L))
         assertTrue(det.evaluate(9.0f, 15.0f, 7.0f, 2_200L))
-        // Still inside 5s cooldown -> suppressed
         assertFalse(det.evaluate(9.0f, 15.0f, 7.0f, 3_000L))
         assertFalse(det.evaluate(9.0f, 15.0f, 7.0f, 3_200L))
     }
@@ -107,5 +108,35 @@ class MaxModulesUnitTest {
             badTag = true
         }
         assertTrue(badTag)
+    }
+
+    @Test
+    fun pairingQrScreenInputAndHudApprovalModelsWork() {
+        val parsedUrl = PairingQrPayload.parse("https://172.16.6.143:8000/pwa?pin=ABCD2345&fp=DEADBEF0")
+        assertNotNull(parsedUrl)
+        assertEquals("https://172.16.6.143:8000", parsedUrl!!.baseUrl)
+        assertEquals("ABCD2345", parsedUrl.pin)
+        assertEquals("deadbef0", parsedUrl.certSha256)
+
+        val parsedJson = PairingQrPayload.parse(
+            """{"qr_payload":{"url":"https://172.16.6.143:8000","pin":"wxyz9876","cert_sha256":"AABBCC"}}"""
+        )
+        assertNotNull(parsedJson)
+        assertEquals("https://172.16.6.143:8000", parsedJson!!.baseUrl)
+        assertEquals("WXYZ9876", parsedJson.pin)
+        assertEquals("aabbcc", parsedJson.certSha256)
+
+        val tapJson = ScreenInputCommand(action = "tap", normX = 0.5f, normY = 0.25f).toJson()
+        assertEquals("screen_input", tapJson.getString("type"))
+        assertEquals("tap", tapJson.getString("action"))
+        assertEquals(0.5, tapJson.getDouble("norm_x"), 0.001)
+
+        val confirmJson = ConfirmResolveCommand(kind = "confirm", accepted = true).toJson()
+        assertEquals("confirm_resolve", confirmJson.getString("type"))
+        assertTrue(confirmJson.getBoolean("accepted"))
+
+        val choiceJson = ConfirmResolveCommand(kind = "choice", selection = 1).toJson()
+        assertEquals("choice", choiceJson.getString("kind"))
+        assertEquals(1, choiceJson.getInt("selection"))
     }
 }

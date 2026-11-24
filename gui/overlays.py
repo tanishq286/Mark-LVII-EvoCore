@@ -1781,7 +1781,7 @@ class RemoteKeyOverlay(QWidget):
 
     closed = pyqtSignal()
 
-    _OW, _OH = 400, 465
+    _OW, _OH = 420, 520
 
     def __init__(self, url: str, key: str, auto_login_url: str = "",
                  manual_url: str = "", expiry_secs: int = 600, parent=None,
@@ -1797,6 +1797,19 @@ class RemoteKeyOverlay(QWidget):
         """)
         self._expiry          = time.time() + expiry_secs
         self._on_new_key      = None
+        self._key             = key
+        self._fp              = ""
+        self._qr_info         = {}
+        try:
+            from dashboard.server import get_active_server
+            _srv = get_active_server()
+            if _srv is not None:
+                self._qr_info = _srv.build_qr_pairing_info(key=key, include_pin=True)
+                self._fp = str(self._qr_info.get("cert_sha256") or "")
+                auto_login_url = str(self._qr_info.get("pairing_url") or auto_login_url)
+                manual_url = str(self._qr_info.get("pwa_url") or manual_url)
+        except Exception:
+            pass
         self._auto_login_url  = auto_login_url
         self._manual_url      = manual_url or url
 
@@ -1904,6 +1917,13 @@ class RemoteKeyOverlay(QWidget):
         self._timer_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(self._timer_lbl)
 
+        fp_short = f"TLS SHA-256: {self._fp[:20]}…" if self._fp else "TLS: pending"
+        ts_info = (self._qr_info.get("tailscale") or {}) if isinstance(self._qr_info, dict) else {}
+        if ts_info.get("available"):
+            fp_short += f"  ·  4G Tailscale: {ts_info.get('ip')}"
+        self._fp_lbl = _lbl(fp_short, 7, color=C.TEXT_DIM)
+        lay.addWidget(self._fp_lbl)
+
         btn_row = QHBoxLayout(); btn_row.setSpacing(8)
         new_btn = QPushButton("NEW KEY")
         new_btn.setFixedHeight(32)
@@ -1918,6 +1938,20 @@ class RemoteKeyOverlay(QWidget):
         """)
         new_btn.clicked.connect(self._refresh_key)
         btn_row.addWidget(new_btn)
+
+        self._tun_btn = QPushButton("4G TUNNEL")
+        self._tun_btn.setFixedHeight(32)
+        self._tun_btn.setFont(hud_font(8, QFont.Weight.Bold))
+        self._tun_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tun_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C.PANEL}; color: {C.ACC2};
+                border: 1px solid {C.BORDER_B}; border-radius: 5px;
+            }}
+            QPushButton:hover {{ border: 1px solid {C.PRI}; color: {C.PRI}; }}
+        """)
+        self._tun_btn.clicked.connect(self._activate_tunnel)
+        btn_row.addWidget(self._tun_btn)
 
         close_btn = QPushButton("DISMISS")
         close_btn.setFixedHeight(32)
@@ -2013,6 +2047,16 @@ class RemoteKeyOverlay(QWidget):
                 key    = result[1]
                 auto   = result[2] if len(result) >= 3 else ""
                 manual = result[3] if len(result) >= 4 else url
+                self._key = key
+                try:
+                    from dashboard.server import get_active_server
+                    _srv = get_active_server()
+                    if _srv is not None:
+                        _info = _srv.build_qr_pairing_info(key=key, include_pin=True)
+                        auto = str(_info.get("pairing_url") or auto)
+                        manual = str(_info.get("pwa_url") or manual)
+                except Exception:
+                    pass
                 self._manual_url     = manual or url
                 self._url_lbl.setText(self._manual_url)
                 self._key_lbl.setText(key)
@@ -2032,6 +2076,34 @@ class RemoteKeyOverlay(QWidget):
                 )
                 self._ctimer.start(1000)
                 self._tick()
+
+    def _activate_tunnel(self):
+        """Switch QR code to Tailscale or start a Cloudflare Quick Tunnel for 4G/5G pairing."""
+        try:
+            from dashboard.server import detect_tailscale, get_active_server, start_quick_tunnel
+            srv = get_active_server()
+            if srv is None:
+                return
+            ts = detect_tailscale()
+            if ts.get("available"):
+                info = srv.build_qr_pairing_info(key=self._key, include_pin=True, mode="tailscale")
+                self._manual_url = str(info.get("pwa_url") or self._manual_url)
+                self._url_lbl.setText(self._manual_url)
+                self._update_qr(str(info.get("pairing_url") or self._manual_url))
+                self._fp_lbl.setText(f"4G Tailscale Ready: {ts.get('url')}")
+                return
+            self._fp_lbl.setText("Starting Cloudflare 4G Quick Tunnel…")
+            st = start_quick_tunnel(wait_s=4.0)
+            if st.get("running") and st.get("url"):
+                info = srv.build_qr_pairing_info(key=self._key, include_pin=True, mode="tunnel")
+                self._manual_url = str(info.get("pwa_url") or st["url"])
+                self._url_lbl.setText(self._manual_url)
+                self._update_qr(str(info.get("pairing_url") or st["url"]))
+                self._fp_lbl.setText("4G Cloudflare Quick Tunnel Active ✓")
+            else:
+                self._fp_lbl.setText(str(st.get("error") or "Install Tailscale or cloudflared for 4G access"))
+        except Exception as exc:
+            self._fp_lbl.setText(f"Tunnel unavailable: {exc}")
 
     def _do_close(self):
         self._ctimer.stop()

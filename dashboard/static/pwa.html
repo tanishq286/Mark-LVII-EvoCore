@@ -2,56 +2,129 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <meta name="theme-color" content="#00d4ff" />
   <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="icon" href="/pwa-icon.svg" type="image/svg+xml" />
-  <title>JARVIS Mobile Companion PWA</title>
+  <title>MARK-LVII · Mobile Remote & Companion PWA</title>
   <style>
-    :root { --bg:#07090f; --panel:#0d1520; --pri:#00d4ff; --acc:#ff6b00; --text:#e2f6ff; --mut:#6f8ca0; --red:#ff3355; }
-    * { box-sizing:border-box; margin:0; padding:0; }
-    body { background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,sans-serif; padding:16px; max-width:540px; margin:0 auto; }
-    header { display:flex; align-items:center; justify-content:space-between; padding-bottom:12px; border-bottom:1px solid rgba(0,212,255,0.2); margin-bottom:14px; }
-    .title { font-weight:700; letter-spacing:3px; color:var(--pri); font-size:15px; }
-    .badge { font-size:11px; padding:4px 10px; border-radius:99px; border:1px solid var(--pri); color:var(--pri); }
+    :root {
+      --bg:#06090f; --panel:#0d1520; --panel2:#071019;
+      --pri:#00d4ff; --acc:#ff6b00; --ok:#00ff88;
+      --text:#e2f6ff; --mut:#7291a6; --red:#ff3355;
+    }
+    * { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
+    body { background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,sans-serif; padding:12px; max-width:580px; margin:0 auto 36px; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:8px; padding-bottom:10px; border-bottom:1px solid rgba(0,212,255,0.22); margin-bottom:12px; }
+    .title { font-weight:800; letter-spacing:2.5px; color:var(--pri); font-size:14px; }
+    .badges { display:flex; gap:6px; align-items:center; }
+    .badge { font-size:10px; font-weight:700; padding:3px 9px; border-radius:99px; border:1px solid var(--pri); color:var(--pri); }
+    .badge.ok { border-color:var(--ok); color:var(--ok); }
     .badge.off { border-color:var(--mut); color:var(--mut); }
-    .card { background:var(--panel); border:1px solid rgba(0,212,255,0.18); border-radius:14px; padding:14px; margin-bottom:12px; }
-    .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
-    input { flex:1; background:#050b12; border:1px solid rgba(0,212,255,0.3); color:var(--text); padding:10px 12px; border-radius:10px; font-size:14px; }
-    button { background:var(--pri); color:#041017; border:none; border-radius:10px; padding:10px 14px; font-weight:700; cursor:pointer; font-size:13px; }
-    button.sec { background:rgba(0,212,255,0.14); color:var(--text); border:1px solid rgba(0,212,255,0.3); }
-    button.warn { background:rgba(255,51,85,0.2); color:#ff889d; border:1px solid var(--red); }
-    .grid { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; margin-top:10px; }
-    pre { background:#04080e; border:1px solid rgba(255,255,255,0.08); border-radius:10px; padding:10px; font-size:12px; color:#9de8ff; max-height:200px; overflow:auto; margin-top:10px; white-space:pre-wrap; }
-    label.switch { display:flex; align-items:center; justify-content:space-between; font-size:13px; cursor:pointer; }
+    .card { background:var(--panel); border:1px solid rgba(0,212,255,0.18); border-radius:14px; padding:13px; margin-bottom:11px; }
+    .card.alert { border:2px solid var(--acc); background:rgba(28,10,4,0.96); box-shadow:0 0 22px rgba(255,107,0,0.22); }
+    .sec-hdr { display:flex; align-items:center; justify-content:space-between; font-size:11px; font-weight:800; color:var(--pri); letter-spacing:1.4px; margin-bottom:8px; }
+    .row { display:flex; gap:7px; flex-wrap:wrap; margin-top:8px; align-items:center; }
+    input, select { flex:1; min-width:110px; background:#050b12; border:1px solid rgba(0,212,255,0.3); color:var(--text); padding:9px 11px; border-radius:10px; font-size:14px; }
+    button { background:var(--pri); color:#041017; border:none; border-radius:10px; padding:9px 13px; font-weight:700; cursor:pointer; font-size:12px; transition:transform 0.08s,opacity 0.15s; }
+    button:active { transform:scale(0.97); }
+    button.sec { background:rgba(0,212,255,0.13); color:var(--text); border:1px solid rgba(0,212,255,0.3); }
+    button.ok-btn { background:var(--ok); color:#031a0d; }
+    button.acc-btn { background:var(--acc); color:#fff; }
+    button.warn { background:rgba(255,51,85,0.2); color:#ff8fa3; border:1px solid var(--red); }
+    button.ptt { flex:1; background:rgba(0,212,255,0.18); color:var(--pri); border:1.5px solid var(--pri); padding:12px; font-size:13px; user-select:none; touch-action:none; }
+    button.ptt.live { background:rgba(255,51,85,0.28); color:#fff; border-color:var(--red); }
+    .grid { display:grid; grid-template-columns:repeat(2,1fr); gap:7px; margin-top:8px; }
+    .key-row { display:grid; grid-template-columns:repeat(5,1fr); gap:5px; margin-top:7px; }
+    .key-row button { padding:7px 4px; font-size:11px; }
+    .screen-wrap { position:relative; width:100%; min-height:150px; background:#03060b; border:1px solid rgba(0,212,255,0.25); border-radius:10px; overflow:hidden; display:flex; align-items:center; justify-content:center; cursor:crosshair; }
+    #pc-screen { width:100%; height:auto; display:block; user-select:none; -webkit-user-drag:none; }
+    .tap-dot { position:absolute; width:22px; height:22px; margin:-11px 0 0 -11px; border:2px solid var(--pri); border-radius:50%; pointer-events:none; animation:ripple 0.55s ease-out forwards; }
+    @keyframes ripple { from { transform:scale(0.4); opacity:1; } to { transform:scale(1.8); opacity:0; } }
+    pre { background:var(--panel2); border:1px solid rgba(255,255,255,0.08); border-radius:10px; padding:9px; font-size:11.5px; color:#9de8ff; max-height:175px; overflow:auto; margin-top:6px; white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,monospace; }
+    label.switch { display:flex; align-items:center; justify-content:space-between; font-size:12.5px; cursor:pointer; width:100%; }
+    .fp-line { font-size:10.5px; color:var(--mut); font-family:ui-monospace,monospace; margin-top:5px; word-break:break-all; }
   </style>
 </head>
 <body>
   <header>
-    <div class="title">MARK-LVII · ANDROID PWA</div>
-    <span id="ws-badge" class="badge off">OFFLINE</span>
+    <div class="title">MARK-LVII · OMNICORE REMOTE</div>
+    <div class="badges">
+      <span id="enc-badge" class="badge off">TLS</span>
+      <span id="ws-badge" class="badge off">OFFLINE</span>
+    </div>
   </header>
 
-  <section class="card">
-    <div style="font-size:12px;color:var(--mut)">Host __IP__:__PORT__ · Instant Mobile Companion Fallback</div>
-    <div class="row">
-      <input id="pin" placeholder="8-char Pairing PIN" maxlength="12" />
-      <button id="pair-btn">Pair</button>
+  <!-- (c) 1-Tap Remote HUD Approval Banner (CONFIRM & ChoiceBanner) -->
+  <section id="approval-card" class="card alert" style="display:none">
+    <div class="sec-hdr" style="color:var(--acc)">
+      <span id="approval-kind">⚠ HUD CONFIRMATION REQUIRED</span>
+      <span id="approval-exp" style="font-size:10px;color:var(--mut)">LIVE</span>
     </div>
-    <div class="row" style="margin-top:10px">
-      <label class="switch" style="width:100%">
+    <div id="approval-title" style="font-weight:700;font-size:14px;margin-bottom:4px"></div>
+    <div id="approval-detail" style="font-size:12px;color:#cbd5e1;margin-bottom:10px;white-space:pre-wrap"></div>
+    <div id="approval-actions" class="row"></div>
+  </section>
+
+  <!-- Pairing & Privacy Card -->
+  <section class="card">
+    <div style="font-size:11.5px;color:var(--mut)">Host <strong>__IP__:__PORT__</strong> · 1-Tap QR / PIN Pairing</div>
+    <div class="row">
+      <input id="pin" placeholder="8-char Pairing PIN" maxlength="12" autocomplete="off" />
+      <button id="pair-btn">Pair Now</button>
+    </div>
+    <div id="fp-box" class="fp-line">TLS SHA-256: probing…</div>
+    <div class="row" style="margin-top:8px">
+      <label class="switch">
         <span>100% On-Device Privacy Mode (Pause PC Sync)</span>
-        <input type="checkbox" id="privacy-toggle" style="flex:0;width:20px;height:20px;" />
+        <input type="checkbox" id="privacy-toggle" style="flex:0;width:19px;height:19px;" />
       </label>
     </div>
   </section>
 
+  <!-- (a) Live PC Screen Stream Viewer + Remote Tap / Type -->
   <section class="card">
-    <div style="font-size:12px;font-weight:700;color:var(--pri);letter-spacing:1px">PC COMMAND & VOICE</div>
+    <div class="sec-hdr">
+      <span>LIVE PC SCREEN + REMOTE TAP/TYPE</span>
+      <div style="display:flex;gap:5px">
+        <select id="tap-mode" style="padding:4px 6px;font-size:11px;min-width:78px;border-radius:7px">
+          <option value="tap">1-Tap Click</option>
+          <option value="double_click">Double-Click</option>
+          <option value="right_click">Right-Click</option>
+        </select>
+        <button id="stream-btn" class="sec" style="padding:5px 9px;font-size:11px">Start Live</button>
+        <button id="snap-btn" class="sec" style="padding:5px 9px;font-size:11px">Snap</button>
+      </div>
+    </div>
+    <div id="screen-wrap" class="screen-wrap">
+      <img id="pc-screen" alt="Tap 'Snap' or 'Start Live' after pairing to view & tap PC screen" style="display:none" />
+      <div id="screen-hint" style="font-size:12px;color:var(--mut);padding:28px 14px;text-align:center">
+        Pair phone, then tap <strong>Start Live</strong> to view &amp; tap your PC desktop in real time.
+      </div>
+    </div>
     <div class="row">
-      <input id="cmd" placeholder="Ask JARVIS or say Hey Jarvis / Bolo Jarvis..." />
+      <input id="remote-type" placeholder="Type text directly onto PC window…" />
+      <button id="type-btn" class="sec">Type</button>
+    </div>
+    <div class="key-row">
+      <button class="sec" onclick="sendScreenKey('enter')">Enter</button>
+      <button class="sec" onclick="sendScreenKey('escape')">ESC</button>
+      <button class="sec" onclick="sendScreenKey('tab')">Tab</button>
+      <button class="sec" onclick="sendScreenScroll('up')">PgUp</button>
+      <button class="sec" onclick="sendScreenScroll('down')">PgDn</button>
+    </div>
+  </section>
+
+  <!-- (b) Push-to-Talk Voice + Command & Quick Companion Actions -->
+  <section class="card">
+    <div class="sec-hdr"><span>PUSH-TO-TALK VOICE &amp; COMMAND</span></div>
+    <div class="row">
+      <button id="ptt-btn" class="ptt">🎙 HOLD TO TALK (LIVE MIC)</button>
+      <button id="mic-btn" class="sec" title="Browser Speech-to-Text">Dictate</button>
+    </div>
+    <div class="row">
+      <input id="cmd" placeholder="Ask JARVIS or launch a multi-agent mission…" />
       <button id="send-btn">Send</button>
-      <button id="mic-btn" class="sec">Mic</button>
     </div>
     <div class="grid">
       <button class="sec" onclick="quickAction('toggle',{target:'flashlight',value:'toggle'})">Flashlight</button>
@@ -63,55 +136,361 @@
     </div>
   </section>
 
+  <!-- Live Mission & Bridge Stream -->
   <section class="card">
-    <div style="font-size:12px;font-weight:700;color:var(--pri);letter-spacing:1px">LIVE BRIDGE LOG</div>
-    <pre id="log">Ready. Enter pairing PIN from JARVIS Remote Control.</pre>
+    <div class="sec-hdr">
+      <span>LIVE MISSION &amp; SWARM LOG STREAM</span>
+      <button class="sec" style="padding:3px 8px;font-size:10px" onclick="refreshMissions()">Sync</button>
+    </div>
+    <pre id="mission-log">Waiting for autonomous Brain / Swarm / Mission events…</pre>
+    <div class="sec-hdr" style="margin-top:10px"><span>BRIDGE TELEMETRY</span></div>
+    <pre id="log">Ready. Scan HUD QR code or enter 8-char PIN.</pre>
   </section>
 
   <script>
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js').catch(() => {});
     }
+
     const logEl = document.getElementById('log');
+    const missionEl = document.getElementById('mission-log');
     const badge = document.getElementById('ws-badge');
+    const encBadge = document.getElementById('enc-badge');
     const privEl = document.getElementById('privacy-toggle');
+    const fpBox = document.getElementById('fp-box');
+    const screenImg = document.getElementById('pc-screen');
+    const screenHint = document.getElementById('screen-hint');
+    const screenWrap = document.getElementById('screen-wrap');
+
     let token = sessionStorage.getItem('jarvis_token') || '';
+    let sessionKey = sessionStorage.getItem('jarvis_key') || '';
     let devId = localStorage.getItem('jarvis_pwa_id') || ('pwa-' + Math.random().toString(16).slice(2, 8));
     localStorage.setItem('jarvis_pwa_id', devId);
+
     let ws = null;
     let hbTimer = null;
+    let pollTimer = null;
+    let screenTimer = null;
+    let aesKey = null;
 
-    function addLog(line) {
-      logEl.textContent = `[${new Date().toLocaleTimeString()}] ${line}\n` + logEl.textContent.slice(0, 3000);
+    // ── AES-256-GCM Web Crypto ──────────────────────────────────────────────
+    async function initAesKey(pinKey) {
+      if (!pinKey || !window.crypto || !crypto.subtle) {
+        aesKey = null;
+        encBadge.textContent = location.protocol === 'https:' ? 'TLS' : 'HTTP';
+        return;
+      }
+      try {
+        const enc = new TextEncoder();
+        const base = await crypto.subtle.importKey('raw', enc.encode(pinKey), 'PBKDF2', false, ['deriveKey']);
+        aesKey = await crypto.subtle.deriveKey(
+          { name: 'PBKDF2', salt: enc.encode('JARVIS-DASHBOARD-v1'), iterations: 200000, hash: 'SHA-256' },
+          base,
+          { name: 'AES-GCM', length: 256 },
+          false,
+          ['encrypt']
+        );
+        encBadge.textContent = 'TLS+GCM';
+        encBadge.className = 'badge ok';
+      } catch {
+        aesKey = null;
+      }
     }
 
+    async function encryptText(plain) {
+      if (!aesKey) return null;
+      try {
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, new TextEncoder().encode(plain)));
+        const out = new Uint8Array(iv.length + ct.length);
+        out.set(iv, 0);
+        out.set(ct, iv.length);
+        let bin = '';
+        for (const b of out) bin += String.fromCharCode(b);
+        return btoa(bin);
+      } catch { return null; }
+    }
+
+    function authHeaders(extra = {}) {
+      return Object.assign({ 'Authorization': `Bearer ${token}` }, extra);
+    }
+
+    function addLog(line) {
+      logEl.textContent = `[${new Date().toLocaleTimeString()}] ${line}\n` + logEl.textContent.slice(0, 3500);
+    }
+
+    function addMissionLog(line) {
+      if (missionEl.textContent.startsWith('Waiting for')) missionEl.textContent = '';
+      missionEl.textContent = `[${new Date().toLocaleTimeString()}] ${line}\n` + missionEl.textContent.slice(0, 4500);
+    }
+
+    // ── Probe TLS Fingerprint ───────────────────────────────────────────────
+    async function loadCertFingerprint(expectedFp = '') {
+      try {
+        const r = await fetch('/api/cert-fingerprint');
+        const d = await r.json();
+        const sha = d.sha256 || '';
+        const matchNote = (expectedFp && sha && expectedFp.toLowerCase() === sha.toLowerCase()) ? ' ✓ PINNED' : '';
+        fpBox.textContent = sha
+          ? `TLS SHA-256: ${sha.slice(0, 24)}…${matchNote}`
+          : 'TLS: plain HTTP mode';
+      } catch {}
+    }
+
+    // ── (c) 1-Tap Remote HUD CONFIRM / ChoiceBanner Approval UI ─────────────
+    function renderApprovalBanner(pending) {
+      const card = document.getElementById('approval-card');
+      const kindEl = document.getElementById('approval-kind');
+      const expEl = document.getElementById('approval-exp');
+      const titleEl = document.getElementById('approval-title');
+      const detailEl = document.getElementById('approval-detail');
+      const actionsEl = document.getElementById('approval-actions');
+
+      const cf = pending && pending.confirm;
+      const ch = pending && pending.choice;
+      if (!cf && !ch) {
+        card.style.display = 'none';
+        return;
+      }
+      card.style.display = 'block';
+      actionsEl.innerHTML = '';
+
+      if (cf) {
+        kindEl.textContent = '⚠ HUD CONFIRMATION GATE';
+        expEl.textContent = cf.expires_in ? `${Math.round(cf.expires_in)}s` : 'PENDING';
+        titleEl.textContent = cf.title || 'Confirm Action';
+        detailEl.textContent = cf.detail || '';
+
+        const yesBtn = document.createElement('button');
+        yesBtn.className = 'ok-btn';
+        yesBtn.style.flex = '1';
+        yesBtn.textContent = '✓ CONFIRM & EXECUTE';
+        yesBtn.onclick = () => resolvePrompt('confirm', { accepted: true });
+
+        const noBtn = document.createElement('button');
+        noBtn.className = 'warn';
+        noBtn.style.flex = '1';
+        noBtn.textContent = '✕ CANCEL';
+        noBtn.onclick = () => resolvePrompt('confirm', { accepted: false });
+
+        actionsEl.appendChild(yesBtn);
+        actionsEl.appendChild(noBtn);
+      } else if (ch) {
+        kindEl.textContent = '◆ HUD CHOICE REQUIRED';
+        expEl.textContent = `${(ch.options || []).length} OPTIONS`;
+        titleEl.textContent = ch.title || 'Select Option';
+        detailEl.textContent = ch.detail || '';
+
+        (ch.options || []).forEach((opt, idx) => {
+          const b = document.createElement('button');
+          b.className = 'sec';
+          b.style.width = '100%';
+          b.style.textAlign = 'left';
+          b.textContent = `${idx + 1}. ${opt}`;
+          b.onclick = () => resolvePrompt('choice', { selection: idx });
+          actionsEl.appendChild(b);
+        });
+        const cancelB = document.createElement('button');
+        cancelB.className = 'warn';
+        cancelB.style.width = '100%';
+        cancelB.textContent = 'Cancel Choice';
+        cancelB.onclick = () => resolvePrompt('choice', { selection: null });
+        actionsEl.appendChild(cancelB);
+      }
+    }
+
+    async function resolvePrompt(kind, payload) {
+      if (!token) return;
+      try {
+        const body = Object.assign({ kind }, payload);
+        const r = await fetch('/api/confirm/resolve', {
+          method: 'POST',
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify(body)
+        });
+        const d = await r.json();
+        addLog(`HUD ${kind} resolved -> ${JSON.stringify(d)}`);
+        document.getElementById('approval-card').style.display = 'none';
+      } catch (e) {
+        addLog('Approval resolve error: ' + e.message);
+      }
+    }
+
+    async function pollPendingApprovals() {
+      if (!token || privEl.checked) return;
+      try {
+        const r = await fetch('/api/confirm/pending', { headers: authHeaders() });
+        if (r.status === 200) {
+          renderApprovalBanner(await r.json());
+        }
+      } catch {}
+    }
+
+    async function refreshMissions() {
+      if (!token || privEl.checked) return;
+      try {
+        const r = await fetch('/api/missions/live', { headers: authHeaders() });
+        if (r.status !== 200) return;
+        const d = await r.json();
+        if (d.pending_prompts) renderApprovalBanner(d.pending_prompts);
+        if (Array.isArray(d.logs) && d.logs.length) {
+          missionEl.textContent = d.logs.slice().reverse().map(
+            it => `[${new Date((it.ts || 0) * 1000).toLocaleTimeString()}] [${it.source || 'brain'}] ${it.text}`
+          ).join('\n');
+        }
+      } catch {}
+    }
+
+    // ── (a) Live PC Screen Frame & Remote Tap/Type ──────────────────────────
+    async function fetchScreenOnce() {
+      if (!token || privEl.checked) return;
+      try {
+        const r = await fetch(`/api/screen/frame?t=${Date.now()}`, { headers: authHeaders() });
+        if (r.status !== 200) return;
+        const blob = await r.blob();
+        const objUrl = URL.createObjectURL(blob);
+        const prev = screenImg.dataset.prevUrl;
+        screenImg.onload = () => { if (prev) URL.revokeObjectURL(prev); };
+        screenImg.dataset.prevUrl = objUrl;
+        screenImg.src = objUrl;
+        screenImg.style.display = 'block';
+        screenHint.style.display = 'none';
+      } catch {}
+    }
+
+    document.getElementById('snap-btn').onclick = () => fetchScreenOnce();
+
+    document.getElementById('stream-btn').onclick = function () {
+      if (screenTimer) {
+        clearInterval(screenTimer);
+        screenTimer = null;
+        this.textContent = 'Start Live';
+        return;
+      }
+      if (!token) { addLog('Pair first to start screen stream.'); return; }
+      fetchScreenOnce();
+      screenTimer = setInterval(fetchScreenOnce, 900);
+      this.textContent = 'Stop Live';
+    };
+
+    screenImg.addEventListener('click', async (ev) => {
+      if (!token || privEl.checked) return;
+      const rect = screenImg.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const norm_x = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+      const norm_y = Math.max(0, Math.min(1, (ev.clientY - rect.top) / rect.height));
+      const action = document.getElementById('tap-mode').value || 'tap';
+
+      const dot = document.createElement('div');
+      dot.className = 'tap-dot';
+      dot.style.left = `${ev.clientX - rect.left}px`;
+      dot.style.top = `${ev.clientY - rect.top}px`;
+      screenWrap.appendChild(dot);
+      setTimeout(() => dot.remove(), 600);
+
+      try {
+        const r = await fetch('/api/screen/input', {
+          method: 'POST',
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ action, norm_x, norm_y })
+        });
+        const d = await r.json();
+        addLog(`PC ${action} (${Math.round(norm_x*100)}%, ${Math.round(norm_y*100)}%) -> ${d.ok ? 'OK' : (d.message || d.detail)}`);
+        setTimeout(fetchScreenOnce, 350);
+      } catch (e) {
+        addLog('Tap error: ' + e.message);
+      }
+    });
+
+    document.getElementById('type-btn').onclick = async () => {
+      if (!token || privEl.checked) return;
+      const inp = document.getElementById('remote-type');
+      const text = inp.value;
+      if (!text) return;
+      inp.value = '';
+      await fetch('/api/screen/input', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ action: 'type', text })
+      });
+      addLog('Typed on PC: ' + text);
+      setTimeout(fetchScreenOnce, 350);
+    };
+
+    async function sendScreenKey(keys) {
+      if (!token || privEl.checked) return;
+      await fetch('/api/screen/input', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ action: 'key', keys })
+      });
+      addLog('Key -> PC: ' + keys);
+      setTimeout(fetchScreenOnce, 350);
+    }
+
+    async function sendScreenScroll(direction) {
+      if (!token || privEl.checked) return;
+      await fetch('/api/screen/input', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ action: 'scroll', direction, amount: 4 })
+      });
+      setTimeout(fetchScreenOnce, 350);
+    }
+
+    // ── WebSocket Connection ────────────────────────────────────────────────
     function connectWs() {
       if (!token || privEl.checked) return;
+      if (ws && ws.readyState <= 1) ws.close();
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`);
       ws.onopen = () => {
         badge.textContent = 'LIVE WS';
-        badge.className = 'badge';
+        badge.className = 'badge ok';
         ws.send(JSON.stringify({
           type: 'device_register',
           device_id: devId,
           name: 'Mobile Web PWA',
           model: navigator.userAgent.slice(0, 48),
-          android_version: 'PWA',
-          capabilities: ['voice', 'command', 'gps', 'flashlight_req', 'sos'],
+          android_version: 'PWA-v2',
+          capabilities: ['voice_ptt', 'screen_remote', 'hud_confirm', 'command', 'gps', 'sos'],
           privacy_mode: privEl.checked
         }));
+        if (hbTimer) clearInterval(hbTimer);
         hbTimer = setInterval(() => {
           if (ws && ws.readyState === 1) {
             ws.send(JSON.stringify({ type: 'heartbeat', device_id: devId, privacy_mode: privEl.checked }));
           }
         }, 25000);
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = setInterval(pollPendingApprovals, 2500);
+        refreshMissions();
         addLog('WebSocket connected as ' + devId);
       };
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data);
-          addLog('IN: ' + JSON.stringify(msg));
+          if (msg.type === 'mission_log') {
+            addMissionLog(`[${msg.source || 'brain'}] ${msg.text}`);
+            return;
+          }
+          if (msg.type === 'log') {
+            addMissionLog(`${(msg.speaker || 'jarvis').toUpperCase()}: ${msg.text}`);
+            return;
+          }
+          if (msg.type === 'confirm_prompt') {
+            renderApprovalBanner({ confirm: msg, choice: null });
+            return;
+          }
+          if (msg.type === 'choice_prompt') {
+            renderApprovalBanner({ confirm: null, choice: msg });
+            return;
+          }
+          if (msg.type === 'confirm_cleared' || msg.type === 'choice_cleared' || msg.type === 'confirm_resolved') {
+            pollPendingApprovals();
+            return;
+          }
+          addLog('IN: ' + JSON.stringify(msg).slice(0, 220));
           if (msg.type === 'pc_to_android') {
             ws.send(JSON.stringify({
               type: 'android_result',
@@ -129,37 +508,64 @@
       };
     }
 
-    document.getElementById('pair-btn').onclick = async () => {
-      const pin = document.getElementById('pin').value.trim();
+    // ── Pairing (Manual & 1-Tap QR Auto-Pair) ───────────────────────────────
+    async function doPair(pinValue, expectedFp = '') {
+      const pin = (pinValue || '').trim().toUpperCase();
       if (!pin) return;
-      const res = await fetch('/api/android/pair', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pin, device_id: devId, name: 'Mobile PWA', model: 'Browser' })
-      });
-      const data = await res.json();
-      if (data.ok) {
-        token = data.token;
-        sessionStorage.setItem('jarvis_token', token);
-        addLog('Paired cleanly.');
-        connectWs();
-      } else {
-        addLog('Pair error: ' + (data.error || res.status));
+      try {
+        const res = await fetch('/api/android/pair', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            pin,
+            device_id: devId,
+            name: 'Mobile PWA',
+            model: 'Android Chrome PWA',
+            capabilities: ['voice_ptt', 'screen_remote', 'hud_confirm', 'sos']
+          })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          token = data.token;
+          sessionKey = data.session_key || pin;
+          sessionStorage.setItem('jarvis_token', token);
+          sessionStorage.setItem('jarvis_key', sessionKey);
+          if (data.device_token) localStorage.setItem('jarvis_device_token', data.device_token);
+          await initAesKey(sessionKey);
+          await loadCertFingerprint(expectedFp || data.cert_sha256 || '');
+          addLog('Paired cleanly over ' + location.protocol.toUpperCase());
+          connectWs();
+        } else {
+          addLog('Pair error: ' + (data.error || res.status));
+        }
+      } catch (e) {
+        addLog('Pair network error: ' + e.message);
       }
+    }
+
+    document.getElementById('pair-btn').onclick = () => {
+      doPair(document.getElementById('pin').value);
     };
 
     privEl.onchange = () => {
-      if (privEl.checked && ws) { ws.close(); addLog('Privacy Mode ON — outbound sync halted.'); }
-      else if (!privEl.checked && token) { connectWs(); }
+      if (privEl.checked) {
+        if (ws) ws.close();
+        if (screenTimer) { clearInterval(screenTimer); screenTimer = null; }
+        addLog('Privacy Mode ON — outbound sync halted.');
+      } else if (token) {
+        connectWs();
+      }
     };
 
-    document.getElementById('send-btn').onclick = () => {
+    document.getElementById('send-btn').onclick = async () => {
       if (privEl.checked) { addLog('Blocked by Privacy Mode.'); return; }
-      const text = document.getElementById('cmd').value.trim();
+      const inp = document.getElementById('cmd');
+      const text = inp.value.trim();
       if (!text || !ws || ws.readyState !== 1) return;
-      ws.send(JSON.stringify({ type: 'command', text }));
-      document.getElementById('cmd').value = '';
-      addLog('Sent: ' + text);
+      inp.value = '';
+      const enc = await encryptText(text);
+      ws.send(JSON.stringify(enc ? { type: 'command', enc } : { type: 'command', text }));
+      addMissionLog('YOU: ' + text);
     };
 
     async function quickAction(action, params) {
@@ -169,20 +575,123 @@
       addLog('Event -> PC: ' + action);
     }
 
+    // ── (b) Hold-to-Talk Real-Time PCM16 Voice -> /ws/phone-audio ───────────
+    let pttWs = null, pttCtx = null, pttStream = null, pttNode = null;
+    const pttBtn = document.getElementById('ptt-btn');
+
+    function f32ToPcm16(f32, srcRate) {
+      let s = f32;
+      if (srcRate !== 16000) {
+        const ratio = srcRate / 16000;
+        const len = Math.round(f32.length / ratio);
+        s = new Float32Array(len);
+        for (let i = 0; i < len; i++) s[i] = f32[Math.min(Math.round(i * ratio), f32.length - 1)];
+      }
+      const out = new Int16Array(s.length);
+      for (let i = 0; i < s.length; i++) out[i] = Math.max(-32768, Math.min(32767, Math.round(s[i] * 32768)));
+      return out.buffer;
+    }
+
+    async function startPtt(ev) {
+      if (ev) ev.preventDefault();
+      if (pttWs || !token || privEl.checked) return;
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        addLog('Mic requires HTTPS context (open https://' + location.host + '/pwa).');
+        return;
+      }
+      try {
+        pttStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+        pttCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+        if (pttCtx.state === 'suspended') await pttCtx.resume();
+        const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+        pttWs = new WebSocket(`${proto}://${location.host}/ws/phone-audio?token=${encodeURIComponent(token)}`);
+        pttWs.binaryType = 'arraybuffer';
+        pttWs.onopen = () => {
+          const src = pttCtx.createMediaStreamSource(pttStream);
+          const sp = pttCtx.createScriptProcessor(2048, 1, 1);
+          sp.onaudioprocess = (e) => {
+            if (pttWs && pttWs.readyState === 1) {
+              pttWs.send(f32ToPcm16(e.inputBuffer.getChannelData(0), pttCtx.sampleRate));
+            }
+          };
+          src.connect(sp);
+          sp.connect(pttCtx.destination);
+          pttNode = sp;
+          pttBtn.classList.add('live');
+          pttBtn.textContent = '🔴 STREAMING TO JARVIS…';
+        };
+        pttWs.onclose = stopPtt;
+      } catch (e) {
+        addLog('PTT mic error: ' + e.message);
+        stopPtt();
+      }
+    }
+
+    function stopPtt(ev) {
+      if (ev) ev.preventDefault();
+      if (pttNode) { try { pttNode.disconnect(); } catch {} pttNode = null; }
+      if (pttCtx) { try { pttCtx.close(); } catch {} pttCtx = null; }
+      if (pttStream) { pttStream.getTracks().forEach(t => t.stop()); pttStream = null; }
+      if (pttWs) { try { if (pttWs.readyState < 2) pttWs.close(); } catch {} pttWs = null; }
+      pttBtn.classList.remove('live');
+      pttBtn.textContent = '🎙 HOLD TO TALK (LIVE MIC)';
+    }
+
+    pttBtn.addEventListener('pointerdown', startPtt);
+    pttBtn.addEventListener('pointerup', stopPtt);
+    pttBtn.addEventListener('pointercancel', stopPtt);
+    pttBtn.addEventListener('pointerleave', stopPtt);
+
     document.getElementById('mic-btn').onclick = () => {
       const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!SR) { addLog('SpeechRecognition unsupported in this browser.'); return; }
+      if (!SR) { addLog('SpeechRecognition unsupported — use HOLD TO TALK.'); return; }
       const rec = new SR();
       rec.lang = 'en-IN';
       rec.onresult = (e) => {
         const heard = e.results[0][0].transcript;
         document.getElementById('cmd').value = heard;
-        addLog('Voice: ' + heard);
+        addLog('Dictated: ' + heard);
       };
       rec.start();
     };
 
-    if (token) connectWs();
+    // ── Boot: Check 1-Tap QR Params, Saved Device Token, or Active Session ──
+    (async () => {
+      const params = new URLSearchParams(location.search);
+      const qrPin = params.get('pin') || '';
+      const qrFp = params.get('fp') || '';
+      await loadCertFingerprint(qrFp);
+      if (qrPin) {
+        document.getElementById('pin').value = qrPin;
+        history.replaceState({}, '', location.pathname);
+        await doPair(qrPin, qrFp);
+        return;
+      }
+      if (sessionKey) await initAesKey(sessionKey);
+      if (token) {
+        connectWs();
+        return;
+      }
+      const savedDevTok = localStorage.getItem('jarvis_device_token');
+      if (savedDevTok) {
+        try {
+          const r = await fetch('/api/device-login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ device_token: savedDevTok })
+          });
+          const d = await r.json();
+          if (d.ok) {
+            token = d.token;
+            sessionKey = d.key || '';
+            sessionStorage.setItem('jarvis_token', token);
+            sessionStorage.setItem('jarvis_key', sessionKey);
+            await initAesKey(sessionKey);
+            connectWs();
+          }
+        } catch {}
+      }
+    })();
   </script>
 </body>
 </html>
