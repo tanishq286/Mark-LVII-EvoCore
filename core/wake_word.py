@@ -17,10 +17,15 @@ CPU. The pretrained wake phrase used here is "Hey Jarvis".
 """
 from __future__ import annotations
 
+import functools
+import io
+import os
 import queue
 import subprocess
 import sys
 import threading
+import time
+import wave
 from pathlib import Path
 from typing import Callable
 
@@ -30,6 +35,17 @@ WAKE_MODEL = "hey_jarvis"
 DEFAULT_THRESHOLD = 0.5
 # Mic frames arrive at 16 kHz int16; this is just the detector's input rate.
 SAMPLE_RATE = 16000
+# openWakeWord processes audio natively in 80 ms (1280-sample) increments.
+_OWW_FRAME_SAMPLES = 1280
+_MIN_MODEL_BYTES = 1024
+
+
+def _onnx_present(models_dir: Path, prefix: str) -> bool:
+    """True when at least one non-empty ONNX model matching `prefix` exists."""
+    return any(
+        p.is_file() and p.stat().st_size > _MIN_MODEL_BYTES
+        for p in models_dir.glob(f"{prefix}*.onnx")
+    )
 
 
 def is_installed() -> bool:
@@ -42,7 +58,7 @@ def is_installed() -> bool:
 
 
 def is_ready() -> bool:
-    """True if openwakeword is installed AND its model files are present on disk.
+    """True if openwakeword is installed AND its ONNX model files are present on disk.
 
     This is a cheap, DETERMINISTIC file-existence check. It deliberately does NOT
     construct a Model to probe readiness — doing that is slow and, worse, can clash
@@ -56,15 +72,59 @@ def is_ready() -> bool:
         models_dir = Path(openwakeword.__file__).resolve().parent / "resources" / "models"
         if not models_dir.is_dir():
             return False
-        has_wake = (any(models_dir.glob(f"{WAKE_MODEL}*.onnx"))
-                    or any(models_dir.glob(f"{WAKE_MODEL}*.tflite")))
-        has_mel = (any(models_dir.glob("melspectrogram*.onnx"))
-                   or any(models_dir.glob("melspectrogram*.tflite")))
-        has_emb = (any(models_dir.glob("embedding_model*.onnx"))
-                   or any(models_dir.glob("embedding_model*.tflite")))
-        return bool(has_wake and has_mel and has_emb)
+        # WakeWordDetector always runs inference_framework="onnx", so .onnx files
+        # (not .tflite alone) must exist and be non-trivial.
+        return bool(
+            _onnx_present(models_dir, WAKE_MODEL)
+            and _onnx_present(models_dir, "melspectrogram")
+            and _onnx_present(models_dir, "embedding_model")
+        )
     except Exception:
         return False
+
+
+def _download_onnx_file(url: str, dest: Path) -> None:
+    """Stream-download one ONNX model file atomically via a temporary file."""
+    import requests
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".tmp")
+    try:
+        with requests.get(url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            with open(tmp, "wb") as fh:
+                for chunk in r.iter_content(chunk_size=16384):
+                    if chunk:
+                        fh.write(chunk)
+        if not tmp.is_file() or tmp.stat().st_size <= _MIN_MODEL_BYTES:
+            raise RuntimeError(f"downloaded file {dest.name} is empty or truncated")
+        os.replace(tmp, dest)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+def _ensure_required_onnx_models() -> None:
+    """Download any missing ONNX files directly from openwakeword's official URLs."""
+    import openwakeword
+    models_dir = Path(openwakeword.__file__).resolve().parent / "resources" / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    required: list[tuple[str, str]] = []
+    for feat in openwakeword.FEATURE_MODELS.values():
+        url = str(feat["download_url"]).replace(".tflite", ".onnx")
+        prefix = url.rsplit("/", 1)[-1].split(".onnx", 1)[0]
+        required.append((prefix, url))
+    if WAKE_MODEL in openwakeword.MODELS:
+        url = str(openwakeword.MODELS[WAKE_MODEL]["download_url"]).replace(".tflite", ".onnx")
+        required.append((WAKE_MODEL, url))
+
+    for prefix, url in required:
+        if not _onnx_present(models_dir, prefix):
+            filename = url.rsplit("/", 1)[-1]
+            _download_onnx_file(url, models_dir / filename)
 
 
 def install_and_download(logger: Callable[[str], None] = print,
@@ -91,19 +151,72 @@ def install_and_download(logger: Callable[[str], None] = print,
         _tell("Wake word: downloading models…")
         try:
             import openwakeword.utils as _u
+            orig_stderr = sys.stderr
+            orig_stdout = sys.stdout
             try:
-                _u.download_models([WAKE_MODEL])
-            except TypeError:
-                _u.download_models()   # older signature downloads the default set
+                # Under pythonw.exe sys.stderr/stdout can be None, which makes tqdm crash.
+                if sys.stderr is None:
+                    sys.stderr = io.StringIO()
+                if sys.stdout is None:
+                    sys.stdout = io.StringIO()
+                try:
+                    _u.download_models([WAKE_MODEL])
+                except TypeError:
+                    _u.download_models()   # older signature downloads the default set
+            finally:
+                sys.stderr = orig_stderr
+                sys.stdout = orig_stdout
+            if not is_ready():
+                _ensure_required_onnx_models()
         except Exception as e:
             return False, f"model download failed: {e}"
 
         if not is_ready():
-            return False, "installed, but the wake model could not be loaded."
+            return False, "installed, but the ONNX wake model files could not be verified."
         logger("Wake word: ready.")
         return True, "Wake word installed and ready."
     except Exception as e:
         return False, f"setup error: {e}"
+
+
+@functools.lru_cache(maxsize=1)
+def build_wake_chime_wav() -> bytes:
+    """Synthesize a crisp 140 ms two-tone rising chime (24 kHz mono 16-bit WAV)."""
+    import numpy as np
+
+    sr = 24000
+    note_samples = int(sr * 0.070)  # 70 ms per note -> 140 ms total
+    t = np.arange(note_samples, dtype=np.float32) / sr
+    # Smooth half-sine attack/release envelope so each tone is click-free.
+    env = np.sin(np.pi * np.arange(note_samples, dtype=np.float32) / max(1, note_samples - 1))
+    amp = 0.18 * 32767.0
+    n1 = amp * env * np.sin(2.0 * np.pi * 660.0 * t)
+    n2 = amp * env * np.sin(2.0 * np.pi * 990.0 * t)
+    pcm = np.concatenate((n1, n2)).astype(np.int16)
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
+def play_wake_chime() -> bool:
+    """Play the subtle wake chime asynchronously without touching the live mic gate."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winsound
+        wav_bytes = build_wake_chime_wav()
+        winsound.PlaySound(
+            wav_bytes,
+            winsound.SND_MEMORY | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+        )
+        return True
+    except Exception:
+        return False
 
 
 class WakeWordDetector:
@@ -115,10 +228,12 @@ class WakeWordDetector:
 
     def __init__(self, on_detect: Callable[[], None],
                  threshold: float = DEFAULT_THRESHOLD,
+                 cooldown_s: float = 1.5,
                  logger: Callable[[str], None] = print,
                  notify: Callable[[str], None] | None = None):
         self._on_detect = on_detect
         self._threshold = threshold
+        self._cooldown_s = max(0.0, float(cooldown_s))
         self._logger    = logger
         # See PluginRegistry: `logger` is the console and gets everything,
         # `notify` is the activity log and gets only what the user must act on.
@@ -129,6 +244,8 @@ class WakeWordDetector:
         self._model = None
         self._ready = False
         self._reset_pending = False
+        self._cooldown_until = 0.0
+        self._buf = None
 
     def start(self) -> bool:
         """Load the model and spawn the inference thread. Returns True on success.
@@ -157,6 +274,9 @@ class WakeWordDetector:
             self._queue.put_nowait(None)
         except Exception:
             pass
+        t, self._thread = self._thread, None
+        if t is not None and t.is_alive() and threading.current_thread() is not t:
+            t.join(timeout=1.0)
         self._model = None
         self._ready = False
 
@@ -175,8 +295,10 @@ class WakeWordDetector:
         # "Hey Jarvis" fired a dozen times in a row (measured: 12), and audio
         # from before the assistant woke was still in there when it went back
         # to sleep — so it could wake again on words said minutes earlier.
+        self._buf = None
         try:
-            self._model.reset()
+            if self._model is not None:
+                self._model.reset()
         except Exception:
             pass
 
@@ -196,6 +318,7 @@ class WakeWordDetector:
 
     def _loop(self) -> None:
         import numpy as np
+        self._buf = np.empty(0, dtype=np.int16)
         while self._running:
             try:
                 frame = self._queue.get()
@@ -204,23 +327,39 @@ class WakeWordDetector:
                 if self._reset_pending:
                     self._reset_pending = False
                     self._reset_model()
-                scores = self._model.predict(np.asarray(frame, dtype=np.int16))
-                score = 0.0
-                if isinstance(scores, dict):
-                    # match the jarvis model regardless of exact key suffix
-                    for k, v in scores.items():
-                        if "jarvis" in k.lower():
-                            score = max(score, float(v))
-                    if score == 0.0 and scores:
-                        score = max(float(v) for v in scores.values())
-                if score >= self._threshold:
-                    # drain any backlog and clear the model, so one utterance is one wake
-                    self._drain()
-                    self._reset_model()
-                    try:
-                        self._on_detect()
-                    except Exception as e:
-                        self._logger(f"Wake word: on_detect error — {e}")
+                chunk = np.asarray(frame, dtype=np.int16).ravel()
+                if chunk.size == 0:
+                    continue
+                if self._buf is None or self._buf.size == 0:
+                    self._buf = chunk
+                else:
+                    self._buf = np.concatenate((self._buf, chunk))
+
+                while self._buf is not None and self._buf.size >= _OWW_FRAME_SAMPLES and self._running:
+                    slice_1280 = self._buf[:_OWW_FRAME_SAMPLES]
+                    self._buf = self._buf[_OWW_FRAME_SAMPLES:]
+                    scores = self._model.predict(slice_1280)
+                    score = 0.0
+                    if isinstance(scores, dict):
+                        # match the jarvis model regardless of exact key suffix
+                        for k, v in scores.items():
+                            if "jarvis" in k.lower():
+                                score = max(score, float(v))
+                        if score == 0.0 and scores:
+                            score = max(float(v) for v in scores.values())
+                    if score >= self._threshold:
+                        now = time.monotonic()
+                        if now < self._cooldown_until:
+                            continue
+                        self._cooldown_until = now + self._cooldown_s
+                        # drain any backlog and clear the model, so one utterance is one wake
+                        self._drain()
+                        self._reset_model()
+                        try:
+                            self._on_detect()
+                        except Exception as e:
+                            self._logger(f"Wake word: on_detect error — {e}")
+                        break
             except Exception as e:
                 self._logger(f"Wake word: inference error — {e}")
 

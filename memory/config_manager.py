@@ -168,7 +168,7 @@ def save_voice(voice_name: str) -> None:
 
 def get_wake_word_enabled() -> bool:
     """Whether local wake-word gating is on (assistant sleeps until 'Hey Jarvis')."""
-    return load_api_keys().get("wake_word_enabled", False)
+    return bool(load_api_keys().get("wake_word_enabled", False))
 
 
 @_locked
@@ -177,6 +177,29 @@ def save_wake_word_enabled(enabled: bool) -> None:
     data = _read_for_write()
     data["wake_word_enabled"] = bool(enabled)
     _write_config(data)
+
+
+CLAP_SENSITIVITIES = ("low", "medium", "high")
+
+
+def get_clap_wake_enabled() -> bool:
+    """Whether double-clap wake gating is on (assistant wakes on two claps)."""
+    return bool(load_api_keys().get("clap_wake_enabled", False))
+
+
+def save_clap_wake_enabled(enabled: bool) -> None:
+    _save_flag("clap_wake_enabled", bool(enabled))
+
+
+def get_clap_sensitivity() -> str:
+    """Return double-clap detector sensitivity ('low' | 'medium' | 'high')."""
+    val = str(load_api_keys().get("clap_sensitivity", "medium") or "medium").strip().lower()
+    return val if val in CLAP_SENSITIVITIES else "medium"
+
+
+def save_clap_sensitivity(level: str) -> None:
+    val = str(level or "medium").strip().lower()
+    _save_flag("clap_sensitivity", val if val in CLAP_SENSITIVITIES else "medium")
 
 
 def get_push_to_talk_enabled() -> bool:

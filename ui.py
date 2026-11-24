@@ -193,6 +193,14 @@ class JarvisUI:
         self._win.on_wake_toggle = cb
 
     @property
+    def on_clap_toggle(self):
+        return self._win.on_clap_toggle
+
+    @on_clap_toggle.setter
+    def on_clap_toggle(self, cb):
+        self._win.on_clap_toggle = cb
+
+    @property
     def on_wake_manual(self):
         return self._win.on_wake_manual
 
@@ -207,6 +215,14 @@ class JarvisUI:
     @wake_get_state.setter
     def wake_get_state(self, cb):
         self._win.wake_get_state = cb
+
+    def bring_to_front(self) -> None:
+        """Thread-safe: restore and focus the JARVIS window on wake."""
+        self._win._bring_front_sig.emit()
+
+    def refresh_wake_ui(self) -> None:
+        """Thread-safe: refresh wake/clap buttons and footer status strip."""
+        self._win._wake_btns_sig.emit()
 
     def set_audio_level(self, level: float) -> None:
         """Thread-safe: feed a 0.0–1.0 live audio level to the HUD waveform.

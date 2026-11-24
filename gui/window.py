@@ -107,6 +107,7 @@ class MainWindow(QMainWindow):
     _video_open_sig  = pyqtSignal(str, str, bool, str)  # video, title, muted, audio
     _image_open_sig  = pyqtSignal(str, str)   # still picture on the HUD: path, title
     _wake_btns_sig   = pyqtSignal()          # wake state resolved off-thread
+    _bring_front_sig = pyqtSignal()          # restore & focus window from worker thread
     _video_close_sig = pyqtSignal()
     _video_mute_sig  = pyqtSignal(bool)
     _video_seek_sig  = pyqtSignal(float, bool)          # seconds, relative
@@ -152,11 +153,13 @@ class MainWindow(QMainWindow):
         self.get_plugins       = None   # callable: () -> list[dict], set by JarvisLive
         self.get_plugin_settings = None # callable: () -> list[dict] settings schemas, set by JarvisLive
         self.on_wake_toggle    = None   # callable: (enable: bool) -> str, set by JarvisLive
+        self.on_clap_toggle    = None   # callable: (enable: bool) -> str, set by JarvisLive
         self.on_wake_manual    = None   # callable: () -> None — manual sleep/wake
         self.on_push_to_talk   = None   # callable: (enable: bool) -> str scope
         self.ptt_hold          = None   # callable: (held: bool) -> None — windowed chord
         self.wake_get_state    = None   # callable: () -> dict {enabled, awake, ready}
         self._muted            = False
+        self._wake_warmed      = False
         self._current_file: str | None = None
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._customize_overlay: CustomizeOverlay | None = None
@@ -406,6 +409,7 @@ class MainWindow(QMainWindow):
         self._cam_stream_sig.connect(self._on_cam_stream)
         self._cam_frame_sig.connect(self._on_cam_frame)
         self._wake_btns_sig.connect(self._refresh_wake_btns)
+        self._bring_front_sig.connect(self._bring_to_front)
         self._video_open_sig.connect(self._on_video_open)
         self._image_open_sig.connect(self._on_image_open)
         self._video_close_sig.connect(self._on_video_close)
@@ -1133,6 +1137,12 @@ class MainWindow(QMainWindow):
         else:
             self.showFullScreen()
 
+    def _bring_to_front(self):
+        if self.isMinimized() or self.isHidden():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._fit_side_columns()
@@ -1321,11 +1331,24 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "_status_strip"):
             return
         mic = ("MIC · MUTED", "MUTED_C") if self._muted else ("MIC · LIVE", "GREEN")
-        self._status_strip.set_items([
+        items = [
             (f"ENGINE · {getattr(self, '_engine_label', 'GEMINI LIVE')}", "GREEN"),
             mic,
             (f"PROTOCOL · {APP_PROTOCOL}", "PRI"),
-        ])
+        ]
+        if hasattr(self, "_wake_btn") and (
+            self.wake_get_state is not None or getattr(self, "_wake_warmed", False)
+        ):
+            st = self._wake_state()
+            voice_on = bool(st.get("enabled")) and bool(st.get("ready"))
+            clap_on = bool(st.get("clap_enabled"))
+            if voice_on and clap_on:
+                items.append(("WAKE · HEY JARVIS + CLAP", "PRI"))
+            elif voice_on:
+                items.append(("WAKE · HEY JARVIS", "PRI"))
+            elif clap_on:
+                items.append(("WAKE · DOUBLE CLAP", "PRI"))
+        self._status_strip.set_items(items)
 
     def _build_left_panel(self) -> QWidget:
         w = QWidget()
@@ -1687,11 +1710,15 @@ class MainWindow(QMainWindow):
 
         self._wake_btn = _row(QPushButton())
         self._wake_btn.clicked.connect(self._toggle_wake_word)
+        self._clap_btn = _row(QPushButton())
+        self._clap_btn.clicked.connect(self._toggle_clap_wake)
         self._wake_sleep_btn = _row(QPushButton())
         self._wake_sleep_btn.clicked.connect(self._tap_wake_manual)
         # Neutral until the real state lands from the background warm-up.
         self._wake_btn.setText("🎙  WAKE WORD")
         self._wake_btn.setStyleSheet(self._BTN_DIM)
+        self._clap_btn.setText("👏  DOUBLE CLAP")
+        self._clap_btn.setStyleSheet(self._BTN_DIM)
         self._wake_sleep_btn.hide()
 
         self._ptt_btn = _row(QPushButton())
@@ -1720,6 +1747,7 @@ class MainWindow(QMainWindow):
                 self._wake_state()
             except Exception:
                 pass
+            self._wake_warmed = True
             self._wake_btns_sig.emit()
         threading.Thread(target=work, daemon=True, name="wake-state-warm").start()
 
@@ -2442,26 +2470,40 @@ class MainWindow(QMainWindow):
     # ── Wake word settings ───────────────────────────────────────────────────
 
     def _wake_state(self) -> dict:
-        """Combined state for the two wake-word buttons. Readiness is a cheap,
+        """Combined state for wake word and double-clap controls. Readiness is a cheap,
         deterministic on-disk check now (see core.wake_word.is_ready), so there
         is nothing to cache — the button never flickers to a stale value."""
         if self.wake_get_state:
             try:
                 s = self.wake_get_state()
-                return {"ready": bool(s.get("ready")),
-                        "enabled": bool(s.get("enabled")),
-                        "awake": bool(s.get("awake"))}
+                enabled = bool(s.get("enabled"))
+                clap_enabled = bool(s.get("clap_enabled"))
+                return {
+                    "ready": bool(s.get("ready")),
+                    "enabled": enabled,
+                    "clap_enabled": clap_enabled,
+                    "any_enabled": bool(s.get("any_enabled", enabled or clap_enabled)),
+                    "awake": bool(s.get("awake")),
+                }
             except Exception:
                 pass
         # Before JarvisLive has wired its callback (drawer built at startup).
-        ready, enabled = False, False
+        ready, enabled, clap_enabled = False, False, False
         try:
             from core.wake_word import is_ready
-            from memory.config_manager import get_wake_word_enabled
-            ready, enabled = is_ready(), get_wake_word_enabled()
+            from memory.config_manager import get_clap_wake_enabled, get_wake_word_enabled
+            ready = is_ready()
+            enabled = get_wake_word_enabled()
+            clap_enabled = get_clap_wake_enabled()
         except Exception:
             pass
-        return {"ready": ready, "enabled": enabled, "awake": True}
+        return {
+            "ready": ready,
+            "enabled": enabled,
+            "clap_enabled": clap_enabled,
+            "any_enabled": bool(enabled or clap_enabled),
+            "awake": not (enabled or clap_enabled),
+        }
 
     def _refresh_wake_btns(self):
         if not hasattr(self, '_wake_btn'):
@@ -2472,17 +2514,48 @@ class MainWindow(QMainWindow):
         if not st["ready"]:
             self._wake_btn.setText("⬇  WAKE WORD: DOWNLOAD")
             self._wake_btn.setStyleSheet(_off)
-            self._wake_sleep_btn.hide()
+            self._wake_btn.setToolTip("Download and enable local 'Hey Jarvis' voice wake word.")
         elif st["enabled"]:
             self._wake_btn.setText("🎙  WAKE WORD: ON")
             self._wake_btn.setStyleSheet(_on)
+            self._wake_btn.setToolTip("Listening locally for 'Hey Jarvis' while asleep.")
+        else:
+            self._wake_btn.setText("🎙  WAKE WORD: OFF")
+            self._wake_btn.setStyleSheet(_off)
+            self._wake_btn.setToolTip("Enable local 'Hey Jarvis' voice wake word.")
+
+        if hasattr(self, "_clap_btn"):
+            clap_on = bool(st.get("clap_enabled"))
+            self._clap_btn.setText("👏  DOUBLE CLAP: ON" if clap_on else "👏  DOUBLE CLAP: OFF")
+            self._clap_btn.setStyleSheet(_on if clap_on else _off)
+            self._clap_btn.setToolTip("Clap your hands twice to wake JARVIS from sleep.")
+
+        if st.get("any_enabled"):
             self._wake_sleep_btn.show()
             self._wake_sleep_btn.setText("😴  SLEEP NOW" if st["awake"] else "👂  WAKE NOW")
             self._wake_sleep_btn.setStyleSheet(_off)
         else:
-            self._wake_btn.setText("🎙  WAKE WORD: OFF")
-            self._wake_btn.setStyleSheet(_off)
             self._wake_sleep_btn.hide()
+
+        self._refresh_status_strip()
+        if hasattr(self, "_ctrl_drawer") and self._ctrl_drawer.isVisible():
+            self._position_ctrl_drawer()
+
+    def _toggle_clap_wake(self):
+        st = self._wake_state()
+        want = not bool(st.get("clap_enabled"))
+        if self.on_clap_toggle:
+            try:
+                self.on_clap_toggle(want)
+            except Exception as e:
+                self._log.append_log(f"ERR: Double-clap toggle failed — {e}")
+        else:
+            try:
+                from memory.config_manager import save_clap_wake_enabled
+                save_clap_wake_enabled(want)
+            except Exception:
+                pass
+        self._refresh_wake_btns()
 
     def _refresh_talk_btns(self):
         """Repaint the push-to-talk row from the saved setting."""
@@ -2888,7 +2961,11 @@ class MainWindow(QMainWindow):
             self._apply_state("MUTED")
             self._log.append_log("SYS: Microphone muted." + (f" {note}" if note else ""))
         else:
-            self._apply_state("LISTENING")
+            st = self._wake_state() if hasattr(self, "_wake_btn") else {}
+            if st.get("any_enabled") and not st.get("awake"):
+                self._apply_state("SLEEPING")
+            else:
+                self._apply_state("LISTENING")
             self._log.append_log("SYS: Microphone active." + (f" {note}" if note else ""))
 
     def _style_mute_btn(self):
