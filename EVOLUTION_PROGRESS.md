@@ -1,9 +1,58 @@
 # Mark-LVII EvoCore Upgrade Progress
 
-- **Active Milestone:** **Milestone 11 COMPLETE (Gated — Awaiting User Confirmation for Milestone 12)**
-- **Current Branch:** `milestone/11-windows-desktop-parity` (`ccb9420`, branched from `milestone/10-evocore-safety-evolution` `d1ce834`)
+- **Active Milestone:** **ALL MILESTONES COMPLETE (Milestone 10 + 11 + 12 Verified & Release-Ready)**
+- **Current Branch:** `milestone/12-android-max-companion` (`7f2d1be`, branched from `milestone/11-windows-desktop-parity` `56d87d7`)
 - **Base `main` Commit (Untouched):** `3a34d38`
-- **Test Runner Installed:** `pytest 9.2.0` (`C:\Users\tanis\AppData\Local\Python\pythoncore-3.13-64\python.exe`)
+- **Test Runners Installed:**
+  - `pytest 9.2.0` (`C:\Users\tanis\AppData\Local\Python\pythoncore-3.13-64\python.exe`)
+  - OpenJDK 17 (`EclipseAdoptium.Temurin.17.JDK`), Gradle `8.10.2`, Android SDK `android-35` + `build-tools 34.0.0/35.0.0` + `adb`
+
+---
+
+## Final 48/48 Modules + 5/5 Evolution Engines Completion Scorecard
+
+| Track | Target | Verified Implementation | Status |
+| :--- | :--- | :--- | :--- |
+| **EvoCore Auto-Evolution Engines** | 5 / 5 | Telemetry SQLite WAL, Safety Guard + Rollback, Self-Healer + Replay Benchmark, Habit Compiler, Skill Synthesizer + Reflection Loop | **5 / 5 COMPLETE** |
+| **Milestone 10: Security, Hybrid Router & Planner Core** | 6 / 6 | Adaptive Router (`local_router.py`), RAG Consolidation & Failure Immunity, Replay Self-Benchmarking, Verified Planner + Choice HUD (`confirm.py`), Uniform `SAFE`/`CONFIRM`/`LOCKED` gates, AES-256-GCM `file_vault` + Defender + 3-Persona | **6 / 6 COMPLETE** |
+| **Milestone 11: Windows Desktop Parity** | 41 / 41 | Biometric Voice Lock, Cron SQLite Routines, Network Speed/IP, `system_cleaner`, Spotify, MediaPipe Gestures, Auto-Scroll & Notepad Dictation, `.pptx` Decks, Scraper + Price Comparator, Website & Image Generators, `office_suite` (Excel/PDF/Convert), Email SMTP/IMAP, WhatsApp Media/Calls, Dev Workspace + Profiles, AES Form Filler, YouTube Whisper Fallback, Market Finance, 2D Avatar Overlay (8 Gestures) | **41 / 41 COMPLETE** |
+| **Milestone 12: Android MAX Companion & PC Bridge** | 7 / 7 | Setup Pre-Flight (`setup_android_env.ps1`), Bidirectional TLS `/ws` Bridge + Instant PWA (`/pwa`), `android_bridge` Plugin, Native Kotlin App (`AntiTheftGuardService`, `WakeWordVoiceService`, `WhatsAppAndCallController`, `MobileToggleManager`, `ScreenVisionScrollService`, `EmergencySosManager`, `VoiceCameraController`) + On-Device Privacy Mode | **7 / 7 COMPLETE** |
+
+---
+
+## Milestone 12 — 7/7 Android MAX Companion & PC <-> Android Bridge (`7f2d1be`)
+
+### 1. Zero-Friction Android Pre-Flight (`scripts/setup_android_env.ps1`)
+- Installed and detected **Eclipse Temurin OpenJDK 17** (`C:\Program Files\Eclipse Adoptium\jdk-17.0.21.10002-hotspot`), **Gradle 8.10.2** (`C:\Users\tanis\AppData\Local\Android\tools\gradle-8.10.2`), **Android Command-Line Tools** (`sdkmanager.bat`), **`platform-tools` (`adb.exe`)**, **`platforms;android-35`**, and **Build-Tools `34.0.0` / `35.0.0`**.
+
+### 2. Bidirectional PC <-> Android Bridge, PWA Fallback & Plugin (`dashboard/server.py`, `plugins/android_bridge.py`, `main.py`)
+- Upgraded `dashboard/server.py` `/ws` with typed bidirectional RPC: `device_register`, `heartbeat` telemetry updates, `pc_to_android` -> `android_result` correlated futures, `tool_invoke` -> `main.py:_execute_tool` (recording telemetry & honoring `safety_guard` gates), and `android_event` broadcasts.
+- Added `/api/android/pair` (rate-limited PIN pairing returning session token, device token, & TLS SHA-256 fingerprint), `/api/android/devices`, `/api/android/command` (server-side risk gate enforcement), `/api/cert-fingerprint`, and installable PWA routes (`/pwa`, `/manifest.webmanifest`, `/sw.js`, `/pwa-icon.svg`).
+- Created `plugins/android_bridge.py` (`SAFE` status/devices/pair/battery_gps/toggle/scroll/speak, `CONFIRM` siren/lock_screen/camera/whatsapp/call, `LOCKED` `sos` protected by Biometric Voice Lock + HUD confirmation).
+- Fixed test-pollution bug in `providers/_tests.py` `[20]` so synthetic fallback tests run against an isolated temporary telemetry SQLite DB instead of polluting live `memory/telemetry.sqlite`.
+
+### 3. Native Kotlin Android MAX Companion App (`android_companion/`, `minSdk 26`, `compileSdk 35`)
+- **Core (`core/`):** `PrivacyConfig.kt` (100% On-Device Privacy Mode toggle), `CryptoEnvelope.kt` (PBKDF2 200k + AES-256-GCM matching `dashboard/server.py`), `ProtocolModels.kt`, and `JarvisWebSocketClient.kt` (OkHttp TLS SHA-256 certificate pinning + 25s heartbeat).
+- **7/7 MAX Modules (`modules/`):**
+  1. `antitheft/` (`AntiTheftGuardService`, `MotionTamperDetector`, `JarvisDeviceAdminReceiver`, `ChargerDisconnectReceiver`)
+  2. `wakeword/` (`WakeWordVoiceService`, `WakePhraseMatcher` for English / Hindi Devanagari / Hinglish)
+  3. `comms/` (`WhatsAppAndCallController`, `JarvisNotificationListener`)
+  4. `toggles/` (`MobileToggleManager` — flashlight, Wi-Fi, Bluetooth, DND, brightness, ringer, alarms, battery, app launch)
+  5. `vision/` (`ScreenVisionScrollService` `AccessibilityService` — continuous auto-scroll, read screen aloud, label auto-tap, auto-type)
+  6. `sos/` (`EmergencySosManager` — `FusedLocationProviderClient` GPS SMS/WhatsApp + PC alert with safety confirmation)
+  7. `camera/` (`VoiceCameraController` — CameraX front/rear capture, zoom, video recording)
+- **Material 3 Compose UI (`ui/MainActivity.kt`):** Cybernetic HUD pairing screen, TLS SHA-256 pin field, 100% Privacy Mode toggle, 7 MAX module controls, and live telemetry feed.
+
+### Milestone 12 Verification Summary
+- `scripts/validate_plugin.py plugins/android_bridge.py`: **PASS** (0 errors, 0 warnings)
+- `pytest -B -v`: **36 passed, 0 failed** (`47.82s`; Milestone 10 + 11 + 12 Python suites)
+- `.\gradlew.bat testDebugUnitTest assembleDebug`: **BUILD SUCCESSFUL** (`GRADLE_EXIT=0`), **4/4 JUnit tests passed** (`MaxModulesUnitTest`), APK built at git-ignored `android_companion/app/build/outputs/apk/debug/app-debug.apk` (`18,700,363` bytes)
+- `scripts/verify_wake_activation.py`: **8/8 passed** (live WASAPI RAW `false_hits=0`)
+- `scripts/verify_cybersec.py`: **8/8 checks PASSED** (`ALL CYBERSEC CHECKS PASSED`)
+- `scripts/verify_m3_reflector.py`: **14/14 checks PASSED**
+- `scripts/verify_m4_skill_workflow.py`: **18/18 checks PASSED** (`active=31, rejected=0, core_checked=28`)
+- `python -B -m providers._tests`: **108 passed, 0 failed**
+- `scripts/health_check.py`: Re-verified clean (`dirty=0`, `active=31`, `rejected=0`, `unignored_secrets=none`).
 
 ---
 
@@ -134,6 +183,16 @@
 
 ---
 
-## Next Steps (Pending User Confirmation)
-- **Milestone 11 (COMPLETE on `milestone/11-windows-desktop-parity` `ccb9420`):** Inherited by Milestone 12.
-- **Milestone 12 (`milestone/12-android-max-companion`):** After user confirmation, generate & run `scripts/setup_android_env.ps1` (OpenJDK 17, Android cmdline-tools, Gradle, ADB), keep `dashboard/server.py` mobile web/PWA controller synced as fallback, and scaffold `android_companion/` in Kotlin (Android 8.0+) with all 7 MAX modules (Anti-Theft Siren Guard + DevicePolicyManager + intruder selfie, Foreground Wake-Word in Hindi/English/Hinglish, WhatsApp & Speakerphone Call Control, Mobile Hardware Toggles, Accessibility Auto-Scroll & Screen Vision, Emergency SOS + Live GPS, CameraX Voice Trigger) plus 100% offline privacy mode.
+## Merge to `main` & Restart Live Mark-LVII (Run When Ready)
+```powershell
+# 1. Fast-forward / merge Milestone 10 -> 11 -> 12 into main cleanly:
+cd C:\Users\tanis\Downloads\Mark-LVII-main\Mark-LVII-main
+git checkout main
+git merge --no-ff milestone/12-android-max-companion -m "merge: Milestone 10-12 EvoCore, Windows Parity, and Android MAX Companion"
+
+# 2. Optional: sideload the Android MAX Companion APK via ADB (USB debugging enabled):
+"$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" install -r .\android_companion\app\build\outputs\apk\debug\app-debug.apk
+
+# 3. Restart live Mark-LVII:
+C:\Users\tanis\AppData\Local\Python\pythoncore-3.13-64\python.exe -B -u main.py
+```
