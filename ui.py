@@ -168,6 +168,15 @@ class JarvisUI:
         """Thread-safe: take the gate down."""
         self._win._confirm_hide_sig.emit()
 
+    def show_choice(self, title: str, detail: str, options: list[str]) -> None:
+        """Thread-safe: raise the multi-option choice picker on the HUD."""
+        clean = [str(o)[:100] for o in (options or [])[:6]]
+        self._win._choice_sig.emit(str(title)[:120], str(detail)[:300], clean)
+
+    def hide_choice(self) -> None:
+        """Thread-safe: take the multi-option choice picker down."""
+        self._win._choice_hide_sig.emit()
+
     @property
     def get_plugins(self):
         return self._win.get_plugins

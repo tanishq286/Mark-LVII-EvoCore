@@ -689,3 +689,20 @@ def save_providers(mode: str = None, pipeline: dict = None, creds: dict = None,
 
     data["providers"] = block
     _write_config(data)
+
+
+def get_persona_mode() -> str:
+    """Active communication persona ('precision', 'empathetic', or 'expressive')."""
+    try:
+        from core.persona import normalize_persona
+        return normalize_persona(load_api_keys().get("persona_mode", "precision"))
+    except Exception:
+        return "precision"
+
+
+def save_persona_mode(mode: str) -> str:
+    """Persist active persona mode cleanly into api_keys.json."""
+    from core.persona import normalize_persona
+    canonical = normalize_persona(mode)
+    _patch_config(persona_mode=canonical)
+    return canonical

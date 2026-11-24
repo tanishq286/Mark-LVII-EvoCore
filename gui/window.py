@@ -73,6 +73,7 @@ from gui.widgets import (
 )
 from gui.overlays import (
     AudioDeviceOverlay,
+    ChoiceBanner,
     ClipboardPanel,
     ConfirmBanner,
     CustomizeOverlay,
@@ -115,6 +116,8 @@ class MainWindow(QMainWindow):
     _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
     _confirm_sig    = pyqtSignal(str, str)   # (title, detail) — irreversible-action gate
     _confirm_hide_sig = pyqtSignal()
+    _choice_sig     = pyqtSignal(str, str, list)  # (title, detail, options) — multi-option gate
+    _choice_hide_sig = pyqtSignal()
     _wake_dl_sig    = pyqtSignal(bool, str)  # wake-word install finished (ok, message)
     _quiz_sig       = pyqtSignal(str, object, object)  # (topic, questions, grader)
     _quiz_hide_sig  = pyqtSignal()
@@ -150,6 +153,7 @@ class MainWindow(QMainWindow):
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
         self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
+        self._choice_overlay   = None   # live ChoiceBanner, if one is on screen
         self.get_plugins       = None   # callable: () -> list[dict], set by JarvisLive
         self.get_plugin_settings = None # callable: () -> list[dict] settings schemas, set by JarvisLive
         self.on_wake_toggle    = None   # callable: (enable: bool) -> str, set by JarvisLive
@@ -406,6 +410,8 @@ class MainWindow(QMainWindow):
         self._camera_sig.connect(self._show_camera_frame)
         self._confirm_sig.connect(self._show_confirm_banner)
         self._confirm_hide_sig.connect(self._hide_confirm_banner)
+        self._choice_sig.connect(self._show_choice_banner)
+        self._choice_hide_sig.connect(self._hide_choice_banner)
         self._cam_stream_sig.connect(self._on_cam_stream)
         self._cam_frame_sig.connect(self._on_cam_frame)
         self._wake_btns_sig.connect(self._refresh_wake_btns)
@@ -2881,6 +2887,28 @@ class MainWindow(QMainWindow):
             resolve(bool(accepted))
         except Exception as e:
             self._log.append_log(f"ERR: Confirmation failed — {e}")
+
+    def _show_choice_banner(self, title: str, detail: str, options: list):
+        self._hide_choice_banner()
+        ov = ChoiceBanner(title, detail, [str(x) for x in (options or [])], parent=self.centralWidget())
+        ov.chosen.connect(self._on_choice_answered)
+        self._centre_overlay(ov)
+        self._choice_overlay = ov
+
+    def _hide_choice_banner(self):
+        ov = getattr(self, "_choice_overlay", None)
+        if ov is not None:
+            ov.hide()
+            ov.deleteLater()
+            self._choice_overlay = None
+
+    def _on_choice_answered(self, idx: int):
+        self._hide_choice_banner()
+        try:
+            from core.confirm import resolve_choice
+            resolve_choice(idx if idx >= 0 else None)
+        except Exception as e:
+            self._log.append_log(f"ERR: Choice failed — {e}")
 
     def _open_plugin_manager(self):
         plugins = self.get_plugins() if self.get_plugins else []

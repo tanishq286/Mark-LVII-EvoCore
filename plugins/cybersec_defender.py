@@ -58,13 +58,15 @@ PLUGIN = {
     "description": (
         "Authorized defensive cybersecurity inspector for the local machine and "
         "local source folders only (no remote scanning or offensive exploitation). "
-        "Supports 6 modes: 'status' (fast guardrail readiness), 'audit_ports' "
+        "Supports 8 modes: 'status' (fast guardrail readiness), 'audit_ports' "
         "(read-only listening TCP/UDP sockets & owning processes, flagging 0.0.0.0 "
         "exposure), 'audit_posture' (read-only Windows Firewall, Defender, and UAC "
         "check), 'audit_code' (local folder/file secret detection with redaction + "
         "AST/regex CWE audit, blocking symlinks outside target), 'audit_headers' "
-        "(loopback-only 127.0.0.1/localhost HTTP security header audit), and "
-        "'cve_lookup' (free OSV.dev advisory or package lookup wrapped as UNTRUSTED data)."
+        "(loopback-only 127.0.0.1/localhost HTTP security header audit), 'cve_lookup' "
+        "(free OSV.dev advisory or package lookup wrapped as UNTRUSTED data), "
+        "'defender_scan_file' (targeted Windows Defender MpCmdRun.exe file/folder malware scan), "
+        "and 'defender_quick_scan' (CONFIRM-gated Windows Defender system quick scan)."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -78,10 +80,13 @@ PLUGIN = {
                     "audit_code",
                     "audit_headers",
                     "cve_lookup",
+                    "defender_scan_file",
+                    "defender_quick_scan",
                 ],
                 "description": (
                     "Defensive check mode: 'status', 'audit_ports', 'audit_posture', "
-                    "'audit_code', 'audit_headers', or 'cve_lookup'."
+                    "'audit_code', 'audit_headers', 'cve_lookup', 'defender_scan_file', "
+                    "or 'defender_quick_scan'."
                 ),
             },
             "target": {
@@ -996,6 +1001,114 @@ def _cve_lookup(target: str, ecosystem: str = "", version: str = "") -> str:
         return _wrap_untrusted("cybersec_cve", fallback)
 
 
+def _find_mpcmdrun() -> Path | None:
+    """Locate Windows Defender's official CLI scanner (`MpCmdRun.exe`)."""
+    candidates: list[Path] = []
+    pf = os.environ.get("ProgramFiles") or r"C:\Program Files"
+    candidates.append(Path(pf) / "Windows Defender" / "MpCmdRun.exe")
+    prog_data = os.environ.get("ProgramData") or r"C:\ProgramData"
+    platform_dir = Path(prog_data) / "Microsoft" / "Windows Defender" / "Platform"
+    if platform_dir.is_dir():
+        try:
+            for sub in sorted(platform_dir.iterdir(), reverse=True):
+                if sub.is_dir():
+                    candidates.append(sub / "MpCmdRun.exe")
+        except OSError:
+            pass
+    for c in candidates:
+        try:
+            if c.is_file():
+                return c
+        except OSError:
+            continue
+    return None
+
+
+def _defender_scan_file(target: str) -> str:
+    raw = (target or "").strip()
+    if not raw:
+        return "defender_scan_file requires a local file or directory path in 'target'."
+    p = Path(raw)
+    if p.is_symlink() or not p.exists():
+        return f"AUTHORIZATION BLOCKED: target does not exist or symlink refused: {raw}"
+
+    mp = _find_mpcmdrun()
+    if mp is None:
+        return "Windows Defender MpCmdRun.exe is not available on this OS/machine."
+
+    try:
+        proc = subprocess.run(
+            [str(mp), "-Scan", "-ScanType", "3", "-File", str(p.resolve())],
+            capture_output=True,
+            text=True,
+            timeout=90.0,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return f"Windows Defender file scan timed out after 90s for '{p}'."
+    except Exception as exc:
+        return f"Windows Defender file scan failed: {exc}"
+
+    out = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    if proc.returncode == 0:
+        return f"Windows Defender custom scan CLEAN (exit=0) for '{p.resolve()}'.\n{out[:1200]}"
+    if proc.returncode == 2:
+        return f"ALERT: Windows Defender detected a threat (exit=2) in '{p.resolve()}':\n{out[:1600]}"
+    return f"Windows Defender scan finished (exit={proc.returncode}) for '{p.resolve()}':\n{out[:1200]}"
+
+
+def _defender_quick_scan(player: Any = None) -> str:
+    mp = _find_mpcmdrun()
+    if mp is None:
+        return "Windows Defender MpCmdRun.exe is not available on this OS/machine."
+
+    def _run_quick() -> str:
+        try:
+            proc = subprocess.run(
+                [str(mp), "-Scan", "-ScanType", "1"],
+                capture_output=True,
+                text=True,
+                timeout=300.0,
+                shell=False,
+                stdin=subprocess.DEVNULL,
+            )
+            out = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            msg = (
+                f"Windows Defender Quick Scan complete (exit={proc.returncode}): "
+                + ("no threats found." if proc.returncode == 0 else out[:300])
+            )
+        except Exception as exc:
+            msg = f"Windows Defender Quick Scan failed: {exc}"
+        _log(player, msg)
+        _show(player, "Windows Defender Quick Scan", msg)
+        return msg
+
+    def _launch_thread() -> str:
+        import threading
+        threading.Thread(target=_run_quick, daemon=True, name="defender-quick-scan").start()
+        return "Windows Defender Quick Scan started in the background; results will appear on the HUD."
+
+    try:
+        from core.evolution import safety_guard
+        return safety_guard.enforce_gate(
+            "cybersec_defender",
+            "defender_quick_scan",
+            "Run Windows Defender Quick Scan",
+            "Executes `MpCmdRun.exe -Scan -ScanType 1` across system memory and startup locations.",
+            _launch_thread,
+            key="defender_quick_scan",
+        )
+    except Exception:
+        from core import confirm
+        return confirm.request(
+            key="defender_quick_scan",
+            title="[CONFIRM] Run Windows Defender Quick Scan",
+            detail="Executes `MpCmdRun.exe -Scan -ScanType 1`.",
+            run=_launch_thread,
+        )
+
+
 def run(parameters: dict, player=None, session_memory=None) -> str:
     """Execute a strictly defensive, read-only cybersecurity check cleanly."""
     try:
@@ -1040,10 +1153,18 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             _log(player, f"cybersec_defender: cve_lookup complete ({target})")
             _show(player, f"OSV Advisory Lookup ({target})", result)
             return result
+        if mode == "defender_scan_file":
+            result = _defender_scan_file(target)
+            _log(player, "cybersec_defender: defender_scan_file complete")
+            _show(player, "Windows Defender File Scan", result)
+            return result
+        if mode == "defender_quick_scan":
+            return _defender_quick_scan(player=player)
 
         return (
             f"Unknown mode '{mode}'. Supported modes: status, audit_ports, "
-            "audit_posture, audit_code, audit_headers, cve_lookup."
+            "audit_posture, audit_code, audit_headers, cve_lookup, "
+            "defender_scan_file, defender_quick_scan."
         )
     except Exception as exc:
         _log(player, f"cybersec_defender error: {exc}")

@@ -32,8 +32,17 @@ memory/heuristics_chain.json
 memory/score_history.json
 memory/evolution_journal.json
 memory/failure_patterns.json
+memory/habits.json
+memory/evolution_digest.json
+memory/evolution_commits.json
+memory/vault_index.json
+memory/autonomous_missions.json
 memory/*.log
 memory/*.db
+memory/*.sqlite
+memory/*.sqlite-wal
+memory/*.sqlite-shm
+.pytest_cache/
 training_data/
 knowledge/
 backups/

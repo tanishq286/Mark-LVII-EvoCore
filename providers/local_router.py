@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from pathlib import Path
 import re
 import threading
 import time
@@ -116,6 +117,83 @@ class RouteDecision:
     preferred_models: tuple[str, ...]
     reason: str
     selected_model: str = ""
+    escalate_to_cloud: bool = False
+    telemetry_note: str = ""
+
+
+def adaptive_rank_models(
+    category: str,
+    ladder: Sequence[str],
+    *,
+    db_path: Path | None = None,
+    min_samples: int = 3,
+    min_success_rate: float = 0.65,
+    max_p95_ms: float = 25_000.0,
+) -> tuple[list[str], bool, str]:
+    """Re-order `ladder` using SQLite telemetry and decide if cloud escalation is warranted.
+
+    Models without `min_samples` retain their deterministic static priority until
+    enough observations accumulate. Once candidates have sufficient samples, healthy
+    models (`success_rate >= min_success_rate` and `p95_ms <= max_p95_ms`) sort ahead
+    of degraded ones. If every candidate with sufficient samples is degraded, sets
+    `escalate=True`. Never raises.
+    """
+    ordered = list(ladder)
+    if not ordered:
+        return [], False, ""
+    try:
+        from core.evolution.telemetry import route_metrics
+        stats = route_metrics(category=category, db_path=db_path)
+    except Exception:
+        return ordered, False, ""
+
+    if not stats:
+        return ordered, False, ""
+
+    evaluated_flags: list[bool] = []
+    degraded_flags: list[bool] = []
+    scored: list[tuple[tuple[int, float, float, int], str]] = []
+
+    for idx, model in enumerate(ordered):
+        rec = stats.get((category, model))
+        if not rec or int(rec.get("calls", 0)) < min_samples:
+            # Cold-start: preserve static order among unmeasured candidates without outranking proven healthy ones
+            scored.append(((0, -min_success_rate, 1e9, idx), model))
+            evaluated_flags.append(False)
+            degraded_flags.append(False)
+            continue
+
+        evaluated_flags.append(True)
+        sr = float(rec.get("success_rate", 1.0))
+        p95 = float(rec.get("p95_ms", 0.0))
+        is_bad = (sr < min_success_rate) or (p95 > max_p95_ms)
+        degraded_flags.append(is_bad)
+        tier_rank = 1 if is_bad else 0
+        scored.append(((tier_rank, -sr, p95, idx), model))
+
+    scored.sort(key=lambda item: item[0])
+    ranked = [m for _, m in scored]
+
+    # Escalate when every candidate with >= min_samples is degraded (and at least one was evaluated)
+    all_eval_bad = any(evaluated_flags) and all(
+        degraded for evaluated, degraded in zip(evaluated_flags, degraded_flags) if evaluated
+    ) and all(evaluated_flags)
+    if all_eval_bad:
+        note = (
+            f"escalate: all local {category} models degraded "
+            f"(success_rate < {min_success_rate:.2f} or p95 > {max_p95_ms:.0f}ms)"
+        )
+        return ranked, True, note
+
+    if ranked != ordered:
+        top_m = ranked[0]
+        rec = stats.get((category, top_m), {})
+        note = (
+            f"re-ranked {category} -> {top_m} "
+            f"(sr={rec.get('success_rate', 1.0):.2f}, p95={rec.get('p95_ms', 0.0):.0f}ms)"
+        )
+        return ranked, False, note
+    return ranked, False, ""
 
 
 def strip_thinking(raw: str) -> str:
@@ -273,6 +351,8 @@ def route_prompt(
     available_models: Iterable[str] | None = None,
     fallback_model: str = "qwen3:8b",
     force_category: str | None = None,
+    use_telemetry: bool = True,
+    telemetry_db_path: Path | None = None,
 ) -> tuple[RouteDecision, list[str]]:
     """Classify `prompt` and resolve the concrete installed Ollama model ladder."""
     if force_category in SPECIALIST_LADDERS:
@@ -288,11 +368,21 @@ def route_prompt(
     if avail is None:
         avail = list_installed_models(ollama_origin)
     ladder = select_candidate_ladder(decision, avail, fallback_model=fallback_model)
+    escalate = False
+    t_note = ""
+    if use_telemetry and ladder:
+        ladder, escalate, t_note = adaptive_rank_models(
+            decision.category,
+            ladder,
+            db_path=telemetry_db_path,
+        )
     resolved = RouteDecision(
         category=decision.category,
         preferred_models=decision.preferred_models,
         reason=decision.reason,
         selected_model=ladder[0],
+        escalate_to_cloud=escalate,
+        telemetry_note=t_note,
     )
     return resolved, ladder
 
@@ -437,14 +527,25 @@ def complete_local(
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        t_start = time.perf_counter()
         try:
             with urlopen(req, timeout=timeout_s) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
-        except Exception:
+        except Exception as exc:
+            _record_route_safe(
+                decision.category,
+                model,
+                "ollama",
+                False,
+                (time.perf_counter() - t_start) * 1000.0,
+                error_snippet=f"{type(exc).__name__}: {exc}",
+            )
             continue
+        elapsed_ms = (time.perf_counter() - t_start) * 1000.0
         raw_txt = str((data.get("message") or {}).get("content") or "")
         txt = strip_thinking(raw_txt)
         if txt:
+            _record_route_safe(decision.category, model, "ollama", True, elapsed_ms)
             return {
                 "text": txt,
                 "model": model,
@@ -454,4 +555,37 @@ def complete_local(
                 "keep_alive": resolved_keep_alive,
                 "unloaded": vram_info.get("unloaded") or [],
             }
+        _record_route_safe(
+            decision.category,
+            model,
+            "ollama",
+            False,
+            elapsed_ms,
+            error_snippet="empty response",
+        )
     return None
+
+
+def _record_route_safe(
+    category: str,
+    model: str,
+    provider: str,
+    success: bool,
+    latency_ms: float,
+    *,
+    escalated: bool = False,
+    error_snippet: str = "",
+) -> None:
+    try:
+        from core.evolution.telemetry import record_route_event
+        record_route_event(
+            category,
+            model,
+            provider,
+            success,
+            latency_ms,
+            escalated=escalated,
+            error_snippet=error_snippet,
+        )
+    except Exception:
+        pass

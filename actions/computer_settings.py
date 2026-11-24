@@ -1,5 +1,6 @@
 #computer_settings.py
 import json
+import os
 import re
 import shutil
 import sys
@@ -781,13 +782,60 @@ def restart_computer():
 
 def shutdown_computer():
     if _OS == "Windows":
-        subprocess.run(["shutdown", "/s", "/t", "10"], capture_output=True)
+        subprocess.run(["shutdown", "/s", "/t", "10"], capture_output=True, **_WIN_HIDE)
     elif _OS == "Darwin":
         subprocess.run(["osascript", "-e",
             'tell application "System Events" to shut down'],
             capture_output=True)
     else:
         subprocess.run(["systemctl", "poweroff"], capture_output=True)
+
+
+def hibernate_computer():
+    if _OS == "Windows":
+        subprocess.run(["shutdown", "/h"], capture_output=True, **_WIN_HIDE)
+    elif _OS == "Darwin":
+        subprocess.run(["pmset", "sleepnow"], capture_output=True)
+    else:
+        subprocess.run(["systemctl", "hibernate"], capture_output=True)
+
+
+def sign_out_computer():
+    if _OS == "Windows":
+        subprocess.run(["shutdown", "/l"], capture_output=True, **_WIN_HIDE)
+    elif _OS == "Darwin":
+        subprocess.run(["osascript", "-e", 'tell application "loginwindow" to «event aevtrlgo»'], capture_output=True)
+    else:
+        subprocess.run(["loginctl", "terminate-user", os.environ.get("USER", "")], capture_output=True)
+
+
+def schedule_shutdown(minutes: int = 10):
+    mins = max(1, min(1440, int(minutes or 10)))
+    secs = str(mins * 60)
+    if _OS == "Windows":
+        subprocess.run(["shutdown", "/s", "/t", secs], capture_output=True, **_WIN_HIDE)
+    elif _OS == "Darwin":
+        subprocess.run(["shutdown", "-h", f"+{mins}"], capture_output=True)
+    else:
+        subprocess.run(["shutdown", "-h", f"+{mins}"], capture_output=True)
+
+
+def schedule_restart(minutes: int = 10):
+    mins = max(1, min(1440, int(minutes or 10)))
+    secs = str(mins * 60)
+    if _OS == "Windows":
+        subprocess.run(["shutdown", "/r", "/t", secs], capture_output=True, **_WIN_HIDE)
+    elif _OS == "Darwin":
+        subprocess.run(["shutdown", "-r", f"+{mins}"], capture_output=True)
+    else:
+        subprocess.run(["shutdown", "-r", f"+{mins}"], capture_output=True)
+
+
+def cancel_power_timer():
+    if _OS == "Windows":
+        subprocess.run(["shutdown", "/a"], capture_output=True, **_WIN_HIDE)
+    else:
+        subprocess.run(["shutdown", "-c"], capture_output=True)
 
 ACTION_MAP: dict[str, callable] = {
     "volume_up":           volume_up,
@@ -855,6 +903,12 @@ ACTION_MAP: dict[str, callable] = {
     "toggle_wifi":         toggle_wifi,
     "restart":             restart_computer,
     "shutdown":            shutdown_computer,
+    "hibernate":           hibernate_computer,
+    "sign_out":            sign_out_computer,
+    "log_off":             sign_out_computer,
+    "schedule_shutdown":   schedule_shutdown,
+    "schedule_restart":    schedule_restart,
+    "cancel_power_timer":  cancel_power_timer,
 }
 
 # ── What needs a human, and what just needs an undo ──────────────────────────
@@ -877,6 +931,16 @@ _IRREVERSIBLE = {
                     "Anything unsaved will be lost. The computer restarts in 10 seconds."),
     "shutdown":    ("Shut this computer down",
                     "Anything unsaved will be lost. The computer powers off in 10 seconds."),
+    "hibernate":   ("Hibernate this computer",
+                    "The computer will save RAM to disk and power down cleanly."),
+    "sign_out":    ("Sign out of this user session",
+                    "All open applications will be closed and you will be returned to the sign-in screen."),
+    "log_off":     ("Sign out of this user session",
+                    "All open applications will be closed and you will be returned to the sign-in screen."),
+    "schedule_shutdown": ("Schedule timed shutdown",
+                          "Schedules automatic shutdown after the requested number of minutes."),
+    "schedule_restart":  ("Schedule timed restart",
+                          "Schedules automatic restart after the requested number of minutes."),
     # Not obviously destructive, and that is exactly why it was missed: turning
     # the WiFi off cuts the assistant's own connection to the Live API, so it
     # cannot be asked to turn it back on.
@@ -887,6 +951,7 @@ _IRREVERSIBLE = {
 
 # Kept so anything still importing the old name keeps working.
 _DANGEROUS_ACTIONS = set(_IRREVERSIBLE)
+_SCHEDULED_POWER_ACTIONS = {"schedule_shutdown", "schedule_restart"}
 
 
 # ── Local intent resolution ──────────────────────────────────────────────────
@@ -919,8 +984,13 @@ _ALIASES = {
     "screenshot":      ("capture screen", "take a screenshot", "snip"),
     "refresh_page":    ("refresh", "reload page"),
     "new_tab":         ("open a tab", "open new tab"),
-    "shutdown":        ("power off", "turn off the computer", "switch off the pc"),
-    "restart":         ("reboot", "restart the pc"),
+    "shutdown":           ("power off", "turn off the computer", "switch off the pc"),
+    "restart":            ("reboot", "restart the pc"),
+    "hibernate":          ("hibernate", "hibernate pc", "hibernate computer"),
+    "sign_out":           ("sign out", "log off", "logout", "sign out of windows"),
+    "schedule_shutdown":  ("schedule shutdown", "shutdown timer", "shut down in"),
+    "schedule_restart":   ("schedule restart", "restart timer", "restart in"),
+    "cancel_power_timer": ("cancel shutdown", "abort shutdown", "cancel restart", "cancel power timer"),
     "unmute":          ("sound on", "unmute"),
     "media_next":      ("next song", "next track", "skip song"),
     "media_previous":  ("previous song", "previous track"),
@@ -1043,16 +1113,32 @@ def computer_settings(
             return outcome.failed("computer_settings",
                                   "that is not an action this tool has",
                                   wanted=raw_action)
-        if confirm.pending_title():
-            return outcome.ask(
+        if action in _SCHEDULED_POWER_ACTIONS:
+            mins = _number(value)
+            mins = 10 if mins is None else max(1, min(1440, int(mins)))
+            detail = f"{detail} Timer: {mins} minute(s)."
+            run_cb = lambda f=func, m=mins, a=action: (f(m), f"{a} scheduled for {m} minute(s).")[1]
+        else:
+            run_cb = lambda f=func, a=action: (f(), f"{a} done.")[1]
+        try:
+            from core.evolution import safety_guard
+            canon_action = "sign_out" if action == "log_off" else action
+            return safety_guard.enforce_gate(
                 "computer_settings",
-                "there is already a confirmation waiting on screen - the user "
-                "has to answer that one first",
-                wanted=action)
-        return confirm.request(
-            key=action, title=title, detail=detail,
-            run=lambda f=func, a=action: (f(), f"{a} done.")[1],
-        )
+                canon_action,
+                title,
+                detail,
+                run_cb,
+                key=canon_action,
+            )
+        except Exception:
+            if confirm.pending_title():
+                return outcome.ask(
+                    "computer_settings",
+                    "there is already a confirmation waiting on screen - the user "
+                    "has to answer that one first",
+                    wanted=action)
+            return confirm.request(key=action, title=title, detail=detail, run=run_cb)
 
     if action in ("volume_set", "set_volume"):
         # No level means no guess: the old default of 50 turned "set the volume"
@@ -1330,7 +1416,8 @@ TOOL = {
                     "undo | redo | select_all | save | enter | escape | press_key | "
                     "type_text | screenshot | lock_screen | open_settings | "
                     "file_explorer | open_run | dark_mode | toggle_wifi | "
-                    "restart | shutdown"
+                    "restart | shutdown | hibernate | sign_out | "
+                    "schedule_shutdown | schedule_restart | cancel_power_timer"
                 )
             },
             "description": {

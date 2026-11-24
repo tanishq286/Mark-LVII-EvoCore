@@ -341,20 +341,36 @@ def send_message(
 
     preview = message_text[:50] + ("…" if len(message_text) > 50 else "")
     print(f"[SendMessage] 📨 {platform} → {receiver}: {preview}")
-    if player:
-        player.write_log(f"[msg] {platform} → {receiver}")   # the message itself IS the news
 
-    threading.Thread(
-        target=_send_and_report,
-        args=(player, platform, receiver, message_text),
-        daemon=True, name="send-message",
-    ).start()
+    def _dispatch_send() -> str:
+        if player:
+            player.write_log(f"[msg] {platform} → {receiver}")   # the message itself IS the news
+        threading.Thread(
+            target=_send_and_report,
+            args=(player, platform, receiver, message_text),
+            daemon=True, name="send-message",
+        ).start()
+        return outcome.started("send_message", platform=platform, to=receiver)
 
-    # Sending opens an application, searches for a person and types — several
-    # seconds during which the old code held the whole conversation still. The
-    # answer goes out now and the result follows, which is the shape
-    # whatsapp_call.py settled on for the same reason.
-    return outcome.started("send_message", platform=platform, to=receiver)
+    try:
+        from core.evolution import safety_guard
+        return safety_guard.enforce_gate(
+            "send_message",
+            "send",
+            f"Send {platform} message to {receiver}",
+            f"Platform: {platform} | Recipient: {receiver} | Preview: {preview}",
+            _dispatch_send,
+            key=f"send_{platform.lower()}_{receiver[:24]}",
+        )
+    except Exception:
+        # Fail closed if confirm/safety_guard cannot be bypassed
+        from core import confirm
+        return confirm.request(
+            key=f"send_{platform.lower()}_{receiver[:24]}",
+            title=f"[CONFIRM] Send {platform} message to {receiver}",
+            detail=f"Platform: {platform} | Recipient: {receiver} | Preview: {preview}",
+            run=_dispatch_send,
+        )
 
 
 def _send_and_report(player, platform: str, receiver: str,

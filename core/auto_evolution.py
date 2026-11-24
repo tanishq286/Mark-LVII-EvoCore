@@ -702,6 +702,7 @@ def start_daemon(player=None, interval_s: float = 180.0) -> None:
         _daemon_started = True
 
     def _loop():
+        last_reflection_at = 0.0
         try:
             seed_foundational_heuristics()
             harvest_linux_wsl_everything()
@@ -713,5 +714,13 @@ def start_daemon(player=None, interval_s: float = 180.0) -> None:
                 sync_epistemic_graph()
             except Exception as e:
                 print(f"[AutoEvolution] sync error: {e}")
+            now = time.monotonic()
+            if (now - last_reflection_at) >= 3600.0:
+                last_reflection_at = now
+                try:
+                    from core.evolution import reflection_loop
+                    reflection_loop.run_reflection_cycle(_BASE, consolidate_rag=True)
+                except Exception as e:
+                    print(f"[AutoEvolution] reflection cycle error: {e}")
 
     threading.Thread(target=_loop, daemon=True, name="jarvis-auto-evolution").start()
