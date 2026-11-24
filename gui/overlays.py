@@ -713,6 +713,74 @@ class ConfirmBanner(_HudOverlay):
         no.setFocus()
 
 
+class ChoiceBanner(_HudOverlay):
+    """Multi-option HUD disambiguation banner wired to `core/confirm.py`."""
+
+    chosen = pyqtSignal(int)   # 0-based index, or -1 on Cancel
+    _OW = 450
+
+    def __init__(self, title: str, detail: str, options: list[str], parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            ChoiceBanner {{
+                background: rgba(0, 8, 14, 250);
+                border: 1px solid {C.PRI};
+                border-radius: 6px;
+            }}
+        """)
+        self.setFixedWidth(self._OW)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(8)
+
+        hdr = QLabel("◆  SELECT OPTION")
+        hdr.setFont(hud_font(11, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        lay.addWidget(hdr)
+
+        ttl = QLabel(title)
+        ttl.setWordWrap(True)
+        ttl.setFont(hud_font(10, QFont.Weight.Bold))
+        ttl.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+        lay.addWidget(ttl)
+
+        if detail:
+            dtl = QLabel(detail)
+            dtl.setWordWrap(True)
+            dtl.setFont(hud_font(8))
+            dtl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+            lay.addWidget(dtl)
+
+        for idx, opt in enumerate(options[:6]):
+            btn = QPushButton(f"{idx + 1}.  {opt}")
+            btn.setFixedHeight(32)
+            btn.setFont(hud_font(9, QFont.Weight.Bold if idx == 0 else QFont.Weight.Normal))
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(f"""
+                QPushButton {{ background: transparent; color: {C.TEXT}; text-align: left;
+                    padding: 0 10px; border: 1px solid {C.BORDER_B}; border-radius: 3px; }}
+                QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI}; background: {C.PRI_GHO}; }}
+            """)
+            btn.clicked.connect(lambda _chk=False, i=idx: self.chosen.emit(i))
+            lay.addWidget(btn)
+
+        cancel = QPushButton("CANCEL")
+        cancel.setFixedHeight(30)
+        cancel.setFont(hud_font(9))
+        cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+        """)
+        cancel.clicked.connect(lambda: self.chosen.emit(-1))
+        lay.addWidget(cancel)
+        cancel.setDefault(True)
+        cancel.setFocus()
+
+
 class AudioDeviceOverlay(_HudOverlay):
     """Choose which microphone JARVIS listens to and which speakers it uses.
 

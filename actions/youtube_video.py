@@ -308,11 +308,61 @@ def _handle_play(parameters: dict, player) -> str:
     return f"Opened YouTube search for: {query} (manual selection required)"
 
 
-def _handle_summarize(parameters: dict, player, speak) -> str:
-    if not _TRANSCRIPT_OK:
-        return "youtube-transcript-api is not installed. Run: pip install youtube-transcript-api"
+def _transcribe_with_whisper_fallback(url: str) -> str | None:
+    """Download audio via yt_dlp into a temp dir and transcribe with faster_whisper."""
+    import tempfile
+    from pathlib import Path
+    try:
+        import yt_dlp
+        from faster_whisper import WhisperModel
+    except Exception as exc:
+        print(f"[YouTube] Whisper fallback dependencies missing: {exc}")
+        return None
 
-    url = _ask_for_url("Please paste the YouTube video URL:")
+    with tempfile.TemporaryDirectory(prefix="jarvis_yt_") as tmp:
+        out_tmpl = str(Path(tmp) / "audio.%(ext)s")
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": out_tmpl,
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        except Exception as exc:
+            print(f"[YouTube] Audio download failed for Whisper fallback: {exc}")
+            return None
+
+        files = [p for p in Path(tmp).iterdir() if p.is_file()]
+        if not files:
+            return None
+        audio_file = str(files[0])
+
+        model = None
+        for dev, ctype in (("cuda", "float16"), ("cpu", "int8")):
+            try:
+                model = WhisperModel("tiny", device=dev, compute_type=ctype)
+                break
+            except Exception:
+                continue
+        if model is None:
+            return None
+
+        try:
+            segments, _ = model.transcribe(audio_file, beam_size=1)
+            text = " ".join(seg.text.strip() for seg in segments if getattr(seg, "text", "").strip())
+            return text.strip() or None
+        except Exception as exc:
+            print(f"[YouTube] Whisper transcription failed: {exc}")
+            return None
+
+
+def _handle_summarize(parameters: dict, player, speak) -> str:
+    url = str(parameters.get("url") or "").strip()
+    if not url:
+        url = _ask_for_url("Please paste the YouTube video URL:")
     if not url:
         return "No URL provided, sir. Summary cancelled."
     if not _is_valid_youtube_url(url):
@@ -327,12 +377,19 @@ def _handle_summarize(parameters: dict, player, speak) -> str:
     if speak:
         speak("Fetching the transcript now, sir. One moment.")
 
-    transcript = _get_transcript(video_id)
+    transcript = _get_transcript(video_id) if _TRANSCRIPT_OK else None
+    used_whisper = False
     if not transcript:
-        return "I couldn't retrieve a transcript for that video, sir."
+        if player:
+            player.write_log("[YouTube] No captions found — trying Whisper audio fallback...")
+        transcript = _transcribe_with_whisper_fallback(url)
+        used_whisper = bool(transcript)
+    if not transcript:
+        return "I couldn't retrieve captions or transcribe audio for that video, sir."
 
     if speak:
-        speak("Transcript retrieved. Generating summary now.")
+        speak("Audio transcribed via Whisper. Generating summary now." if used_whisper
+              else "Transcript retrieved. Generating summary now.")
 
     try:
         summary = _summarize_with_gemini(transcript, url)
@@ -466,7 +523,7 @@ TOOL = {
             },
             "url": {
                 "type": "STRING",
-                "description": "Video URL for get_info action"
+                "description": "Video URL for summarize or get_info actions"
             }
         },
         "required": []

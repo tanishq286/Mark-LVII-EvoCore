@@ -1,5 +1,6 @@
 #computer_settings.py
 import json
+import os
 import re
 import shutil
 import sys
@@ -781,13 +782,151 @@ def restart_computer():
 
 def shutdown_computer():
     if _OS == "Windows":
-        subprocess.run(["shutdown", "/s", "/t", "10"], capture_output=True)
+        subprocess.run(["shutdown", "/s", "/t", "10"], capture_output=True, **_WIN_HIDE)
     elif _OS == "Darwin":
         subprocess.run(["osascript", "-e",
             'tell application "System Events" to shut down'],
             capture_output=True)
     else:
         subprocess.run(["systemctl", "poweroff"], capture_output=True)
+
+
+def hibernate_computer():
+    if _OS == "Windows":
+        subprocess.run(["shutdown", "/h"], capture_output=True, **_WIN_HIDE)
+    elif _OS == "Darwin":
+        subprocess.run(["pmset", "sleepnow"], capture_output=True)
+    else:
+        subprocess.run(["systemctl", "hibernate"], capture_output=True)
+
+
+def sign_out_computer():
+    if _OS == "Windows":
+        subprocess.run(["shutdown", "/l"], capture_output=True, **_WIN_HIDE)
+    elif _OS == "Darwin":
+        subprocess.run(["osascript", "-e", 'tell application "loginwindow" to «event aevtrlgo»'], capture_output=True)
+    else:
+        subprocess.run(["loginctl", "terminate-user", os.environ.get("USER", "")], capture_output=True)
+
+
+def schedule_shutdown(minutes: int = 10):
+    mins = max(1, min(1440, int(minutes or 10)))
+    secs = str(mins * 60)
+    if _OS == "Windows":
+        subprocess.run(["shutdown", "/s", "/t", secs], capture_output=True, **_WIN_HIDE)
+    elif _OS == "Darwin":
+        subprocess.run(["shutdown", "-h", f"+{mins}"], capture_output=True)
+    else:
+        subprocess.run(["shutdown", "-h", f"+{mins}"], capture_output=True)
+
+
+def schedule_restart(minutes: int = 10):
+    mins = max(1, min(1440, int(minutes or 10)))
+    secs = str(mins * 60)
+    if _OS == "Windows":
+        subprocess.run(["shutdown", "/r", "/t", secs], capture_output=True, **_WIN_HIDE)
+    elif _OS == "Darwin":
+        subprocess.run(["shutdown", "-r", f"+{mins}"], capture_output=True)
+    else:
+        subprocess.run(["shutdown", "-r", f"+{mins}"], capture_output=True)
+
+
+def cancel_power_timer():
+    if _OS == "Windows":
+        subprocess.run(["shutdown", "/a"], capture_output=True, **_WIN_HIDE)
+    else:
+        subprocess.run(["shutdown", "-c"], capture_output=True)
+
+
+def network_info() -> str:
+    """Return full local interface IPs and public IP/ISP report."""
+    import socket
+    hostname = socket.gethostname()
+    local_ips: list[str] = []
+    try:
+        import psutil
+        for iface, addrs in psutil.net_if_addrs().items():
+            for addr in addrs:
+                if addr.family == socket.AF_INET and not addr.address.startswith("127."):
+                    local_ips.append(f"{iface}: {addr.address} (mask {addr.netmask or 'n/a'})")
+    except Exception:
+        pass
+    if not local_ips:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(1.0)
+            s.connect(("8.8.8.8", 80))
+            local_ips.append(f"Primary: {s.getsockname()[0]}")
+            s.close()
+        except Exception:
+            try:
+                local_ips.append(f"Host: {socket.gethostbyname(hostname)}")
+            except Exception:
+                local_ips.append("unavailable")
+
+    pub_ip = "unavailable"
+    isp_meta = ""
+    try:
+        import httpx
+        with httpx.Client(timeout=4.0) as client:
+            r = client.get("https://ipinfo.io/json")
+            if r.status_code == 200:
+                info = r.json()
+                pub_ip = str(info.get("ip") or "unavailable")
+                parts = [info.get("city"), info.get("region"), info.get("country"), info.get("org")]
+                isp_meta = ", ".join(str(x) for x in parts if x)
+            else:
+                r2 = client.get("https://api.ipify.org?format=json")
+                if r2.status_code == 200:
+                    pub_ip = str(r2.json().get("ip") or "unavailable")
+    except Exception as exc:
+        isp_meta = f"lookup offline ({type(exc).__name__})"
+
+    lines = [
+        f"Hostname: {hostname}",
+        "Local IPs:",
+        *[f"  - {item}" for item in local_ips],
+        f"Public IP: {pub_ip}" + (f" ({isp_meta})" if isp_meta else ""),
+    ]
+    return "\n".join(lines)
+
+
+def network_speed_test() -> str:
+    """Measure latency, download Mbps, and upload Mbps via HTTPS probe."""
+    import time
+    import httpx
+    latency_ms: float | None = None
+    down_mbps: float | None = None
+    up_mbps: float | None = None
+    notes: list[str] = []
+
+    try:
+        with httpx.Client(timeout=12.0) as client:
+            t0 = time.perf_counter()
+            client.get("https://speed.cloudflare.com/__down?bytes=0")
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+
+            t1 = time.perf_counter()
+            dl = client.get("https://speed.cloudflare.com/__down?bytes=5000000")
+            dl_sec = max(1e-4, time.perf_counter() - t1)
+            dl_bytes = len(dl.content)
+            down_mbps = (dl_bytes * 8.0) / (dl_sec * 1_000_000.0)
+
+            payload = b"0" * 1_000_000
+            t2 = time.perf_counter()
+            client.post("https://speed.cloudflare.com/__up", content=payload)
+            up_sec = max(1e-4, time.perf_counter() - t2)
+            up_mbps = (len(payload) * 8.0) / (up_sec * 1_000_000.0)
+    except Exception as exc:
+        notes.append(f"probe error: {exc}")
+
+    parts = ["Network Speed Test:"]
+    parts.append(f"- Latency: {latency_ms:.1f} ms" if latency_ms is not None else "- Latency: unavailable")
+    parts.append(f"- Download: {down_mbps:.2f} Mbps" if down_mbps is not None else "- Download: unavailable")
+    parts.append(f"- Upload: {up_mbps:.2f} Mbps" if up_mbps is not None else "- Upload: unavailable")
+    if notes:
+        parts.append("- Notes: " + "; ".join(notes))
+    return "\n".join(parts)
 
 ACTION_MAP: dict[str, callable] = {
     "volume_up":           volume_up,
@@ -855,6 +994,16 @@ ACTION_MAP: dict[str, callable] = {
     "toggle_wifi":         toggle_wifi,
     "restart":             restart_computer,
     "shutdown":            shutdown_computer,
+    "hibernate":           hibernate_computer,
+    "sign_out":            sign_out_computer,
+    "log_off":             sign_out_computer,
+    "schedule_shutdown":   schedule_shutdown,
+    "schedule_restart":    schedule_restart,
+    "cancel_power_timer":  cancel_power_timer,
+    "network_info":        network_info,
+    "ip_info":             network_info,
+    "speed_test":          network_speed_test,
+    "network_speed":       network_speed_test,
 }
 
 # ── What needs a human, and what just needs an undo ──────────────────────────
@@ -877,6 +1026,16 @@ _IRREVERSIBLE = {
                     "Anything unsaved will be lost. The computer restarts in 10 seconds."),
     "shutdown":    ("Shut this computer down",
                     "Anything unsaved will be lost. The computer powers off in 10 seconds."),
+    "hibernate":   ("Hibernate this computer",
+                    "The computer will save RAM to disk and power down cleanly."),
+    "sign_out":    ("Sign out of this user session",
+                    "All open applications will be closed and you will be returned to the sign-in screen."),
+    "log_off":     ("Sign out of this user session",
+                    "All open applications will be closed and you will be returned to the sign-in screen."),
+    "schedule_shutdown": ("Schedule timed shutdown",
+                          "Schedules automatic shutdown after the requested number of minutes."),
+    "schedule_restart":  ("Schedule timed restart",
+                          "Schedules automatic restart after the requested number of minutes."),
     # Not obviously destructive, and that is exactly why it was missed: turning
     # the WiFi off cuts the assistant's own connection to the Live API, so it
     # cannot be asked to turn it back on.
@@ -887,6 +1046,7 @@ _IRREVERSIBLE = {
 
 # Kept so anything still importing the old name keeps working.
 _DANGEROUS_ACTIONS = set(_IRREVERSIBLE)
+_SCHEDULED_POWER_ACTIONS = {"schedule_shutdown", "schedule_restart"}
 
 
 # ── Local intent resolution ──────────────────────────────────────────────────
@@ -919,8 +1079,15 @@ _ALIASES = {
     "screenshot":      ("capture screen", "take a screenshot", "snip"),
     "refresh_page":    ("refresh", "reload page"),
     "new_tab":         ("open a tab", "open new tab"),
-    "shutdown":        ("power off", "turn off the computer", "switch off the pc"),
-    "restart":         ("reboot", "restart the pc"),
+    "shutdown":           ("power off", "turn off the computer", "switch off the pc"),
+    "restart":            ("reboot", "restart the pc"),
+    "hibernate":          ("hibernate", "hibernate pc", "hibernate computer"),
+    "sign_out":           ("sign out", "log off", "logout", "sign out of windows"),
+    "schedule_shutdown":  ("schedule shutdown", "shutdown timer", "shut down in"),
+    "schedule_restart":   ("schedule restart", "restart timer", "restart in"),
+    "cancel_power_timer": ("cancel shutdown", "abort shutdown", "cancel restart", "cancel power timer"),
+    "network_info":       ("ip address", "public ip", "local ip", "network info", "my ip"),
+    "network_speed":      ("speed test", "internet speed", "network speed", "bandwidth test"),
     "unmute":          ("sound on", "unmute"),
     "media_next":      ("next song", "next track", "skip song"),
     "media_previous":  ("previous song", "previous track"),
@@ -1005,12 +1172,6 @@ def computer_settings(
     player=None,
     session_memory=None,
 ) -> str:
-    if not _PYAUTOGUI:
-        return outcome.failed(
-            "computer_settings",
-            "pyautogui is not installed, so the keyboard cannot be driven - "
-            "run: pip install pyautogui")
-
     params      = parameters or {}
     raw_action  = params.get("action", "").strip()
     description = params.get("description", "").strip()
@@ -1023,6 +1184,15 @@ def computer_settings(
             value = detected.get("value")
 
     action = raw_action.lower().strip().replace(" ", "_").replace("-", "_")
+    if action in ("network_info", "ip_info", "speed_test", "network_speed"):
+        report = ACTION_MAP[action]()
+        return outcome.done("computer_settings", wanted=action, details=report)
+
+    if not _PYAUTOGUI:
+        return outcome.failed(
+            "computer_settings",
+            "pyautogui is not installed, so the keyboard cannot be driven - "
+            "run: pip install pyautogui")
 
     if not action:
         return _suggest(description or raw_action)
@@ -1043,16 +1213,32 @@ def computer_settings(
             return outcome.failed("computer_settings",
                                   "that is not an action this tool has",
                                   wanted=raw_action)
-        if confirm.pending_title():
-            return outcome.ask(
+        if action in _SCHEDULED_POWER_ACTIONS:
+            mins = _number(value)
+            mins = 10 if mins is None else max(1, min(1440, int(mins)))
+            detail = f"{detail} Timer: {mins} minute(s)."
+            run_cb = lambda f=func, m=mins, a=action: (f(m), f"{a} scheduled for {m} minute(s).")[1]
+        else:
+            run_cb = lambda f=func, a=action: (f(), f"{a} done.")[1]
+        try:
+            from core.evolution import safety_guard
+            canon_action = "sign_out" if action == "log_off" else action
+            return safety_guard.enforce_gate(
                 "computer_settings",
-                "there is already a confirmation waiting on screen - the user "
-                "has to answer that one first",
-                wanted=action)
-        return confirm.request(
-            key=action, title=title, detail=detail,
-            run=lambda f=func, a=action: (f(), f"{a} done.")[1],
-        )
+                canon_action,
+                title,
+                detail,
+                run_cb,
+                key=canon_action,
+            )
+        except Exception:
+            if confirm.pending_title():
+                return outcome.ask(
+                    "computer_settings",
+                    "there is already a confirmation waiting on screen - the user "
+                    "has to answer that one first",
+                    wanted=action)
+            return confirm.request(key=action, title=title, detail=detail, run=run_cb)
 
     if action in ("volume_set", "set_volume"):
         # No level means no guess: the old default of 50 turned "set the volume"
@@ -1330,7 +1516,9 @@ TOOL = {
                     "undo | redo | select_all | save | enter | escape | press_key | "
                     "type_text | screenshot | lock_screen | open_settings | "
                     "file_explorer | open_run | dark_mode | toggle_wifi | "
-                    "restart | shutdown"
+                    "restart | shutdown | hibernate | sign_out | "
+                    "schedule_shutdown | schedule_restart | cancel_power_timer | "
+                    "network_info | speed_test"
                 )
             },
             "description": {

@@ -12,6 +12,8 @@ Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 import asyncio
 import base64
 import hashlib
+import inspect
+import json
 import re
 import secrets
 import socket
@@ -683,6 +685,56 @@ _LOGIN_MAX_TRIES   = 6
 _LOGIN_WINDOW      = 300.0      # seconds the counter looks back over
 _LOGIN_LOCKOUT     = 300.0      # seconds an address waits after using them up
 
+ANDROID_DEVICES_FILE = BASE_DIR / "memory" / "android_devices.json"
+_ACTIVE_SERVER = None
+
+
+def set_active_server(srv) -> None:
+    global _ACTIVE_SERVER
+    _ACTIVE_SERVER = srv
+
+
+def get_active_server():
+    return _ACTIVE_SERVER
+
+
+def cert_fingerprint_sha256(cert_path: Path | None = None) -> str:
+    """Return lowercase SHA-256 hex digest of the dashboard TLS certificate, or ''."""
+    p = Path(cert_path) if cert_path else (BASE_DIR / "config" / "certs" / "jarvis.crt")
+    if not p.is_file():
+        return ""
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes
+        cert = x509.load_pem_x509_certificate(p.read_bytes())
+        return cert.fingerprint(hashes.SHA256()).hex()
+    except Exception:
+        return ""
+
+
+def dispatch_android_command_sync(
+    action: str,
+    params: dict | None = None,
+    *,
+    device_id: str | None = None,
+    timeout: float = 8.0,
+) -> dict:
+    """Thread-safe sync helper for plugins/android_bridge.py to call into active server."""
+    srv = get_active_server()
+    if srv is None:
+        return {"ok": False, "error": "DashboardServer is not active."}
+    loop = getattr(srv, "_loop", None)
+    if loop is None or loop.is_closed():
+        return {"ok": False, "error": "DashboardServer WebSocket event loop is offline."}
+    try:
+        fut = asyncio.run_coroutine_threadsafe(
+            srv.send_to_android(device_id, action, params or {}, timeout=timeout),
+            loop,
+        )
+        return fut.result(timeout=float(timeout) + 2.0)
+    except Exception as exc:
+        return {"ok": False, "error": f"Android dispatch failed ({type(exc).__name__}: {exc})"}
+
 
 class _Throttle:
     """Failed-attempt counter, per client address.
@@ -735,11 +787,21 @@ class DashboardServer:
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
         self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
         self._uploads_dir                 = UPLOADS_DIR
+        self._devices_file: Path          = ANDROID_DEVICES_FILE
+        self._android_devices: dict[str, dict] = {}
+        self._pending_android_reqs: dict[str, asyncio.Future] = {}
+        self._android_events: list[dict]  = []
+        self._tool_executor               = None
+        self._event_callback              = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         # Set by serve() when the port could not be taken, so the UI can say
         # why the QR code leads nowhere instead of showing it regardless.
         self._bind_error: str = ""
         self._login_html                  = _read("login.html")
         self._app_html                    = _read("app.html")
+        self._pwa_html                    = _read("pwa.html")
+        self._load_known_devices()
+        set_active_server(self)
         self.app                          = self._build_app()
 
     # ── one-time key management ───────────────────────────────────────────
@@ -828,6 +890,93 @@ class DashboardServer:
     def set_connect_callback(self, fn) -> None:
         self._connect_callback = fn
 
+    def set_tool_executor(self, fn) -> None:
+        self._tool_executor = fn
+
+    def set_event_callback(self, fn) -> None:
+        self._event_callback = fn
+
+    def _load_known_devices(self) -> None:
+        p = Path(self._devices_file)
+        if not p.is_file():
+            return
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                for dev_id, meta in data.items():
+                    if isinstance(meta, dict):
+                        rec = dict(meta)
+                        rec["connected"] = False
+                        rec["ws"] = None
+                        self._android_devices[str(dev_id)] = rec
+        except Exception:
+            pass
+
+    def _save_known_devices(self) -> None:
+        p = Path(self._devices_file)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            serializable = {
+                dev_id: {k: v for k, v in meta.items() if k != "ws"}
+                for dev_id, meta in self._android_devices.items()
+            }
+            p.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def list_android_devices(self) -> list[dict]:
+        return [
+            {k: v for k, v in meta.items() if k != "ws"}
+            for meta in self._android_devices.values()
+        ]
+
+    def list_connected_device_ids(self) -> list[str]:
+        return [
+            dev_id for dev_id, meta in self._android_devices.items()
+            if meta.get("connected") and meta.get("ws") is not None
+        ]
+
+    async def send_to_android(
+        self,
+        device_id: str | None,
+        action: str,
+        params: dict | None = None,
+        *,
+        timeout: float = 8.0,
+    ) -> dict:
+        target_id = device_id
+        if not target_id:
+            connected = self.list_connected_device_ids()
+            target_id = connected[-1] if connected else None
+        if not target_id or target_id not in self._android_devices:
+            return {"ok": False, "error": "No paired Android companion is currently connected."}
+        dev = self._android_devices[target_id]
+        ws = dev.get("ws")
+        if not dev.get("connected") or ws is None:
+            return {"ok": False, "error": f"Android device '{target_id}' is disconnected."}
+        if dev.get("privacy_mode") and action not in ("ping", "status"):
+            return {"ok": False, "error": f"Device '{target_id}' is in 100% On-Device Privacy Mode."}
+
+        req_id = f"req_{secrets.token_hex(6)}"
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending_android_reqs[req_id] = fut
+        try:
+            await ws.send_json({
+                "type": "pc_to_android",
+                "request_id": req_id,
+                "action": action,
+                "params": params or {},
+                "ts": time.time(),
+            })
+            return await asyncio.wait_for(fut, timeout=float(timeout))
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": f"Android command '{action}' timed out after {timeout}s."}
+        except Exception as exc:
+            return {"ok": False, "error": f"Android WebSocket error: {exc}"}
+        finally:
+            self._pending_android_reqs.pop(req_id, None)
+
     # ── broadcast ────────────────────────────────────────────────────────
 
     async def broadcast(self, msg: dict) -> None:
@@ -882,6 +1031,116 @@ class DashboardServer:
                     .replace("__IP__", self._ip)
                     .replace("__PORT__", str(PORT)))
             return HTMLResponse(html)
+
+        @app.get("/pwa", response_class=HTMLResponse)
+        async def pwa_page():
+            html = (self._pwa_html
+                    .replace("__IP__", self._ip)
+                    .replace("__PORT__", str(SECURE_PORT if self._ssl_enabled() else PORT)))
+            return HTMLResponse(html)
+
+        @app.get("/manifest.webmanifest")
+        async def pwa_manifest():
+            return FileResponse(str(STATIC_DIR / "manifest.webmanifest"), media_type="application/manifest+json")
+
+        @app.get("/sw.js")
+        async def pwa_sw():
+            return FileResponse(str(STATIC_DIR / "sw.js"), media_type="application/javascript")
+
+        @app.get("/pwa-icon.svg")
+        async def pwa_icon():
+            return FileResponse(str(STATIC_DIR / "pwa-icon.svg"), media_type="image/svg+xml")
+
+        @app.get("/api/cert-fingerprint")
+        async def get_cert_fingerprint():
+            return JSONResponse({
+                "https": self._ssl_enabled(),
+                "sha256": cert_fingerprint_sha256(),
+            })
+
+        @app.post("/api/android/pair")
+        async def android_pair(req: Request):
+            who = _who(req)
+            wait = self._throttle.blocked_for(who)
+            if wait > 0:
+                return JSONResponse(
+                    {"ok": False, "error": f"Too many attempts. Try again in {int(wait) + 1} seconds."},
+                    status_code=429,
+                )
+            body = await req.json()
+            entered = str(body.get("pin", "")).strip().upper()
+            now = time.time()
+            if entered in self._pending_keys and self._pending_keys[entered] > now:
+                self._throttle.clear(who)
+                del self._pending_keys[entered]
+                tok = secrets.token_urlsafe(32)
+                dev_tok = secrets.token_urlsafe(32)
+                dev_id = str(body.get("device_id") or f"android-{secrets.token_hex(3)}")
+                self._tokens[tok] = now
+                self._token_keys[tok] = entered
+                self._aes_key(entered)
+                self._device_sessions[dev_tok] = {"session_key": entered, "device_id": dev_id}
+                self._android_devices[dev_id] = {
+                    "device_id": dev_id,
+                    "name": str(body.get("name") or "Android Companion"),
+                    "model": str(body.get("model") or "Android"),
+                    "android_version": str(body.get("android_version") or ""),
+                    "capabilities": list(body.get("capabilities") or []),
+                    "privacy_mode": False,
+                    "connected": False,
+                    "last_seen": now,
+                    "ws": None,
+                }
+                self._save_known_devices()
+                if self._connect_callback:
+                    self._connect_callback()
+                return JSONResponse({
+                    "ok": True,
+                    "token": tok,
+                    "device_token": dev_tok,
+                    "device_id": dev_id,
+                    "session_key": entered,
+                    "ws_path": "/ws",
+                    "cert_sha256": cert_fingerprint_sha256(),
+                    "protocol_version": 2,
+                })
+            self._throttle.record_failure(who)
+            return JSONResponse({"ok": False, "error": "Invalid or expired pairing PIN"}, status_code=401)
+
+        @app.get("/api/android/devices")
+        async def android_devices_ep(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            return JSONResponse({
+                "ok": True,
+                "devices": self.list_android_devices(),
+                "recent_events": self._android_events[-20:],
+            })
+
+        @app.post("/api/android/command")
+        async def android_command_ep(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            body = await req.json()
+            action = str(body.get("action") or "").strip().lower()
+            device_id = str(body.get("device_id") or "").strip() or None
+            params = body.get("params") if isinstance(body.get("params"), dict) else {}
+            if not action:
+                return JSONResponse({"ok": False, "error": "Missing action"}, status_code=400)
+            from core.evolution import safety_guard
+            tier = safety_guard.classify_risk("android_bridge", action)
+            if tier != safety_guard.SAFE:
+                msg = safety_guard.enforce_gate(
+                    "android_bridge",
+                    action,
+                    f"Remote Android Command: {action}",
+                    f"Device: {device_id or 'active'} | Params: {json.dumps(params)[:120]}",
+                    lambda: json.dumps(dispatch_android_command_sync(action, params, device_id=device_id)),
+                    key=f"android_http_{action}",
+                )
+                return JSONResponse({"ok": False, "gated": True, "tier": tier, "message": msg})
+            res = await self.send_to_android(device_id, action, params)
+            return JSONResponse(res)
 
         @app.post("/login")
         async def login(req: Request):
@@ -1162,7 +1421,9 @@ class DashboardServer:
                 await websocket.close(code=4001)
                 return
             await websocket.accept()
+            self._loop = asyncio.get_running_loop()
             self._clients.add(websocket)
+            registered_dev_id: str | None = None
             for entry in self._history[-50:]:
                 try:
                     await websocket.send_json(entry)
@@ -1171,17 +1432,156 @@ class DashboardServer:
             try:
                 while True:
                     data = await websocket.receive_json()
-                    if data.get("type") == "command":
+                    if not isinstance(data, dict):
+                        continue
+                    msg_type = str(data.get("type") or "").strip().lower()
+
+                    if msg_type == "command":
                         enc = data.get("enc", "")
                         t   = self._decrypt(tok, enc) if enc else (data.get("text") or "").strip()
                         if t:
                             await self._command_queue.put(t)
                             if self._wake_callback:
                                 self._wake_callback()
+
+                    elif msg_type == "device_register":
+                        dev_id = str(data.get("device_id") or f"android-{secrets.token_hex(3)}").strip()
+                        registered_dev_id = dev_id
+                        rec = self._android_devices.get(dev_id, {})
+                        rec.update({
+                            "device_id": dev_id,
+                            "name": str(data.get("name") or rec.get("name") or "Android Companion"),
+                            "model": str(data.get("model") or rec.get("model") or "Android"),
+                            "android_version": str(data.get("android_version") or rec.get("android_version") or ""),
+                            "capabilities": list(data.get("capabilities") or rec.get("capabilities") or []),
+                            "privacy_mode": bool(data.get("privacy_mode", False)),
+                            "battery": data.get("battery", rec.get("battery")),
+                            "charging": data.get("charging", rec.get("charging")),
+                            "location": data.get("location", rec.get("location")),
+                            "last_seen": time.time(),
+                            "connected": True,
+                            "ws": websocket,
+                        })
+                        self._android_devices[dev_id] = rec
+                        self._save_known_devices()
+                        await websocket.send_json({
+                            "type": "registered",
+                            "ok": True,
+                            "device_id": dev_id,
+                            "protocol_version": 2,
+                            "server_time": time.time(),
+                        })
+                        asyncio.create_task(self.broadcast({
+                            "type": "android_connected",
+                            "device_id": dev_id,
+                            "name": rec["name"],
+                            "model": rec["model"],
+                        }))
+
+                    elif msg_type == "heartbeat":
+                        dev_id = str(data.get("device_id") or registered_dev_id or "").strip()
+                        if dev_id and dev_id in self._android_devices:
+                            rec = self._android_devices[dev_id]
+                            for field in ("battery", "charging", "privacy_mode", "location", "network"):
+                                if field in data:
+                                    rec[field] = data[field]
+                            rec["last_seen"] = time.time()
+                            rec["connected"] = True
+                            rec["ws"] = websocket
+                        await websocket.send_json({
+                            "type": "heartbeat_ack",
+                            "device_id": dev_id,
+                            "ts": time.time(),
+                        })
+
+                    elif msg_type == "android_result":
+                        req_id = str(data.get("request_id") or "")
+                        fut = self._pending_android_reqs.get(req_id)
+                        if fut is not None and not fut.done():
+                            fut.set_result({
+                                "ok": bool(data.get("ok", True)),
+                                "device_id": registered_dev_id or str(data.get("device_id") or ""),
+                                "data": data.get("data"),
+                                "error": str(data.get("error") or ""),
+                            })
+
+                    elif msg_type == "tool_invoke":
+                        req_id = str(data.get("request_id") or secrets.token_hex(6))
+                        tool_name = str(data.get("tool") or "").strip()
+                        params = data.get("parameters") if isinstance(data.get("parameters"), dict) else {}
+                        if not tool_name:
+                            await websocket.send_json({
+                                "type": "tool_result", "request_id": req_id, "ok": False, "error": "Missing tool name.",
+                            })
+                        elif tool_name == "assistant_prompt":
+                            prompt_txt = str(params.get("text") or "").strip()
+                            if prompt_txt:
+                                await self._command_queue.put(prompt_txt)
+                                if self._wake_callback:
+                                    self._wake_callback()
+                            await websocket.send_json({
+                                "type": "tool_result", "request_id": req_id, "ok": True, "result": "enqueued",
+                            })
+                        elif self._tool_executor is None:
+                            await websocket.send_json({
+                                "type": "tool_result", "request_id": req_id, "ok": False,
+                                "error": "tool_executor_unavailable",
+                            })
+                        else:
+                            from core.evolution import safety_guard
+                            tier = safety_guard.classify_risk(tool_name, str(params.get("action") or ""))
+                            try:
+                                if inspect.iscoroutinefunction(self._tool_executor):
+                                    res = await self._tool_executor(tool_name, params)
+                                else:
+                                    res = await asyncio.to_thread(self._tool_executor, tool_name, params)
+                                await websocket.send_json({
+                                    "type": "tool_result",
+                                    "request_id": req_id,
+                                    "ok": True,
+                                    "risk_tier": tier,
+                                    "result": str(res),
+                                })
+                            except Exception as exc:
+                                await websocket.send_json({
+                                    "type": "tool_result",
+                                    "request_id": req_id,
+                                    "ok": False,
+                                    "risk_tier": tier,
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                })
+
+                    elif msg_type == "android_event":
+                        ev = {
+                            "event": str(data.get("event") or "unknown"),
+                            "device_id": registered_dev_id or str(data.get("device_id") or "unknown"),
+                            "payload": data.get("payload") if isinstance(data.get("payload"), dict) else {},
+                            "ts": time.time(),
+                        }
+                        self._android_events.append(ev)
+                        if len(self._android_events) > 100:
+                            self._android_events = self._android_events[-100:]
+                        asyncio.create_task(self.broadcast({"type": "android_event", **ev}))
+                        if self._event_callback:
+                            try:
+                                if inspect.iscoroutinefunction(self._event_callback):
+                                    asyncio.create_task(self._event_callback(ev))
+                                else:
+                                    self._event_callback(ev)
+                            except Exception:
+                                pass
+                        await websocket.send_json({"type": "event_ack", "event": ev["event"], "ts": ev["ts"]})
+
             except WebSocketDisconnect:
                 pass
             finally:
                 self._clients.discard(websocket)
+                if registered_dev_id and registered_dev_id in self._android_devices:
+                    rec = self._android_devices[registered_dev_id]
+                    if rec.get("ws") is websocket:
+                        rec["connected"] = False
+                        rec["ws"] = None
+                        self._save_known_devices()
 
         return app
 
@@ -1224,6 +1624,8 @@ class DashboardServer:
         await uvicorn.Server(cfg).serve()
 
     async def serve(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        set_active_server(self)
         if not _DEPS_OK:
             print("[Dashboard] fastapi/uvicorn not installed — dashboard disabled.")
             print("[Dashboard] Run:  pip install fastapi 'uvicorn[standard]' cryptography")

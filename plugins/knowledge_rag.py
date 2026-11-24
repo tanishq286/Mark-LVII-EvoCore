@@ -34,20 +34,21 @@ PLUGIN = {
         "(.md, .txt, .py, .json, .csv, .pdf) using SHA-256 change detection; "
         "mode='search' (with query and optional top_k) to retrieve semantically matching "
         "excerpts with exact `knowledge/<file>:L<start>-L<end>` citations wrapped as untrusted data; "
+        "mode='consolidate' to deduplicate near-identical chunks and prune orphans cleanly; "
         "mode='stats' (default) to inspect indexed files, chunks, DB size, and embedding model health. "
         "Use this when the user asks to search their personal notes, docs, PDFs, or local knowledge vault."
     ),
     "brief": (
-        "Search or incrementally index private docs in `knowledge/` via local Ollama "
-        "nomic-embed-text (mode='search'|'index'|'stats', query, top_k)."
+        "Search, consolidate, or incrementally index private docs in `knowledge/` via local Ollama "
+        "nomic-embed-text (mode='search'|'index'|'consolidate'|'stats', query, top_k)."
     ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "mode": {
                 "type": "STRING",
-                "enum": ["stats", "search", "index"],
-                "description": "'stats' (default), 'search' (semantic retrieval), or 'index' (incremental SHA-256 sync).",
+                "enum": ["stats", "search", "index", "consolidate"],
+                "description": "'stats' (default), 'search' (semantic retrieval), 'index' (incremental SHA-256 sync), or 'consolidate' (dedupe/prune index).",
             },
             "query": {
                 "type": "STRING",
@@ -553,6 +554,109 @@ def vault_stats(
     }
 
 
+def consolidate_vault(
+    vault_dir: Path | None = None,
+    *,
+    similarity_threshold: float = 0.96,
+    ollama_origin: str = OLLAMA_ORIGIN,
+    embed_model: str = EMBED_MODEL,
+) -> dict[str, Any]:
+    """Deduplicate near-identical chunks and remove orphaned/empty rows in `.rag_index.sqlite`."""
+    _ = ollama_origin, embed_model
+    vault = Path(vault_dir) if vault_dir is not None else KNOWLEDGE_DIR
+    db_path = vault / INDEX_FILENAME
+    summary: dict[str, Any] = {
+        "vault_dir": str(vault),
+        "db_exists": db_path.is_file(),
+        "orphans_removed": 0,
+        "empty_removed": 0,
+        "duplicates_removed": 0,
+        "remaining_chunks": 0,
+        "total_files": 0,
+    }
+    if not db_path.is_file():
+        return summary
+
+    thresh = max(0.75, min(0.9999, float(similarity_threshold or 0.96)))
+    with _DB_LOCK:
+        conn = _connect_db(db_path)
+        try:
+            cur = conn.execute(
+                "DELETE FROM chunks WHERE rel_path NOT IN (SELECT rel_path FROM files)"
+            )
+            summary["orphans_removed"] = max(0, int(cur.rowcount or 0))
+
+            cur_empty = conn.execute(
+                "DELETE FROM chunks WHERE TRIM(COALESCE(text, '')) = ''"
+            )
+            summary["empty_removed"] = max(0, int(cur_empty.rowcount or 0))
+
+            # Deduplicate near-identical normalized text or high-cosine embeddings within each dim
+            rows = conn.execute(
+                "SELECT id, rel_path, text, dim, embedding FROM chunks ORDER BY id ASC"
+            ).fetchall()
+
+            dup_ids: set[int] = set()
+            seen_texts: set[str] = set()
+            by_dim: dict[int, list[tuple[int, np.ndarray]]] = {}
+
+            for cid, _rel, txt, dim, blob in rows:
+                norm_txt = " ".join(str(txt or "").split()).lower()
+                if not norm_txt:
+                    dup_ids.add(int(cid))
+                    continue
+                if norm_txt in seen_texts:
+                    dup_ids.add(int(cid))
+                    continue
+                seen_texts.add(norm_txt)
+                vec = np.frombuffer(blob, dtype=np.float32)
+                if vec.shape[0] == int(dim) and int(dim) > 0:
+                    norm = float(np.linalg.norm(vec))
+                    if norm > 0.0:
+                        by_dim.setdefault(int(dim), []).append((int(cid), vec / norm))
+
+            for _dim, vec_items in by_dim.items():
+                if len(vec_items) < 2:
+                    continue
+                ids_arr = [item[0] for item in vec_items]
+                mat = np.vstack([item[1] for item in vec_items])
+                sims = mat @ mat.T
+                n_items = len(ids_arr)
+                dropped = [False] * n_items
+                for i in range(n_items):
+                    if dropped[i]:
+                        continue
+                    for j in range(i + 1, n_items):
+                        if dropped[j]:
+                            continue
+                        if float(sims[i, j]) >= thresh:
+                            dropped[j] = True
+                            dup_ids.add(ids_arr[j])
+
+            if dup_ids:
+                placeholders = ",".join("?" for _ in dup_ids)
+                conn.execute(f"DELETE FROM chunks WHERE id IN ({placeholders})", tuple(sorted(dup_ids)))
+                summary["duplicates_removed"] = len(dup_ids)
+
+            if summary["orphans_removed"] or summary["empty_removed"] or summary["duplicates_removed"]:
+                # Refresh chunk_count on files table to match surviving rows
+                conn.execute(
+                    """
+                    UPDATE files
+                    SET chunk_count = (
+                        SELECT COUNT(*) FROM chunks WHERE chunks.rel_path = files.rel_path
+                    )
+                    """
+                )
+            conn.commit()
+            summary["total_files"] = int(conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
+            summary["remaining_chunks"] = int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+        finally:
+            conn.close()
+
+    return summary
+
+
 def _handle_index(player=None, vault_dir: Path | None = None) -> str:
     res = index_vault(vault_dir=vault_dir)
     if res["total_files"] == 0 and res["indexed_new"] == 0 and res["pruned"] == 0:
@@ -633,6 +737,28 @@ def _handle_stats(player=None, vault_dir: Path | None = None) -> str:
     return reply
 
 
+def _handle_consolidate(player=None, vault_dir: Path | None = None) -> str:
+    res = consolidate_vault(vault_dir=vault_dir)
+    if not res["db_exists"]:
+        msg = "Knowledge vault index does not exist yet — run mode='index' first."
+        _notify_hud(player, msg, "KNOWLEDGE VAULT CONSOLIDATE", msg)
+        return msg
+    reply = (
+        f"Knowledge vault consolidated: removed {res['duplicates_removed']} duplicate, "
+        f"{res['orphans_removed']} orphan, and {res['empty_removed']} empty chunk(s); "
+        f"{res['remaining_chunks']} unique chunks remain across {res['total_files']} files."
+    )
+    panel = (
+        f"Vault: {res['vault_dir']}\n"
+        f"Duplicates removed: {res['duplicates_removed']}\n"
+        f"Orphans removed: {res['orphans_removed']}\n"
+        f"Empty removed: {res['empty_removed']}\n"
+        f"Remaining chunks: {res['remaining_chunks']} ({res['total_files']} files)"
+    )
+    _notify_hud(player, reply, "KNOWLEDGE VAULT CONSOLIDATED", panel)
+    return reply
+
+
 def run(parameters: dict, player=None, session_memory=None) -> str:
     """Entry point discovered by `core.plugin_loader`. Never raises."""
     _ = session_memory
@@ -643,6 +769,8 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             return _handle_stats(player=player)
         if mode == "index":
             return _handle_index(player=player)
+        if mode == "consolidate":
+            return _handle_consolidate(player=player)
         if mode == "search":
             query = str(params.get("query") or "").strip()
             try:
@@ -651,7 +779,7 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
                 top_k = 5
             return _handle_search(query, top_k, player=player)
 
-        msg = f"Sir, unknown knowledge_rag mode '{mode}'. Use 'stats', 'index', or 'search'."
+        msg = f"Sir, unknown knowledge_rag mode '{mode}'. Use 'stats', 'index', 'consolidate', or 'search'."
         _notify_hud(player, msg)
         return msg
     except Exception as exc:

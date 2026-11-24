@@ -33,6 +33,12 @@ from PyQt6.QtCore import QLineF, QPointF, QRectF, Qt
 from PyQt6.QtGui import QBrush, QColor, QPainter, QPen, QPolygonF, QRadialGradient
 
 from core.avatar_mesh import JAW_MAX, JAW_PIVOT, get_head_mesh
+from core.avatar_gestures import (
+    GESTURES,
+    get_active_gesture,
+    sentiment_to_gesture,
+    trigger_global_gesture,
+)
 
 # Perspective camera distance in head-half-heights. Large enough that the nose
 # does not balloon, small enough to keep a sense of depth.
@@ -202,6 +208,8 @@ class HoloAvatar:
         self._v_wide = 0.0
         self._wide = 0.0           # smoothed lip spread, -1 round .. +1 spread
         self._v_peak = 0.18        # running estimate of this voice's loud level
+        self._gesture_seq = 0
+        self._active_gesture: tuple[str, float, float] | None = None
 
     # ── animation ───────────────────────────────────────────────────────────
 
@@ -318,6 +326,38 @@ class HoloAvatar:
         self._pitch -= self._emph * 0.028
         self._yaw += 0.018 * math.sin(t * 1.7) * self._emph
 
+        # ── sentiment-triggered gestures ────────────────────────────────────
+        g_bus = get_active_gesture()
+        g_seq = int(g_bus.get("seq") or 0)
+        if g_seq != self._gesture_seq and g_bus.get("active"):
+            self._gesture_seq = g_seq
+            g_name = str(g_bus.get("gesture") or "approve")
+            dur = float(GESTURES.get(g_name, {}).get("duration", 2.0))
+            self._active_gesture = (g_name, t, t + dur)
+
+        g_yaw = g_pitch = g_brow = g_glow = 0.0
+        g_lid_mul = 1.0
+        if self._active_gesture is not None:
+            g_name, g_t0, g_t1 = self._active_gesture
+            if t < g_t1 and g_name in GESTURES:
+                spec = GESTURES[g_name]
+                frac = max(0.0, min(1.0, (t - g_t0) / max(0.05, g_t1 - g_t0)))
+                env_g = math.sin(frac * math.pi)
+                g_yaw = float(spec["yaw"]) * env_g
+                g_pitch = float(spec["pitch"]) * env_g
+                if g_name == "celebrate":
+                    g_pitch += 0.05 * math.sin((t - g_t0) * 9.0) * env_g
+                elif g_name == "approve":
+                    g_pitch += 0.06 * math.sin((t - g_t0) * 6.0) * env_g
+                g_brow = float(spec["brow"]) * env_g
+                g_lid_mul = 1.0 + (float(spec["lids"]) - 1.0) * env_g
+                g_glow = float(spec["glow"]) * env_g
+            else:
+                self._active_gesture = None
+
+        self._yaw += g_yaw
+        self._pitch += g_pitch
+
         # Loudness envelope, deliberately lazier than the mouth: brows track the
         # shape of a phrase, not individual syllables.
         env = amp if live else 0.0
@@ -333,7 +373,7 @@ class HoloAvatar:
             self._expr_at = t + 0.8
         self._expr += (self._expr_tgt - self._expr) * 0.075
 
-        brow_t = 0.55 * self._amp_slow + 0.60 * self._expr + self._brow_bias
+        brow_t = 0.55 * self._amp_slow + 0.60 * self._expr + self._brow_bias + g_brow
         self._brow += (max(-0.4, min(1.2, brow_t)) - self._brow) * 0.20
 
         # ── what the state does to the face ─────────────────────────────────
@@ -359,6 +399,8 @@ class HoloAvatar:
             brow_bias = 0.10 if st == "LISTENING" else 0.0
             lid_tgt = 1.0
 
+        lid_tgt = max(0.15, min(1.2, lid_tgt * g_lid_mul))
+
         for i in (0, 1):
             self._gaze_bias[i] += (self._bias_tgt[i] - self._gaze_bias[i]) * 0.06
         self._lids += (lid_tgt - self._lids) * 0.08
@@ -378,6 +420,9 @@ class HoloAvatar:
             else:
                 self._gaze_at = t + 1.3 + 2.8 * random.random()
 
+        if self._active_gesture is not None and self._active_gesture[0] in GESTURES:
+            self._gaze_tgt = list(GESTURES[self._active_gesture[0]]["gaze"])
+
         # A deliberate glance (something appeared on screen) overrides the
         # wandering for a moment, then hands control back.
         if self._glance is not None:
@@ -396,8 +441,8 @@ class HoloAvatar:
         wide_t = v_wide if (live and v_open is not None) else 0.0
         self._wide += (max(-1.0, min(1.0, wide_t)) - self._wide) * _rate(dt, 0.030)
 
-        self._glow += ((0.0 if muted else amp) - self._glow) * (
-            0.35 if (0.0 if muted else amp) > self._glow else 0.10)
+        self._glow += (max(g_glow, 0.0 if muted else amp) - self._glow) * (
+            0.35 if max(g_glow, 0.0 if muted else amp) > self._glow else 0.10)
 
         self._scan += dt * (0.55 + 1.5 * self._glow)
         if self._scan > 1.35:
@@ -424,6 +469,14 @@ class HoloAvatar:
         self._glance = (max(-1.0, min(1.0, float(dx))),
                         max(-1.0, min(1.0, float(dy))),
                         self._t + max(0.1, float(hold)))
+
+    def trigger_gesture(self, sentiment_or_gesture: str, duration: float | None = None) -> str:
+        """Trigger one of the 8 sentiment gestures on this HoloAvatar instance."""
+        g_name = sentiment_to_gesture(sentiment_or_gesture)
+        spec = GESTURES[g_name]
+        dur = float(duration) if duration is not None else float(spec["duration"])
+        self._active_gesture = (g_name, self._t, self._t + max(0.3, dur))
+        return g_name
 
     # ── posing ──────────────────────────────────────────────────────────────
 

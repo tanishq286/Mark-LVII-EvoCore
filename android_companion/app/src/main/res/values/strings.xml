@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">JARVIS MAX</string>
+    <string name="accessibility_label">JARVIS Vision &amp; Auto-Scroll</string>
+    <string name="accessibility_description">Enables voice-controlled auto-scrolling, button tapping, text reading, and screen translation for Mark-LVII MAX.</string>
+    <string name="notification_listener_label">JARVIS WhatsApp Reader</string>
+</resources>

@@ -1678,6 +1678,12 @@ class JarvisLive:
         })
 
         parts = [time_ctx, identity_ctx]
+        try:
+            from core.persona import format_persona_prompt
+            from memory.config_manager import get_persona_mode
+            parts.append(format_persona_prompt(get_persona_mode()))
+        except Exception:
+            pass
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
@@ -1811,6 +1817,8 @@ class JarvisLive:
 
         loop   = asyncio.get_event_loop()
         result = "Done."
+        _exc_type = ""
+        _exc_tb   = ""
 
         try:
             if name == "recall_memory":
@@ -1990,6 +1998,8 @@ class JarvisLive:
                     result = f"Unknown tool: {name}"
 
         except Exception as e:
+            _exc_type = type(e).__name__
+            _exc_tb = traceback.format_exc()
             result = f"Tool '{name}' failed: {e}"
             traceback.print_exc()
             self.speak_error(name, e)
@@ -2006,6 +2016,18 @@ class JarvisLive:
         try:
             from core import auto_evolution as _auto_evo
             _auto_evo.observe_tool_outcome(name, args, str(result), _elapsed_ms, player=self.ui)
+        except Exception:
+            pass
+        try:
+            from core.evolution import telemetry as _evo_tel
+            _evo_tel.record_tool_event(
+                name,
+                args,
+                str(result),
+                _elapsed_ms,
+                error_type=_exc_type,
+                tb=_exc_tb,
+            )
         except Exception:
             pass
 
@@ -3014,6 +3036,10 @@ class JarvisLive:
             hide = self.ui.hide_confirm,
             log  = self.ui.write_log,
         )
+        confirm_gate.bind_choice(
+            show_choice = self.ui.show_choice,
+            hide_choice = self.ui.hide_choice,
+        )
         set_trim_notifier(self.ui.write_log)
 
         # Tell the device picker the exact rates the streams open at, from the
@@ -3028,8 +3054,21 @@ class JarvisLive:
         # Start dashboard (optional — needs: pip install fastapi "uvicorn[standard]" cryptography)
         try:
             from dashboard.server import DashboardServer
+            import types as _py_types
             self._dashboard = DashboardServer()
             self._dashboard.set_connect_callback(self._on_phone_connected)
+            async def _dash_tool_exec(tool_name: str, params: dict):
+                resp = await self._execute_tool(
+                    _py_types.SimpleNamespace(id="android-ws", name=tool_name, args=params or {})
+                )
+                payload = getattr(resp, "response", None) or {}
+                return payload.get("result", str(payload))
+            def _dash_android_event(ev: dict):
+                ev_name = str(ev.get("event") or "event")
+                dev = str(ev.get("device_id") or "android")
+                self.ui.write_log(f"PHONE [{dev}]: {ev_name} {ev.get('payload') or ''}".strip())
+            self._dashboard.set_tool_executor(_dash_tool_exec)
+            self._dashboard.set_event_callback(_dash_android_event)
             self._keep_task(asyncio.create_task(self._dashboard.serve()))
             # Runs for the whole lifetime, not just inside an active session
             self._keep_task(asyncio.create_task(self._process_dashboard_commands()))

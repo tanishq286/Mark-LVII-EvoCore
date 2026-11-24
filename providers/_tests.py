@@ -1153,11 +1153,16 @@ def test_gemini_oneshot_think_and_ollama_fallback():
         def log_message(self, *_a):
             pass
 
+    import tempfile
+    from core.evolution import telemetry as _telem
     srv = HTTPServer(("127.0.0.1", 0), Handler)
     port = srv.server_address[1]
     th = threading.Thread(target=srv.serve_forever, daemon=True)
     th.start()
     orig_url = g._OLLAMA_CHAT_URL
+    orig_db = _telem.DEFAULT_DB_PATH
+    _tmp_dir = tempfile.TemporaryDirectory()
+    _telem.DEFAULT_DB_PATH = Path(_tmp_dir.name) / "test_telemetry.sqlite"
     try:
         g._OLLAMA_CHAT_URL = f"http://127.0.0.1:{port}/api/chat"
         rep_code = g._local_ollama_fallback(
@@ -1185,6 +1190,8 @@ def test_gemini_oneshot_think_and_ollama_fallback():
               and seen_models[3] == "qwen3:8b", str(seen_models))
     finally:
         g._OLLAMA_CHAT_URL = orig_url
+        _telem.DEFAULT_DB_PATH = orig_db
+        _tmp_dir.cleanup()
         srv.shutdown()
         srv.server_close()
 

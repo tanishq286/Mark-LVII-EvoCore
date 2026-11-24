@@ -168,6 +168,27 @@ class JarvisUI:
         """Thread-safe: take the gate down."""
         self._win._confirm_hide_sig.emit()
 
+    def show_choice(self, title: str, detail: str, options: list[str]) -> None:
+        """Thread-safe: raise the multi-option choice picker on the HUD."""
+        clean = [str(o)[:100] for o in (options or [])[:6]]
+        self._win._choice_sig.emit(str(title)[:120], str(detail)[:300], clean)
+
+    def hide_choice(self) -> None:
+        """Thread-safe: take the multi-option choice picker down."""
+        self._win._choice_hide_sig.emit()
+
+    def show_avatar_overlay(self) -> None:
+        """Thread-safe: show the standalone transparent 2D avatar overlay."""
+        self._win._avatar_overlay_sig.emit(True)
+
+    def hide_avatar_overlay(self) -> None:
+        """Thread-safe: hide the standalone transparent 2D avatar overlay."""
+        self._win._avatar_overlay_sig.emit(False)
+
+    def trigger_avatar_gesture(self, gesture: str, text: str = "") -> None:
+        """Thread-safe: trigger one of the 8 sentiment avatar gestures."""
+        self._win._avatar_gesture_sig.emit(str(gesture), str(text or "")[:200])
+
     @property
     def get_plugins(self):
         return self._win.get_plugins

@@ -754,15 +754,19 @@ def _provider_call(model: str, contents, config, timeout_ms: int, tier: str = FA
     if missing:
         raise RuntimeError(f"404 not configured: {', '.join(missing)}")
 
-    # Free Local Specialist Router (M6): for text-only requests going to local
-    # Ollama, select the best installed specialist (qwen3:8b vs qwen2.5-coder:14b
-    # vs qwen2.5:14b / gemma4:12b) and evict any competing LLM from 12 GB VRAM.
+    # Free Local Specialist Router (M6 + M10 Adaptive Telemetry Routing): for text-only
+    # requests going to local Ollama, select the best installed specialist and escalate
+    # automatically to Gemini when telemetry shows local models are degraded.
     prompt_text, has_media = _extract_prompt_text(contents)
     base_url = str(cfg.get("base_url") or "")
+    routed_category = ""
+    chosen_local_model = ""
+    is_local_ollama = False
     if not has_media and prompt_text:
         try:
             from providers import local_router
             if local_router.is_local_ollama_url(base_url):
+                is_local_ollama = True
                 origin = local_router.normalize_ollama_origin(base_url)
                 decision, _ladder = local_router.route_prompt(
                     prompt_text,
@@ -770,24 +774,72 @@ def _provider_call(model: str, contents, config, timeout_ms: int, tier: str = FA
                     ollama_origin=origin,
                     fallback_model=str(cfg.get("model") or "qwen3:8b"),
                 )
+                routed_category = decision.category
                 chosen = decision.selected_model or str(cfg.get("model") or "qwen3:8b")
+                chosen_local_model = chosen
+                if decision.escalate_to_cloud and bool(api_key()):
+                    try:
+                        from core.evolution.telemetry import record_route_event
+                        record_route_event(
+                            routed_category,
+                            chosen,
+                            "ollama",
+                            False,
+                            0.0,
+                            escalated=True,
+                            error_snippet=decision.telemetry_note,
+                        )
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"503 adaptive escalation to Gemini: {decision.telemetry_note}")
                 local_router.ensure_vram_ready(chosen, origin)
                 cfg["model"] = chosen
                 cfg["keep_alive"] = local_router.fast_keep_alive_for(decision.category)
                 cfg["allow_thinking"] = (decision.category == local_router.CATEGORY_REASONING)
+        except RuntimeError:
+            raise
         except Exception:
             pass
 
-    llm = registry.build(pid, cfg)
-    messages, temperature = _to_openai_messages(contents, config)
-    text_out, _calls = llm.complete(
-        messages, tools=None,
-        timeout=max(MIN_TIMEOUT_MS, int(timeout_ms)) / 1000.0,
-        temperature=temperature)
-    cleaned = _strip_thinking(text_out or "")
-    if not cleaned:
-        raise RuntimeError("the provider returned an empty answer")
-    return _Reply(cleaned)
+    t_prov = time.perf_counter()
+    try:
+        llm = registry.build(pid, cfg)
+        messages, temperature = _to_openai_messages(contents, config)
+        text_out, _calls = llm.complete(
+            messages, tools=None,
+            timeout=max(MIN_TIMEOUT_MS, int(timeout_ms)) / 1000.0,
+            temperature=temperature)
+        cleaned = _strip_thinking(text_out or "")
+        if not cleaned:
+            raise RuntimeError("the provider returned an empty answer")
+        if is_local_ollama and chosen_local_model:
+            try:
+                from core.evolution.telemetry import record_route_event
+                record_route_event(
+                    routed_category or "fast",
+                    chosen_local_model,
+                    "ollama",
+                    True,
+                    (time.perf_counter() - t_prov) * 1000.0,
+                )
+            except Exception:
+                pass
+        return _Reply(cleaned)
+    except Exception as exc:
+        if is_local_ollama and chosen_local_model:
+            try:
+                from core.evolution.telemetry import record_route_event
+                record_route_event(
+                    routed_category or "fast",
+                    chosen_local_model,
+                    "ollama",
+                    False,
+                    (time.perf_counter() - t_prov) * 1000.0,
+                    error_snippet=f"{type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
+        raise
 
 
 def call(contents, tier: str = FAST, config=None,

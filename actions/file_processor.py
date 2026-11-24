@@ -252,7 +252,11 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
         except ImportError:
             return "python-docx not installed. Run: pip install python-docx"
 
-    return f"Unknown PDF action: '{action}'. Try: summarize, extract_text, info, to_word"
+    if action == "extract_tables":
+        from plugins.office_suite import pdf_tables_to_csv
+        return pdf_tables_to_csv(str(path))
+
+    return f"Unknown PDF action: '{action}'. Try: summarize, extract_text, extract_tables, info, to_word"
 
 def _process_text_doc(path: Path, file_type: str, action: str,
                        params: dict, speak=None) -> str:

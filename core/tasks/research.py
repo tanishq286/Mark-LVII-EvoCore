@@ -705,3 +705,13 @@ Return the whole revised report and nothing else."""),
             "", "\n".join(method)])
         self._set_state(phase="done")
         self.e._complete(self.tid, result)
+
+
+def export_to_pptx(report_markdown: str, *, title: str = "JARVIS Research Briefing", out_path: str = "") -> str:
+    """Export a completed research report Markdown document to a `.pptx` slide deck."""
+    from plugins.deck_generator import create_deck_from_markdown
+    return create_deck_from_markdown(
+        report_markdown,
+        title=title,
+        out_path=out_path or None,
+    )

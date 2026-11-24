@@ -142,84 +142,69 @@ def _execute_mission(goal: str, max_steps: int, player) -> None:
     _step_log(player, f"Analyzing mission & building execution plan for: {goal[:100]}", status="planning")
 
     try:
-        from core import gemini
+        from core import confirm, gemini
+        from core.evolution.planner import VerifiedPlanner
+
         _, catalog_text = _catalog_summary(player)
         run_tool_fn = getattr(player, "run_tool", None) if player else None
+        planner = VerifiedPlanner()
 
-        plan_prompt = f"""You are JARVIS's Autonomous Executive Brain. Break this user mission into a concrete, verifiable plan of at most {max_steps} steps using JARVIS's available tools.
+        plan = planner.plan(goal, catalog_text, max_steps=max_steps)
+        strategy = str(plan.get("strategy") or "Direct verified execution.")
+        steps = list(plan.get("steps") or [])
 
-Mission: {goal}
-
-Available JARVIS tools:
-{catalog_text or '(standard desktop, web_search, code_helper, dev_agent, claude_code, self_evolve tools)'}
-
-Return ONLY valid JSON:
-{{
-  "strategy": "One-sentence executive summary of how you will solve this",
-  "steps": [
-    {{
-      "id": "step_1",
-      "title": "Short title of step 1",
-      "tool": "tool_name_or_none_for_reasoning",
-      "parameters": {{}},
-      "expected": "What this step produces"
-    }}
-  ]
-}}"""
-        plan = gemini.as_json(plan_prompt, tier=gemini.SMART) or {}
-        strategy = str((plan.get("strategy") if isinstance(plan, dict) else "") or "Direct multi-step reasoning and execution.")
-        steps = (plan.get("steps") if isinstance(plan, dict) else None) or []
-        if not isinstance(steps, list):
-            steps = []
-        steps = steps[:max_steps]
+        if plan.get("ambiguous") and len(plan.get("options") or []) >= 2:
+            opts = list(plan["options"])
+            choice_msg = confirm.request_choice(
+                key="autonomous_brain_disambiguate",
+                title=f"Clarify mission: {goal[:70]}",
+                detail=strategy,
+                options=opts,
+                on_select=lambda _idx, label: run(
+                    {"action": "execute", "goal": f"{goal} (Chosen option: {label})", "max_steps": max_steps},
+                    player=player,
+                ),
+            )
+            _step_log(player, choice_msg, status="done")
+            _call(player, "show_content", "CHOICE REQUIRED", f"{strategy}\n\n" + "\n".join(f"{i}. {o}" for i, o in enumerate(opts, 1)))
+            return
 
         with _state_lock:
             _MISSION["summary"] = strategy
             for idx, s in enumerate(steps, 1):
-                if isinstance(s, dict):
-                    key = f"Step {idx}: {s.get('title') or s.get('tool') or 'Task'}"
-                    _MISSION["files"][key] = {
-                        "action": "edit",
-                        "what": str(s.get("expected") or s.get("tool") or ""),
-                        "state": "waiting",
-                    }
+                key = f"Step {idx}: {s.get('title') or s.get('tool') or 'Task'}"
+                _MISSION["files"][key] = {
+                    "action": "edit",
+                    "what": str(s.get("expected") or s.get("tool") or ""),
+                    "state": "waiting",
+                }
         _publish(player)
-        _step_log(player, f"Strategy: {strategy} ({len(steps)} planned steps)", status="executing")
+        _step_log(
+            player,
+            f"Strategy: {strategy} ({len(steps)} steps, failure_immunity={plan.get('immunity_injected')})",
+            status="executing",
+        )
 
-        observations: list[str] = []
-        for idx, s in enumerate(steps, 1):
-            if _CANCEL.is_set():
-                raise RuntimeError("Mission cancelled by user.")
-            if not isinstance(s, dict):
-                continue
-            title = str(s.get("title") or f"Step {idx}")
-            tool_name = str(s.get("tool") or "").strip()
-            params = s.get("parameters") if isinstance(s.get("parameters"), dict) else {}
-            step_key = f"Step {idx}: {title}"
+        exec_res = planner.execute_plan(
+            plan,
+            run_tool_fn,
+            on_step=lambda msg, st, k, fst: _step_log(player, msg, status=st, step_key=k, step_state=fst),
+            cancel_event=_CANCEL,
+        )
+        if exec_res["status"] == "cancelled":
+            raise RuntimeError("Mission cancelled by user.")
 
-            _step_log(player, f"▶ {step_key} (tool={tool_name or 'reasoning'})", status="executing",
-                      step_key=step_key, step_state="writing")
+        observations = [
+            f"[Step {t['index']} - {t['title']} ({t['tool'] or 'think'}) | verified={t['verified']} recovered={t['recovered']}]: {t['output']}"
+            for t in exec_res.get("trace") or []
+        ]
 
-            if tool_name and tool_name.lower() != "none" and callable(run_tool_fn):
-                out = str(run_tool_fn(tool_name, params) or "Done.")
-            else:
-                reason_prompt = (
-                    f"Mission: {goal}\n"
-                    f"Prior observations:\n" + "\n".join(observations[-4:]) + "\n\n"
-                    f"Execute reasoning step {idx} ({title}): {s.get('expected', '')}\n"
-                    "Provide a concise, factual result."
-                )
-                out = gemini.text(reason_prompt, tier=gemini.SMART) or "Completed reasoning step."
-
-            observations.append(f"[Step {idx} - {title} ({tool_name or 'think'})]: {out[:1200]}")
-            _step_log(player, f"✓ {step_key} → {out[:110]}", status="verifying",
-                      step_key=step_key, step_state="done")
-
-        _step_log(player, "Synthesizing final mission outcome…", status="synthesizing")
-        synth_prompt = f"""You are JARVIS reporting the completion of an autonomous multi-step mission.
+        _step_log(player, "Synthesizing verified mission outcome…", status="synthesizing")
+        synth_prompt = f"""You are JARVIS reporting the completion of a verified multi-step mission.
 
 Mission: {goal}
 Strategy: {strategy}
+Verification summary: {exec_res['steps_verified']} verified, {exec_res['steps_recovered']} recovered, {exec_res['steps_failed']} failed
 Step Observations:
 {chr(10).join(observations) or 'Direct synthesis'}
 

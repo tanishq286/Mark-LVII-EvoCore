@@ -124,8 +124,20 @@ def _collect_existing_tool_names(repo_root: Path, exclude_file: Path) -> dict[st
     return names
 
 
-def _check_ast_security(tree: ast.AST) -> list[str]:
+_CURATED_SHARED_ALLOWLIST = {"cybersec_defender.py"}
+
+
+def _check_ast_security(tree: ast.AST, source: str = "", target: Path | None = None) -> list[str]:
     """Inspect AST for AGENTS.md security violations. Returns list of error messages."""
+    try:
+        from core.evolution.safety_guard import audit_python_source
+        strict = not (target is not None and target.name in _CURATED_SHARED_ALLOWLIST)
+        if source:
+            res = audit_python_source(source, filename=str(target or "<candidate>"), strict_sandbox=strict)
+            return list(res.get("violations") or [])
+    except Exception:
+        pass
+
     errors: list[str] = []
     os_aliases: set[str] = set()
     os_bad_funcs: set[str] = set()
@@ -313,7 +325,7 @@ print(json.dumps(out))
 """
     try:
         proc = subprocess.run(
-            [sys.executable, "-c", harness, str(repo_root), str(plugin_path)],
+            [sys.executable, "-B", "-c", harness, str(repo_root), str(plugin_path)],
             cwd=str(repo_root),
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -406,8 +418,8 @@ def validate_plugin(
         report["errors"].append("Missing top-level `def run(parameters, player=None, session_memory=None)` function.")
     report["checks"]["ast_contract"] = has_plugin and has_run
 
-    # 3. Static AST security checks (AGENTS.md)
-    sec_errors = _check_ast_security(tree)
+    # 3. Static AST security checks (AGENTS.md + core.evolution.safety_guard)
+    sec_errors = _check_ast_security(tree, source=source, target=target)
     if sec_errors:
         report["errors"].extend(sec_errors)
     else:
