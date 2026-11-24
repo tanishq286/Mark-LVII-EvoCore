@@ -1,15 +1,15 @@
 # Mark-LVII EvoCore Upgrade Progress
 
-- **Active Milestone:** **ALL MILESTONES COMPLETE (Milestone 10 + 11 + 12 Verified & Release-Ready)**
-- **Current Branch:** `milestone/12-android-max-companion` (`7f2d1be`, branched from `milestone/11-windows-desktop-parity` `56d87d7`)
-- **Base `main` Commit (Untouched):** `3a34d38`
+- **Active Milestone:** **Milestone 13 — Closed-Loop Autonomous Screen Agent (`Observe -> Verify -> Act -> Re-Observe`) Verified & Ready for Review**
+- **Current Branch:** `milestone/13-autonomous-screen-loop` (`53aa8e3`, branched off `main` `54d60bc`, tagged `v12-evocore-10of10`)
+- **Base `main` Commit (Untouched):** `54d60bc` (`v12-evocore-10of10`)
 - **Test Runners Installed:**
   - `pytest 9.2.0` (`C:\Users\tanis\AppData\Local\Python\pythoncore-3.13-64\python.exe`)
   - OpenJDK 17 (`EclipseAdoptium.Temurin.17.JDK`), Gradle `8.10.2`, Android SDK `android-35` + `build-tools 34.0.0/35.0.0` + `adb`
 
 ---
 
-## Final 48/48 Modules + 5/5 Evolution Engines Completion Scorecard
+## Final Modules + 5/5 Evolution Engines Completion Scorecard
 
 | Track | Target | Verified Implementation | Status |
 | :--- | :--- | :--- | :--- |
@@ -17,6 +17,29 @@
 | **Milestone 10: Security, Hybrid Router & Planner Core** | 6 / 6 | Adaptive Router (`local_router.py`), RAG Consolidation & Failure Immunity, Replay Self-Benchmarking, Verified Planner + Choice HUD (`confirm.py`), Uniform `SAFE`/`CONFIRM`/`LOCKED` gates, AES-256-GCM `file_vault` + Defender + 3-Persona | **6 / 6 COMPLETE** |
 | **Milestone 11: Windows Desktop Parity** | 41 / 41 | Biometric Voice Lock, Cron SQLite Routines, Network Speed/IP, `system_cleaner`, Spotify, MediaPipe Gestures, Auto-Scroll & Notepad Dictation, `.pptx` Decks, Scraper + Price Comparator, Website & Image Generators, `office_suite` (Excel/PDF/Convert), Email SMTP/IMAP, WhatsApp Media/Calls, Dev Workspace + Profiles, AES Form Filler, YouTube Whisper Fallback, Market Finance, 2D Avatar Overlay (8 Gestures) | **41 / 41 COMPLETE** |
 | **Milestone 12: Android MAX Companion & PC Bridge** | 7 / 7 | Setup Pre-Flight (`setup_android_env.ps1`), Bidirectional TLS `/ws` Bridge + Instant PWA (`/pwa`), `android_bridge` Plugin, Native Kotlin App (`AntiTheftGuardService`, `WakeWordVoiceService`, `WhatsAppAndCallController`, `MobileToggleManager`, `ScreenVisionScrollService`, `EmergencySosManager`, `VoiceCameraController`) + On-Device Privacy Mode | **7 / 7 COMPLETE** |
+| **Milestone 13: Closed-Loop Autonomous Screen Agent** | 2 / 2 | Hybrid UIA + Vision/OCR Grounding (`core/evolution/screen_agent.py`), Post-Action Settle Polling (up to 3s), Stuck-State Recovery + `ChoiceBanner` Fallback, Multi-Step Wiring (`planner.py`, `autonomous_brain.py`, `plugins/autonomous_screen_agent.py`, `main.py`), `CONFIRM`/`LOCKED` Irreversible Gate, ESC / Corner / `"Jarvis stop"` Kill-Switches, Step Telemetry for `habit_compiler.py` | **COMPLETE** |
+
+---
+
+## Milestone 13 — Closed-Loop Autonomous Screen Agent (`53aa8e3`)
+
+### 1. Closed-Loop Visual Controller (`core/evolution/screen_agent.py`, `plugins/autonomous_screen_agent.py`)
+- **Hybrid Screen Grounding:** Combines `core/screenview.py` UI Automation accessibility trees and logical bounding boxes with `actions/screen_processor.py` JPEG capture, SHA-256 frame hashing, and `core/gemini.py` Vision/OCR fallback grounding (`ground_with_vision`, `observe_screen`) whenever UIA trees are thin, degraded, or missing target controls.
+- **Post-Action Verification Loop:** Polls for UI settle up to `3.0s` after every click, hotkey, app launch, or typing step—watching foreground window title, process transitions, UIA digest, and screenshot frame hash before confirming progress.
+- **Stuck-State Recovery & Choice Fallback:** If the desktop state does not transition or expected postconditions remain unmet, executes one alternative recovery strategy (app focus/launch, HUD unfocus `alt+tab`, hotkey fallback, or Vision coordinate click) and invokes `core/confirm.py` `ChoiceBanner` (`request_choice`) when multiple ambiguous candidates or dialogs block progress.
+- **Multi-Step Wiring (`core/evolution/planner.py`, `plugins/autonomous_brain.py`, `main.py`):** Added `is_gui_screen_goal()` and `requires_screen_loop` routing so interactive multi-step GUI workflows engage `AutonomousScreenAgent` (`max_steps=12`) with live HUD step narration via `write_log` and `show_code_job`.
+
+### 2. Live HUD Feedback, Hard Safety Guardrails & Telemetry
+- **Irreversible Action Gate (`core/evolution/safety_guard.py`, `core/confirm.py`):** Added `("autonomous_screen_agent", "irreversible_act"): CONFIRM` and `("autonomous_screen_agent", "payment_or_power"): LOCKED` in `TOOL_RISK_POLICY`, blocking external comms (`Send`), destructive `Delete`, `Pay/Checkout`, `Install/Admin UAC`, and `Power` clicks/hotkeys behind HUD confirmation and Biometric Voice Lock without false-triggering on search queries or local file saves.
+- **Instant Abort Kill-Switch:** Halts immediately (`status="aborted"`) on `ESC` key polling (`GetAsyncKeyState(0x1B)` inside `core/evolution/screen_agent.py`), `pyautogui.FAILSAFE` corner failsafe exceptions, `autonomous_screen_agent(action="stop")`, `autonomous_brain(action="cancel")`, or live voice utterances matching `"Jarvis stop"` in `main.py`.
+- **Habit Compiler Telemetry & Test Isolation (`tests/conftest.py`, `tests/test_m13_screen_agent.py`):** Logs per-step tool telemetry (`tool_name="autonomous_screen_agent"`, step-specific `action`, app, title, latency, and verification result) into `memory/telemetry.sqlite` so `habit_compiler.py` can detect repeated GUI workflows, while `tests/conftest.py` isolates test runs from live `memory/voiceprints.json` and `memory/autonomous_missions.json`.
+
+### Milestone 13 Verification Summary
+- `scripts/validate_plugin.py`: **PASS** (0 errors, 0 warnings across `plugins/autonomous_screen_agent.py` and `plugins/autonomous_brain.py`)
+- `pytest -B -v`: **44 passed in 21.28s, 0 failed** (including 8/8 new closed-loop tests in `tests/test_m13_screen_agent.py`)
+- `python -B -m providers._tests`: **108 passed, 0 failed**
+- `scripts/verify_wake_activation.py`: **8/8 passed** (live WASAPI RAW `false_hits=0`)
+- `scripts/health_check.py --allow-dirty`: **ALL HEALTHY (10.10s)** (`active=32, rejected=0, core_checked=28, unignored_secrets=none`, `dirty=13` from unrelated concurrent local UI/goddess working-tree edits left untouched)
 
 ---
 
@@ -185,14 +208,11 @@
 
 ## Merge to `main` & Restart Live Mark-LVII (Run When Ready)
 ```powershell
-# 1. Fast-forward / merge Milestone 10 -> 11 -> 12 into main cleanly:
+# 1. Stash or commit any concurrent local UI edits before switching branches, then merge Milestone 13 into main:
 cd C:\Users\tanis\Downloads\Mark-LVII-main\Mark-LVII-main
 git checkout main
-git merge --no-ff milestone/12-android-max-companion -m "merge: Milestone 10-12 EvoCore, Windows Parity, and Android MAX Companion"
+git merge --no-ff milestone/13-autonomous-screen-loop -m "merge: Milestone 13 Closed-Loop Autonomous Screen Agent"
 
-# 2. Optional: sideload the Android MAX Companion APK via ADB (USB debugging enabled):
-"$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" install -r .\android_companion\app\build\outputs\apk\debug\app-debug.apk
-
-# 3. Restart live Mark-LVII:
-C:\Users\tanis\AppData\Local\Python\pythoncore-3.13-64\python.exe -B -u main.py
+# 2. Restart live Mark-LVII:
+C:\Users\tanis\AppData\Local\Python\pythoncore-3.13-64\python.exe -B -u .\scripts\launch_jarvis.pyw
 ```

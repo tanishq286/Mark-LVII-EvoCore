@@ -61,6 +61,7 @@ TOOL_RISK_POLICY: dict[str | tuple[str, str], str] = {
     ("voice_lock", "clear"): LOCKED,
     ("smart_form_filler", "fill_form"): LOCKED,
     ("android_bridge", "sos"): LOCKED,
+    ("autonomous_screen_agent", "payment_or_power"): LOCKED,
     # CONFIRM: external comms, power/network state, destructive deletion, active scans/merges
     "send_message": CONFIRM,
     ("send_message", "send"): CONFIRM,
@@ -85,6 +86,7 @@ TOOL_RISK_POLICY: dict[str | tuple[str, str], str] = {
     ("email_automator", "send"): CONFIRM,
     ("evolution_control", "self_heal_merge"): CONFIRM,
     ("evolution_control", "self_heal"): CONFIRM,
+    ("autonomous_screen_agent", "irreversible_act"): CONFIRM,
 }
 
 _QT_PREFIXES = ("PyQt5", "PyQt6", "PySide2", "PySide6", "qtpy")
