@@ -30,51 +30,57 @@ _HP_TAPS = 129           # zero-phase linear FIR length (~8 ms overlap)
 _HP_CUTOFF_HZ = 280.0    # removes DC + <280 Hz fan rumble while keeping >=450 Hz 100% flat
 
 _COMMON_PRESET = {
-    "decay_window_s": 0.16,
-    "decay_ratio": 0.50,
-    "min_mid_ratio": 0.15,
-    "max_top3_ratio": 0.60,
-    "min_gap_s": 0.135,
-    "max_gap_s": 1.15,
-    "valley_ratio": 0.50,
-    "pair_amp_min": 0.20,
-    "pair_amp_max": 5.0,
+    "decay_window_s": 0.11,
+    "decay_ratio": 0.35,
+    "min_mid_ratio": 0.20,
+    "max_top3_ratio": 0.55,
+    "min_gap_s": 0.15,
+    "max_gap_s": 0.80,
+    "valley_ratio": 0.30,
+    "pair_amp_min": 0.35,
+    "pair_amp_max": 2.8,
     "burst_window_s": 1.5,
     "burst_max_impulses": 4,
-    "burst_suppress_s": 1.5,
-    "cooldown_s": 2.0,
+    "burst_suppress_s": 1.8,
+    "cooldown_s": 2.5,
 }
 
 SENSITIVITY_PRESETS: dict[str, dict[str, float]] = {
     "low": {
         **_COMMON_PRESET,
-        "min_rms": 450.0,
-        "min_peak": 1400.0,
-        "snr_ratio": 4.2,
-        "onset_ratio": 3.0,
-        "min_high_ratio": 0.52,
-        "min_flatness": 0.08,
-        "min_crest": 1.80,
+        "min_rms": 1500.0,
+        "min_peak": 4800.0,
+        "snr_ratio": 8.0,
+        "p95_ratio": 4.2,
+        "onset_ratio": 5.0,
+        "min_high_ratio": 0.68,
+        "min_upper_ratio": 0.38,
+        "min_flatness": 0.10,
+        "min_crest": 2.5,
     },
     "medium": {
         **_COMMON_PRESET,
-        "min_rms": 170.0,
-        "min_peak": 580.0,
-        "snr_ratio": 3.2,
-        "onset_ratio": 2.4,
-        "min_high_ratio": 0.45,
-        "min_flatness": 0.055,
-        "min_crest": 1.60,
+        "min_rms": 800.0,
+        "min_peak": 2600.0,
+        "snr_ratio": 6.5,
+        "p95_ratio": 3.5,
+        "onset_ratio": 4.0,
+        "min_high_ratio": 0.60,
+        "min_upper_ratio": 0.30,
+        "min_flatness": 0.08,
+        "min_crest": 2.2,
     },
     "high": {
         **_COMMON_PRESET,
-        "min_rms": 110.0,
-        "min_peak": 380.0,
-        "snr_ratio": 2.8,
-        "onset_ratio": 2.0,
-        "min_high_ratio": 0.40,
-        "min_flatness": 0.040,
-        "min_crest": 1.45,
+        "min_rms": 550.0,
+        "min_peak": 1800.0,
+        "snr_ratio": 5.0,
+        "p95_ratio": 2.8,
+        "onset_ratio": 3.2,
+        "min_high_ratio": 0.52,
+        "min_upper_ratio": 0.22,
+        "min_flatness": 0.065,
+        "min_crest": 2.0,
     },
 }
 
@@ -119,11 +125,11 @@ class ClapAnalyzer:
         # Precompute FFT window and speech/clap band masks once.
         self._hann = np.hanning(self._fft_size).astype(np.float32)
         freqs = np.fft.rfftfreq(self._fft_size, 1.0 / self._sr)
-        self._mask_low = (freqs >= 60.0) & (freqs <= 320.0)
-        self._mask_high = (freqs >= 450.0) & (freqs <= 7000.0)
-        self._mask_mid = (freqs >= 450.0) & (freqs <= 3500.0)
-        self._mask_core = (freqs >= 450.0) & (freqs <= 2000.0)
-        self._mask_total = (freqs >= 60.0) & (freqs <= 7500.0)
+        self._mask_low = (freqs >= 60.0) & (freqs <= 350.0)
+        self._mask_high = (freqs >= 500.0) & (freqs <= 7000.0)
+        self._mask_mid = (freqs >= 500.0) & (freqs <= 3500.0)
+        self._mask_core = (freqs >= 500.0) & (freqs <= 2500.0)
+        self._mask_upper = (freqs >= 1000.0) & (freqs <= 6500.0)
 
         self._pending_raw = np.empty(0, dtype=np.float32)
         self._pending_hp = np.empty(0, dtype=np.float32)
@@ -132,8 +138,8 @@ class ClapAnalyzer:
         self._samples_processed = 0
         self._frames_seen = 0
         self._noise_floor = 60.0
-        self._bg_e_low = 0.0
-        self._bg_low_updates = 0
+        self._quiet_window: deque[float] = deque(maxlen=200)
+        self._ambient_p95 = 120.0
         self._prev_rms: deque[float] = deque(maxlen=8)
 
         self._active: dict | None = None
@@ -156,8 +162,7 @@ class ClapAnalyzer:
     def reset(self, *, keep_noise_floor: bool = True, clear_cooldown: bool = True) -> None:
         """Clear transient audio buffers and pairing state (used on sleep/wake)."""
         floor = self._noise_floor
-        bg_low = self._bg_e_low
-        bg_cnt = self._bg_low_updates
+        p95 = self._ambient_p95
         self._hp_tail.fill(0.0)
         self._pending_raw = np.empty(0, dtype=np.float32)
         self._pending_hp = np.empty(0, dtype=np.float32)
@@ -173,12 +178,11 @@ class ClapAnalyzer:
             self._cooldown_until = 0.0
         if keep_noise_floor:
             self._noise_floor = max(20.0, min(4000.0, floor))
-            self._bg_e_low = bg_low
-            self._bg_low_updates = bg_cnt
+            self._ambient_p95 = max(40.0, min(8000.0, p95))
         else:
             self._noise_floor = 60.0
-            self._bg_e_low = 0.0
-            self._bg_low_updates = 0
+            self._quiet_window.clear()
+            self._ambient_p95 = 120.0
             self._frames_seen = 0
 
     def process(self, frame_int16) -> bool:
@@ -229,22 +233,8 @@ class ClapAnalyzer:
             self._ring_hp[start : start + self._fft_size].copy(),
         )
 
-    def _update_bg_low(self) -> None:
-        """Track ambient <320 Hz fan/rumble power so desk thuds still stand out."""
-        win = self._ring_raw[-self._fft_size :]
-        centered = win - float(np.mean(win))
-        spec = np.fft.rfft(centered * self._hann)
-        power = (spec.real * spec.real) + (spec.imag * spec.imag)
-        e_low = float(np.sum(power[self._mask_low]))
-        self._bg_low_updates += 1
-        if self._bg_low_updates <= 10:
-            alpha = 0.15 if self._bg_low_updates > 1 else 1.0
-        else:
-            alpha = 0.05
-        self._bg_e_low = (1.0 - alpha) * self._bg_e_low + alpha * e_low
-
     def _passes_spectral_check(self, raw_win: np.ndarray, hp_win: np.ndarray) -> bool:
-        """Reject thuds, speech vowels, and chimes using ambient-aware bands + flatness."""
+        """Reject thuds, speech vowels, and chimes using raw spectral bands + flatness."""
         if raw_win.size != self._fft_size or hp_win.size != self._fft_size:
             self.last_reject_reason = "bad_window_size"
             return False
@@ -263,16 +253,17 @@ class ClapAnalyzer:
         e_low = float(np.sum(power[self._mask_low]))
         e_high = float(np.sum(power[self._mask_high]))
         e_mid = float(np.sum(power[self._mask_mid]))
-        if (e_low + e_high) <= 1e-9:
+        e_upper = float(np.sum(power[self._mask_upper]))
+        denom = e_low + e_high
+        if denom <= 1e-9:
             self.last_reject_reason = "zero_energy"
             return False
 
-        e_low_excess = max(0.0, e_low - 1.5 * self._bg_e_low)
-        denom = e_low_excess + e_high + 1e-9
         high_ratio = e_high / denom
         mid_ratio = e_mid / denom
+        upper_ratio = e_upper / denom
 
-        # Spectral flatness over core clap band (450-2000 Hz) + tonal peak concentration.
+        # Spectral flatness over core clap band (500-2500 Hz) + tonal peak concentration.
         mid_power = power[self._mask_mid]
         core_power = power[self._mask_core]
         if mid_power.size == 0 or core_power.size == 0:
@@ -287,6 +278,7 @@ class ClapAnalyzer:
             "rms": round(hp_rms, 1),
             "crest": round(crest, 2),
             "high_ratio": round(high_ratio, 3),
+            "upper_ratio": round(upper_ratio, 3),
             "mid_ratio": round(mid_ratio, 3),
             "flatness": round(flatness, 3),
             "top3": round(top3_ratio, 3),
@@ -297,6 +289,9 @@ class ClapAnalyzer:
             return False
         if high_ratio < self._cfg["min_high_ratio"]:
             self.last_reject_reason = f"low_high_ratio:{high_ratio:.3f}"
+            return False
+        if upper_ratio < self._cfg["min_upper_ratio"]:
+            self.last_reject_reason = f"low_upper_ratio:{upper_ratio:.3f}"
             return False
         if mid_ratio < self._cfg["min_mid_ratio"]:
             self.last_reject_reason = f"low_mid_ratio:{mid_ratio:.3f}"
@@ -318,6 +313,20 @@ class ClapAnalyzer:
             alpha = 0.03
         updated = (1.0 - alpha) * self._noise_floor + alpha * rms
         self._noise_floor = max(20.0, min(4000.0, updated))
+        self._quiet_window.append(rms)
+        if (self._frames_seen % 10) == 0 or len(self._quiet_window) == 20:
+            if len(self._quiet_window) >= 20:
+                self._ambient_p95 = max(
+                    40.0, min(8000.0, float(np.percentile(self._quiet_window, 95)))
+                )
+            else:
+                self._ambient_p95 = max(40.0, min(8000.0, self._noise_floor * 2.0))
+
+    def _valley_ceiling(self, clap1_rms: float) -> float:
+        return min(
+            self._cfg["valley_ratio"] * clap1_rms,
+            max(450.0, 2.5 * self._noise_floor),
+        )
 
     def _step_subframe(self, sub_raw: np.ndarray, sub_hp: np.ndarray) -> bool:
         self._samples_processed += sub_raw.size
@@ -342,7 +351,7 @@ class ClapAnalyzer:
 
         # Check inter-clap silent valley after first clap has decayed.
         if self._first_clap is not None and not self._valley_seen and self._active is None:
-            if rms <= cfg["valley_ratio"] * self._first_clap[1]:
+            if rms <= self._valley_ceiling(self._first_clap[1]):
                 self._valley_seen = True
 
         # Track an active impulse awaiting fast decay + centered spectral window.
@@ -383,13 +392,14 @@ class ClapAnalyzer:
             self._prev_rms.append(rms)
             return False
 
-        # Not currently tracking an impulse: check for sharp onset above floor.
+        # Not currently tracking an impulse: check for sharp onset above floor + p95 envelope.
         baseline_prev = (
             float(np.median(list(self._prev_rms))) if len(self._prev_rms) >= 2 else self._noise_floor
         )
         trigger_level = max(
             cfg["min_rms"],
             cfg["snr_ratio"] * self._noise_floor,
+            cfg["p95_ratio"] * self._ambient_p95,
             cfg["onset_ratio"] * baseline_prev,
         )
 
@@ -407,12 +417,10 @@ class ClapAnalyzer:
             self._prev_rms.append(rms)
             return False
 
-        # Quiet frame: update adaptive background floor & ambient low-band baseline.
-        if self._first_clap is None or rms <= cfg["valley_ratio"] * self._first_clap[1]:
-            if rms < max(cfg["min_rms"] * 1.5, cfg["snr_ratio"] * self._noise_floor):
+        # Quiet frame: update adaptive background floor & p95 envelope.
+        if self._first_clap is None or rms <= self._valley_ceiling(self._first_clap[1]):
+            if rms < max(cfg["min_rms"] * 1.2, cfg["snr_ratio"] * self._noise_floor):
                 self._update_noise_floor(rms)
-                if self._frames_seen >= 8 and (self._frames_seen % 5) == 0:
-                    self._update_bg_low()
         self._prev_rms.append(rms)
         return False
 
@@ -434,19 +442,19 @@ class ClapAnalyzer:
 
         if self._first_clap is None:
             self._first_clap = (peak_t, peak_rms)
-            self._valley_seen = current_rms <= cfg["valley_ratio"] * peak_rms
+            self._valley_seen = current_rms <= self._valley_ceiling(peak_rms)
             return False
 
         t1, rms1 = self._first_clap
         dt = peak_t - t1
 
-        if dt < 0.085:
-            # Room echo / single-clap bounce (up to ~14m) — keep original Clap 1.
+        if dt < 0.09:
+            # Room echo / single-clap bounce — keep original Clap 1.
             self.last_reject_reason = f"echo_dt:{dt:.3f}"
             return False
 
         if dt < cfg["min_gap_s"]:
-            # Sub-135 ms follow-up impulse indicates rapid tapping/applause, not a double-clap.
+            # Sub-150 ms follow-up impulse indicates rapid tapping/applause, not a double-clap.
             self.last_reject_reason = f"too_fast_dt:{dt:.3f}"
             self._first_clap = None
             self._valley_seen = False
@@ -466,7 +474,7 @@ class ClapAnalyzer:
 
         # Otherwise treat this verified clap as the new Clap 1.
         self._first_clap = (peak_t, peak_rms)
-        self._valley_seen = current_rms <= cfg["valley_ratio"] * peak_rms
+        self._valley_seen = current_rms <= self._valley_ceiling(peak_rms)
         return False
 
 

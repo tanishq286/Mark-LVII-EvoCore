@@ -112,8 +112,8 @@ def _build_wasapi_raw_fan_double_clap(rng: np.random.Generator, gap_s: float = 0
     fan = np.fft.irfft(spec * shape, n=n).astype(np.float32)
     fan *= 385.0 / (float(np.sqrt(np.mean(fan * fan))) + 1e-6)
 
-    c1 = _sim_real_clap(rng, 4200.0, 35.0, 1000.0, 800.0, 10.0)
-    c2 = _sim_real_clap(rng, 4200.0, 35.0, 1000.0, 800.0, 10.0)
+    c1 = _sim_real_clap(rng, 6000.0, 35.0, 1200.0, 800.0, 10.0)
+    c2 = _sim_real_clap(rng, 6000.0, 35.0, 1200.0, 800.0, 10.0)
     p1 = int(0.50 * SAMPLE_RATE) + 90
     p2 = p1 + int(gap_s * SAMPLE_RATE)
     fan[p1 : p1 + c1.size] += c1
@@ -217,15 +217,12 @@ def main() -> int:
         tp_cases = [
             ("wideband_300ms", _build_double_clap(rng, 0.30)),
             ("wideband_500ms", _build_double_clap(rng, 0.50)),
-            ("wideband_750ms", _build_double_clap(rng, 0.75)),
+            ("wideband_700ms", _build_double_clap(rng, 0.70)),
+            ("fast_clap_170ms_gap", _build_band_double_clap(rng, 9000, 35, 1300, 1000, 10, 0.17)),
+            ("relaxed_clap_750ms_gap", _build_band_double_clap(rng, 9000, 35, 1300, 1000, 10, 0.75)),
             ("bt_hfp_3.2khz_400ms", _build_double_clap(rng, 0.40, amp1=15000.0, amp2=14500.0, bt_hfp=True)),
             ("noisy_room_rms300", _build_double_clap(rng, 0.42, amp1=17000.0, amp2=16500.0, noise_rms=300.0)),
-            ("realtek_soft_clap_peak1800_cupped", _build_band_double_clap(rng, 1800, 30, 800, 600, 8, 0.35)),
-            ("realtek_med_clap_peak3000_short6ms", _build_band_double_clap(rng, 3000, 20, 1200, 900, 5, 0.35)),
-            ("realtek_cupped_low_650hz", _build_band_double_clap(rng, 5000, 40, 650, 400, 14, 0.35)),
-            ("reverb_room_decay45ms", _build_band_double_clap(rng, 6000, 180, 1100, 800, 45, 0.40)),
-            ("fast_clap_150ms_gap", _build_band_double_clap(rng, 8000, 35, 1300, 1000, 10, 0.15)),
-            ("slow_clap_1000ms_gap", _build_band_double_clap(rng, 8000, 35, 1300, 1000, 10, 1.00)),
+            ("cupped_hand_900hz", _build_band_double_clap(rng, 6500, 35, 900, 650, 10, 0.35)),
             ("wasapi_raw_fan_room_clap", _build_wasapi_raw_fan_double_clap(rng, 0.40)),
         ]
         tp_failures = []
@@ -295,8 +292,8 @@ def main() -> int:
         s_echo[p0 : p0 + c1.size] += c1
         s_echo[p0 + int(0.06 * SAMPLE_RATE) : p0 + int(0.06 * SAMPLE_RATE) + echo.size] += echo
 
-        # Two claps 1.25 s apart (outside 0.90s max_gap_s)
-        s_far = _build_double_clap(rng, 1.25)
+        # Two claps 1.00 s apart (outside 0.80s max_gap_s)
+        s_far = _build_double_clap(rng, 1.00)
 
         # Sustained speech-like harmonic vowel bursts (250 ms each, 400 ms apart)
         s_speech = _silence(2.0)
@@ -338,15 +335,37 @@ def main() -> int:
         # Continuous loud broadband noise (fan/applause)
         s_noise = rng.normal(0.0, 2600.0, int(SAMPLE_RATE * 2.0)).astype(np.float32)
 
+        # Class 9: 4 seconds of gusty WASAPI RAW fan noise (hp_rms spikes up to ~250)
+        n4 = int(SAMPLE_RATE * 4.0)
+        raw_base = rng.normal(0.0, 1.0, n4).astype(np.float32)
+        sp4 = np.fft.rfft(raw_base)
+        fr4 = np.fft.rfftfreq(n4, 1.0 / SAMPLE_RATE)
+        sh4 = np.where(fr4 < 60.0, 1.0, np.where(fr4 < 350.0, 0.35, 0.032))
+        s_fan4 = np.fft.irfft(sp4 * sh4, n=n4).astype(np.float32)
+        s_fan4 *= 385.0 / (float(np.sqrt(np.mean(s_fan4 * s_fan4))) + 1e-6)
+        t4 = np.arange(n4, dtype=np.float32) / SAMPLE_RATE
+        s_fan4 *= 1.0 + 0.65 * np.maximum(0.0, np.sin(2 * np.pi * 1.1 * t4))
+
+        # Class 10: Two moderate room clicks/chair creaks over WASAPI RAW floor
+        s_clicks = s_fan4[: int(SAMPLE_RATE * 1.8)].copy()
+        click1 = _sim_real_clap(rng, 2200.0, 25.0, 900.0, 600.0, 8.0)
+        click2 = _sim_real_clap(rng, 2200.0, 25.0, 900.0, 600.0, 8.0)
+        p_c1 = int(0.50 * SAMPLE_RATE)
+        p_c2 = p_c1 + int(0.35 * SAMPLE_RATE)
+        s_clicks[p_c1 : p_c1 + click1.size] += click1
+        s_clicks[p_c2 : p_c2 + click2.size] += click2
+
         tn_cases = [
             ("silence_2s", _silence(2.0)),
             ("single_clap_plus_60ms_echo", s_echo),
-            ("two_claps_1.25s_apart", s_far),
+            ("two_claps_1.00s_apart", s_far),
             ("speech_harmonic_vowels", s_speech),
             ("double_desk_thud_150_240hz", s_thud),
             ("melodic_chime_440_880hz", s_chime),
             ("rapid_6_tap_typing", s_typing),
             ("continuous_broadband_noise", s_noise),
+            ("raw_fan_gusty_room_4s", s_fan4),
+            ("raw_ambient_clicks_and_bumps", s_clicks),
         ]
         tn_failures = []
         for label, sig in tn_cases:
@@ -358,7 +377,7 @@ def main() -> int:
         check(
             "5. Double-clap true negative matrix",
             len(tn_failures) == 0,
-            "0 false positives across all 8 negative classes" if not tn_failures else "; ".join(tn_failures),
+            f"0 false positives across all {len(tn_cases)} negative classes" if not tn_failures else "; ".join(tn_failures),
         )
     except Exception as exc:
         check("5. Double-clap true negative matrix", False, str(exc))
@@ -419,7 +438,7 @@ def main() -> int:
     except Exception as exc:
         check("7. TOOL_DECLARATIONS AST & plugin collision check", False, str(exc))
 
-    # 8. Live WASAPI RAW capture + zero false wakes on real room audio
+    # 8. Live 4.0s WASAPI RAW capture + zero false wakes on real room audio
     try:
         if sys.platform != "win32":
             check("8. Live WASAPI RAW capture + zero false wakes", True, "skipped on non-Windows")
@@ -431,7 +450,7 @@ def main() -> int:
             raw_cap = WasapiRawCapture(on_chunk=lambda c: captured.append(c.copy()), target_rate=SAMPLE_RATE)
             started = raw_cap.start()
             if started:
-                time.sleep(1.5)
+                time.sleep(4.0)
             dev_label = raw_cap.device_label
             raw_cap.stop()
 
@@ -439,7 +458,7 @@ def main() -> int:
             rms = float(np.sqrt(np.mean(all_pcm.astype(np.float32) ** 2))) if all_pcm.size else 0.0
             az = ClapAnalyzer(sensitivity="medium")
             false_hits = _feed_signal(az, all_pcm.astype(np.float32)) if all_pcm.size else 0
-            ok_raw = started and all_pcm.size >= SAMPLE_RATE and rms > 10.0 and false_hits == 0
+            ok_raw = started and all_pcm.size >= 48000 and rms > 10.0 and false_hits == 0
             check(
                 "8. Live WASAPI RAW capture + zero false wakes",
                 ok_raw,

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import POINTER, Structure, byref, c_int32, c_int64, c_ubyte, c_uint16, c_uint32, c_uint64, c_void_p, cast
+import gc
 import sys
 import threading
 import warnings
@@ -159,28 +160,44 @@ def _friendly_name(AudioUtilities, dev) -> str:
 def _pick_endpoint(AudioUtilities, EDataFlow, ERole, DEVICE_STATE, device_name: str):
     """Resolve `device_name` among active capture endpoints, or return default."""
     enum = AudioUtilities.GetDeviceEnumerator()
+    coll = None
+    partial_dev = None
+    partial_name = ""
+    chosen = None
+    chosen_name = ""
     want = (device_name or "").strip().lower()
-    if want:
-        try:
-            coll = enum.EnumAudioEndpoints(EDataFlow.eCapture.value, DEVICE_STATE.ACTIVE.value)
-            count = coll.GetCount()
-            partial = None
-            for i in range(count):
-                cand = coll.Item(i)
-                fname = _friendly_name(AudioUtilities, cand)
-                low = fname.lower()
-                if not low:
-                    continue
-                if low == want:
-                    return cand, fname
-                if partial is None and (want in low or low in want):
-                    partial = (cand, fname)
-            if partial is not None:
-                return partial
-        except Exception:
-            pass
-    default_dev = enum.GetDefaultAudioEndpoint(EDataFlow.eCapture.value, ERole.eConsole.value)
-    return default_dev, _friendly_name(AudioUtilities, default_dev) or "Default capture"
+    try:
+        if want:
+            try:
+                coll = enum.EnumAudioEndpoints(EDataFlow.eCapture.value, DEVICE_STATE.ACTIVE.value)
+                count = coll.GetCount()
+                for i in range(count):
+                    cand = coll.Item(i)
+                    fname = _friendly_name(AudioUtilities, cand)
+                    low = fname.lower()
+                    if not low:
+                        cand = None
+                        continue
+                    if low == want:
+                        chosen, chosen_name = cand, fname
+                        cand = None
+                        break
+                    if partial_dev is None and (want in low or low in want):
+                        partial_dev, partial_name = cand, fname
+                    cand = None
+                if chosen is None and partial_dev is not None:
+                    chosen, chosen_name = partial_dev, partial_name
+                partial_dev = None
+            except Exception:
+                partial_dev = None
+        if chosen is None:
+            chosen = enum.GetDefaultAudioEndpoint(EDataFlow.eCapture.value, ERole.eConsole.value)
+            chosen_name = _friendly_name(AudioUtilities, chosen) or "Default capture"
+        return chosen, chosen_name
+    finally:
+        partial_dev = None
+        coll = None
+        enum = None
 
 
 class WasapiRawCapture:
@@ -236,21 +253,13 @@ class WasapiRawCapture:
         if t is not None and t.is_alive() and threading.current_thread() is not t:
             t.join(timeout=1.5)
 
-    def _run(self) -> None:
-        comtypes = None
+    def _run_com(
+        self, AudioUtilities, EDataFlow, ERole, DEVICE_STATE, CLSCTX_ALL, IAudioClient2, IAudioCaptureClient
+    ) -> None:
         ac = None
         cap = None
         dev = None
         try:
-            import comtypes as _comtypes
-            from comtypes import CLSCTX_ALL
-            from pycaw.constants import DEVICE_STATE, EDataFlow, ERole
-            from pycaw.pycaw import AudioUtilities
-
-            comtypes = _comtypes
-            comtypes.CoInitialize()
-            IAudioClient2, IAudioCaptureClient = _build_com_types()
-
             dev, label = _pick_endpoint(
                 AudioUtilities, EDataFlow, ERole, DEVICE_STATE, self._device_name
             )
@@ -340,14 +349,7 @@ class WasapiRawCapture:
                     pkt_frames = cap.GetNextPacketSize()
 
                 self._stop_event.wait(0.010)
-        except Exception as exc:
-            if not self._active:
-                self._logger(f"Double-clap: WASAPI RAW open skipped ({exc}).")
-            else:
-                self._logger(f"Double-clap: WASAPI RAW error ({exc}).")
         finally:
-            self._active = False
-            self._ready_event.set()
             if ac is not None:
                 try:
                     ac.Stop()
@@ -356,6 +358,31 @@ class WasapiRawCapture:
             cap = None
             ac = None
             dev = None
+
+    def _run(self) -> None:
+        comtypes = None
+        try:
+            import comtypes as _comtypes
+            from comtypes import CLSCTX_ALL
+            from pycaw.constants import DEVICE_STATE, EDataFlow, ERole
+            from pycaw.pycaw import AudioUtilities
+
+            comtypes = _comtypes
+            comtypes.CoInitialize()
+            IAudioClient2, IAudioCaptureClient = _build_com_types()
+            self._run_com(
+                AudioUtilities, EDataFlow, ERole, DEVICE_STATE, CLSCTX_ALL, IAudioClient2, IAudioCaptureClient
+            )
+        except Exception as exc:
+            if not self._active:
+                self._logger(f"Double-clap: WASAPI RAW open skipped ({exc}).")
+            else:
+                self._logger(f"Double-clap: WASAPI RAW error ({exc}).")
+        finally:
+            self._active = False
+            self._ready_event.set()
+            # Ensure COM wrappers are garbage-collected BEFORE CoUninitialize().
+            gc.collect()
             if comtypes is not None:
                 try:
                     comtypes.CoUninitialize()

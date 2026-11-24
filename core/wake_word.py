@@ -32,7 +32,7 @@ from typing import Callable
 # Pretrained openwakeword model that listens for "Hey Jarvis".
 WAKE_MODEL = "hey_jarvis"
 # Score in [0,1]; above this counts as a detection. Tunable per environment.
-DEFAULT_THRESHOLD = 0.5
+DEFAULT_THRESHOLD = 0.55
 # Mic frames arrive at 16 kHz int16; this is just the detector's input rate.
 SAMPLE_RATE = 16000
 # openWakeWord processes audio natively in 80 ms (1280-sample) increments.
