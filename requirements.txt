@@ -94,6 +94,8 @@ pdfplumber                   # file_processor — PDF text and tables
 PyPDF2                       # file_processor — PDF fallback reader
 python-docx                  # file_processor — .docx reading
 pynvml                       # system_monitor + the HUD's GPU meter (NVIDIA)
+scipy>=1.15,<2              # voice_lock — MFCC discrete cosine transform
+croniter>=2,<7              # routines — cron expression parsing
 
 # ── Optional: heavy extras, install only if you want the feature ──────────────
 # Left out on purpose — together they are several hundred megabytes, which is a
