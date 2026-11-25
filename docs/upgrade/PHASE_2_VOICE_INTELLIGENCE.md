@@ -152,7 +152,7 @@ Added:
 
 - `providers/base.py`: optional generation metadata on provider events. The field defaults to `None`, so existing providers and tests retain their prior event contract.
 - `providers/engine_pipeline.py`: local pipeline owns a `VoiceTurnCoordinator`; text, audio, and tool-call events carry a generation token; both queue publication and event consumption reject stale generations; late tool results from an interrupted generation are ignored.
-- `tests/test_pipeline_generation_fence.py`: focused tests for playback-state gating, stale queued-audio rejection, stale tool-result rejection, and starting a new local turn after interruption.
+- `tests/test_pipeline_generation_fence.py`: focused tests for playback-state gating, stale queued-audio rejection, stale tool-result rejection, starting a new local turn after interruption, and cleanup of partially completed tool-call history.
 
 This hardens the local pipeline's existing cancellation path. It does **not** yet enable voice-detected interruption, and it does not alter the primary Gemini Live path. The local pipeline continues to advertise `barge_in: false` until live near-end speech detection and acoustic echo cancellation are validated.
 
