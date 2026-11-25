@@ -170,7 +170,8 @@ def test_main_injects_bootstrap_and_records_turns_off_loop():
 
 # ── 24/7 agents: gates & budget ─────────────────────────────────────────────
 
-def test_gates_pause_for_active_user_cpu_and_gpu():
+def test_gates_pause_for_active_user_cpu_and_gpu(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(rq, "_gpu_util_pct", lambda: None)     # "no NVIDIA GPU" - never the live host GPU
     lim = dict(rq.DEFAULT_LIMITS)
     assert rq.check_gates(idle_s=10, cpu_pct=1, gpu_pct=1, lim=lim)[0] is False
     assert "CPU" in rq.check_gates(idle_s=900, cpu_pct=90, gpu_pct=1, lim=lim)[1]

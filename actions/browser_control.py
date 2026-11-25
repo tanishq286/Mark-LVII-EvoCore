@@ -385,6 +385,21 @@ def _jarvis_preferred_browser() -> str:
         return ""
 
 
+def open_url(url: str) -> bool:
+    """Milestone 15: the one entry point for "open this link for the user".
+
+    Routes through Jarvis's browser (Chrome when installed, else the OS
+    default) instead of `webbrowser.open`, which always picks the OS handler
+    (Edge on this PC). True unless the launch definitely failed.
+    """
+    try:
+        result = str(_open_native(url, None))
+    except Exception as exc:
+        print(f"[Browser] open_url failed for {url!r}: {exc}")
+        return False
+    return not result.startswith(f"status={outcome.FAILED} ")
+
+
 def _detect_default_browser() -> str:
     """Jarvis preference (Chrome) first; the OS http handler only as fallback."""
     preferred = _jarvis_preferred_browser()

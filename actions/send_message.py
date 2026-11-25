@@ -120,9 +120,10 @@ def _open_app(app_name: str) -> bool:
 
 
 def _open_browser_url(url: str) -> bool:
-    import webbrowser
     try:
-        webbrowser.open(url)
+        from actions.browser_control import open_url   # Chrome by default (M15)
+        if not open_url(url):
+            return False
         time.sleep(4.0) 
         return True
     except Exception as e:

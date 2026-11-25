@@ -214,6 +214,27 @@ def test_urls_launch_chrome_exe_not_the_os_handler(monkeypatch: pytest.MonkeyPat
     assert any("example.com" in a for a in launched[0])
 
 
+def test_remaining_link_openers_route_through_jarvis_browser(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """send_message / weather_report / website_builder used webbrowser.open (OS default = Edge)."""
+    import webbrowser
+    from actions import browser_control, send_message, weather_report
+    from plugins import website_builder
+    opened: list[tuple[str, object]] = []
+    monkeypatch.setattr(browser_control, "_open_native", lambda url, name: opened.append((url, name)) or "status=done")
+    monkeypatch.setattr(webbrowser, "open", lambda *_a, **_k: pytest.fail("webbrowser.open bypassed Chrome"))
+    monkeypatch.setattr(send_message.time, "sleep", lambda _s: None)
+    assert send_message._open_browser_url("https://web.whatsapp.com") is True
+    assert "Showing the weather" in weather_report.weather_action({"city": "Pune"})
+    out = website_builder.run({"action": "build", "title": "M15", "preview": True, "out_dir": str(tmp_path / "site")})
+    assert "Opened in browser." in out
+    urls = [u for u, _ in opened]
+    assert urls[0] == "https://web.whatsapp.com" and "weather+in+Pune" in urls[1] and urls[2].startswith("file:")
+    assert all(name is None for _, name in opened)              # None -> Jarvis preference (Chrome)
+    monkeypatch.setattr(browser_control, "_open_native", lambda *_a: "status=failed action=x reason=y")
+    assert browser_control.open_url("https://example.com") is False
+    assert "couldn't open the browser" in weather_report.weather_action({"city": "Pune"})
+
+
 def test_fetch_user_agent_matches_installed_chrome():
     from core.tasks import web
     major = web._chrome_major()

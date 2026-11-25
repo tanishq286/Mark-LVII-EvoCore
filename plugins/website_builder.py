@@ -6,7 +6,6 @@ import html
 from pathlib import Path
 import re
 import time
-import webbrowser
 
 _BASE_DIR = Path(__file__).resolve().parent.parent
 _DEFAULT_SITES_DIR = _BASE_DIR / "generated_sites"
@@ -236,8 +235,9 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
         preview_msg = ""
         if params.get("preview"):
             try:
-                webbrowser.open(index_path.resolve().as_uri())
-                preview_msg = " Opened in browser."
+                from actions.browser_control import open_url   # Chrome by default (M15)
+                opened = open_url(index_path.resolve().as_uri())
+                preview_msg = " Opened in browser." if opened else " Browser preview could not be launched."
             except Exception as exc:
                 preview_msg = f" Browser preview error: {exc}"
         return f"Built responsive HTML5/CSS/JS/Canvas website ({len(html_doc)} bytes): {index_path}.{preview_msg}"
