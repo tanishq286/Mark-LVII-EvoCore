@@ -346,8 +346,8 @@ def detect_tailscale(*, port: int = PORT, https: bool = True) -> dict:
 
 LOCAL_TUNNEL_PORT = 8766
 PAIRING_PIN_TTL_SECONDS = 300
-_TUNNEL_LOCK = threading.Lock()
-_TUNNEL_START_LOCK = threading.Lock()       # one launch at a time (auto-start vs. API)
+_TUNNEL_LOCK = threading.RLock()
+_TUNNEL_START_LOCK = threading.RLock()       # one launch at a time (auto-start vs. API)
 _TUNNEL_SUPERVISOR: threading.Thread | None = None
 _TUNNEL_PROC: subprocess.Popen | None = None
 _TUNNEL_URL: str = ""
@@ -476,9 +476,11 @@ def start_quick_tunnel(
 
 
 def _start_tunnel_locked(*, local_port: int, https: bool, tunnel_http_port: int, wait_s: float) -> dict:
+    already_running = False
     with _TUNNEL_LOCK:
-        if _TUNNEL_PROC is not None and _TUNNEL_PROC.poll() is None and _TUNNEL_URL:
-            return get_tunnel_status()
+        already_running = bool(_TUNNEL_PROC is not None and _TUNNEL_PROC.poll() is None and _TUNNEL_URL)
+    if already_running:
+        return get_tunnel_status()
 
     cf_exe = _find_cloudflared()
     if cf_exe:

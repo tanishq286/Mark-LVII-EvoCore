@@ -376,3 +376,27 @@ def test_setup_integrations_env_and_mcp_generation(tmp_path: Path):
     assert mcp_cfg["servers"]["github"]["enabled"] is True
     assert mcp_cfg["servers"]["notion"]["enabled"] is False
     assert (REPO_ROOT / "IP_AND_PRIVACY_AUDIT.md").is_file()
+
+
+def test_start_quick_tunnel_idempotent_no_deadlock(monkeypatch: pytest.MonkeyPatch):
+    from dashboard import server as ds
+
+    class _AliveProc:
+        def poll(self):
+            return None
+
+    orig_proc = ds._TUNNEL_PROC
+    orig_url = ds._TUNNEL_URL
+    orig_prov = ds._TUNNEL_PROVIDER
+    try:
+        monkeypatch.setattr(ds, "_TUNNEL_PROC", _AliveProc())
+        monkeypatch.setattr(ds, "_TUNNEL_URL", "https://already-up.trycloudflare.com")
+        monkeypatch.setattr(ds, "_TUNNEL_PROVIDER", "cloudflared")
+        res = ds.start_quick_tunnel(wait_s=0.5)
+        assert res["running"] is True
+        assert res["url"] == "https://already-up.trycloudflare.com"
+        assert res["pwa_url"] == "https://already-up.trycloudflare.com/pwa"
+    finally:
+        monkeypatch.setattr(ds, "_TUNNEL_PROC", orig_proc)
+        monkeypatch.setattr(ds, "_TUNNEL_URL", orig_url)
+        monkeypatch.setattr(ds, "_TUNNEL_PROVIDER", orig_prov)
