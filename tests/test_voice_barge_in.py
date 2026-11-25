@@ -81,3 +81,13 @@ def test_candidate_buffer_is_bounded():
     assert detector.observe(b"c", 16_000, 0.9) is None
     assert detector.observe(b"d", 16_000, 0.9) is None
     assert detector.observe(b"e", 16_000, 0.9) == (b"d", b"e")
+
+
+def test_room_calibration_uses_echo_residual_samples_not_gain_observations():
+    from core.echo import EchoGuard
+
+    guard = EchoGuard()
+    guard._residuals = [0.0] * 16  # headphone / isolated-mic profile
+    guard._seen = 0
+
+    assert guard.calibrated is True

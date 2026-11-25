@@ -140,8 +140,14 @@ class EchoGuard:
 
     @property
     def calibrated(self) -> bool:
-        """True once the estimate rests on enough real echo to be trusted."""
-        return self._seen >= 8
+        """True once the room has enough residual samples to classify reliably.
+
+        Gain estimation is useful when audible echo exists, but headphones (or
+        isolated microphones) can produce no measurable echo at all. In that
+        case the quiet-frame path records zero residuals: that is a valid
+        calibrated acoustic profile even though no gain observations exist.
+        """
+        return len(self._residuals) >= _WARMUP
 
     @property
     def floor(self) -> float:
