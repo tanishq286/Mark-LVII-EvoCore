@@ -144,3 +144,16 @@ The coordinator issues monotonically increasing generation IDs. An integration m
 **Not yet integrated:** no microphone callback, Gemini Live stream, PipelineEngine, playback queue, TTS provider, or avatar code has been changed. The coordinator does not yet make the application interruptible; it provides a tested foundation for wiring that behaviour safely.
 
 **Next:** wire generation IDs to the shared playback publication boundary and interruption path on a separate commit, after the user's local repository state and private runtime backup are verified. Then add mocked race-condition tests and perform a microphone/speaker smoke test before enabling barge-in by default.
+
+
+### Stage 2 — local pipeline generation fencing
+
+Added:
+
+- `providers/base.py`: optional generation metadata on provider events. The field defaults to `None`, so existing providers and tests retain their prior event contract.
+- `providers/engine_pipeline.py`: local pipeline owns a `VoiceTurnCoordinator`; text, audio, and tool-call events carry a generation token; both queue publication and event consumption reject stale generations; late tool results from an interrupted generation are ignored.
+- `tests/test_pipeline_generation_fence.py`: focused tests for playback-state gating, stale queued-audio rejection, stale tool-result rejection, and starting a new local turn after interruption.
+
+This hardens the local pipeline's existing cancellation path. It does **not** yet enable voice-detected interruption, and it does not alter the primary Gemini Live path. The local pipeline continues to advertise `barge_in: false` until live near-end speech detection and acoustic echo cancellation are validated.
+
+**Validation status:** Source files and test cases are committed on the feature branch. The focused test suite and full Windows CI run still need a confirmed green result.
