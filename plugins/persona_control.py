@@ -27,7 +27,7 @@ PLUGIN = {
             },
             "persona": {
                 "type": "STRING",
-                "enum": ["precision", "empathetic", "expressive", "soulful"],
+                "enum": ["precision", "empathetic", "expressive", "soulful", "romantic_charm"],
                 "description": "Target persona mode when action='set'.",
             },
         },
@@ -56,7 +56,12 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
     """Entry point discovered by `core.plugin_loader`. Never raises."""
     _ = session_memory
     try:
-        from core.persona import PERSONAS, format_persona_prompt, normalize_persona
+        from core.persona import (
+            PERSONAS,
+            avatar_mood_for_persona,
+            format_persona_prompt,
+            normalize_persona,
+        )
         from memory.config_manager import get_persona_mode, save_persona_mode
 
         params = parameters if isinstance(parameters, dict) else {}
@@ -73,13 +78,20 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             ]
             body = "\n".join(lines)
             _notify(player, f"Active persona: {current}.", "JARVIS PERSONA PROFILES", body)
-            return f"Available personas (active={current}): precision, empathetic, expressive, soulful.\n{body}"
+            return f"Available personas (active={current}): {', '.join(PERSONAS.keys())}.\n{body}"
 
         if action == "set":
             if not target:
-                return "Specify persona ('precision', 'empathetic', 'expressive', or 'soulful')."
+                return f"Specify persona ({', '.join(PERSONAS.keys())})."
             canonical = save_persona_mode(normalize_persona(target))
             meta = PERSONAS[canonical]
+            if player is not None and hasattr(player, "set_mood"):
+                try:
+                    player.set_mood(avatar_mood_for_persona(canonical), 0.90, 12.0)
+                    if canonical == "romantic_charm" and hasattr(player, "trigger_avatar_gesture"):
+                        player.trigger_avatar_gesture("shy", meta["title"])
+                except Exception:
+                    pass
             msg = f"Persona switched to {canonical} ({meta['title']}, mood={meta['avatar_mood']})."
             _notify(player, msg, f"PERSONA · {canonical.upper()}", format_persona_prompt(canonical))
             return msg

@@ -16,6 +16,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import os
+import re
 from pathlib import Path
 import sqlite3
 import sys
@@ -376,6 +377,167 @@ def _sha256_file(path: Path) -> str:
                 break
             h.update(block)
     return h.hexdigest()
+
+
+def auto_compound_artifact(
+    title: str,
+    content: str,
+    *,
+    kind: str = "research",
+    domain: str = "general",
+    source: str = "task",
+    tags: list[str] | tuple[str, ...] | None = None,
+    entities: list[dict[str, Any]] | None = None,
+    vault_dir: Path | None = None,
+    graph_db_path: Path | None = None,
+    ollama_origin: str = OLLAMA_ORIGIN,
+    embed_model: str = EMBED_MODEL,
+    embed: bool = True,
+) -> dict[str, Any]:
+    """Persist and incrementally index a completed report or solved task into RAG + Knowledge Graph."""
+    body = str(content or "").strip()
+    if not body:
+        return {"ok": False, "reason": "empty_content", "rag_indexed": False, "graph_entities": 0}
+
+    clean_title = " ".join(str(title or "Knowledge Artifact").split())[:120] or "Knowledge Artifact"
+    clean_domain = " ".join(str(domain or "general").split())[:48] or "general"
+    clean_kind = " ".join(str(kind or "research").split())[:48] or "research"
+    slug = re.sub(r"[^a-z0-9]+", "-", clean_title.lower()).strip("-")[:48] or "artifact"
+    content_hash = hashlib.sha256(f"{clean_title}\n{clean_domain}\n{body}".encode("utf-8")).hexdigest()[:12]
+
+    vault = Path(vault_dir) if vault_dir is not None else KNOWLEDGE_DIR
+    comp_dir = vault / "compounded"
+    comp_dir.mkdir(parents=True, exist_ok=True)
+    if not _is_within_vault(comp_dir, vault.resolve()):
+        return {"ok": False, "reason": "invalid_target_path", "rag_indexed": False, "graph_entities": 0}
+    note_path = comp_dir / f"{slug}-{content_hash}.md"
+    if note_path.is_symlink() or (note_path.exists() and not _is_within_vault(note_path, vault.resolve())):
+        return {"ok": False, "reason": "invalid_target_path", "rag_indexed": False, "graph_entities": 0}
+
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tag_list = [str(t).strip() for t in (tags or ()) if str(t).strip()]
+    header_lines = [
+        f"# {clean_title}",
+        "",
+        f"- Kind: {clean_kind}",
+        f"- Domain: {clean_domain}",
+        f"- Source: {source}",
+        f"- Recorded: {now_iso}",
+    ]
+    if tag_list:
+        header_lines.append(f"- Tags: {', '.join(tag_list)}")
+    header_lines.extend(["", body, ""])
+    note_text = "\n".join(header_lines)
+    if not note_path.is_file() or note_path.read_text(encoding="utf-8", errors="replace") != note_text:
+        note_path.write_text(note_text, encoding="utf-8")
+
+    rel_path = note_path.resolve().relative_to(vault.resolve()).as_posix()
+    digest = _sha256_file(note_path)
+    rag_indexed = False
+    deduped = False
+    chunk_count = 0
+    rag_note = ""
+
+    db_path = vault / INDEX_FILENAME
+    lines, read_note = _read_document_lines(note_path)
+    if lines is None:
+        rag_note = read_note
+    elif embed:
+        with _DB_LOCK:
+            conn = _connect_db(db_path)
+            try:
+                row = conn.execute("SELECT sha256, chunk_count FROM files WHERE rel_path = ?", (rel_path,)).fetchone()
+                if row and row[0] == digest:
+                    deduped = True
+                    rag_indexed = True
+                    chunk_count = int(row[1] or 0)
+                else:
+                    chunks = _chunk_lines(lines)
+                    embed_ok, embed_status = _embed_model_reachable(ollama_origin, embed_model)
+                    if not embed_ok:
+                        rag_note = embed_status
+                    elif chunks:
+                        embedded_rows = []
+                        for c_idx, (l_start, l_end, c_text) in enumerate(chunks):
+                            vec = np.asarray(
+                                _embed_text(
+                                    c_text,
+                                    prefix="search_document: ",
+                                    ollama_origin=ollama_origin,
+                                    model=embed_model,
+                                ),
+                                dtype=np.float32,
+                            )
+                            embedded_rows.append(
+                                (rel_path, c_idx, l_start, l_end, c_text, int(vec.shape[0]), vec.tobytes())
+                            )
+                        st = note_path.stat()
+                        conn.execute("DELETE FROM files WHERE rel_path = ?", (rel_path,))
+                        conn.execute(
+                            "INSERT INTO files(rel_path, sha256, size_bytes, mtime, chunk_count, indexed_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (rel_path, digest, int(st.st_size), float(st.st_mtime), len(embedded_rows), now_iso),
+                        )
+                        conn.executemany(
+                            "INSERT INTO chunks(rel_path, chunk_idx, line_start, line_end, text, dim, embedding) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            embedded_rows,
+                        )
+                        conn.commit()
+                        rag_indexed = True
+                        chunk_count = len(embedded_rows)
+            except Exception as exc:
+                rag_note = f"{type(exc).__name__}: {exc}"
+            finally:
+                conn.close()
+
+    # Compound entities and distilled takeaway into knowledge_graph.sqlite
+    summary_line = ""
+    for ln in body.splitlines():
+        s = ln.strip().lstrip("#-* ").strip()
+        if len(s) >= 16:
+            summary_line = s
+            break
+    if not summary_line:
+        summary_line = " ".join(body.split())[:120]
+
+    kg_facts: list[dict[str, Any]] = [
+        {
+            "kind": "note",
+            "subject": f"{clean_domain}:{clean_kind}",
+            "value": clean_title[:100],
+            "fact": f"{clean_title} — {summary_line[:180]}",
+            "confidence": 0.85,
+        }
+    ]
+    for ent in (entities or ()):
+        if isinstance(ent, dict) and (ent.get("value") or ent.get("subject")):
+            kg_facts.append(ent)
+    try:
+        from core.memory import memory_extractor
+        for rf in memory_extractor.extract_rule_facts(body[:2000])[:4]:
+            kg_facts.append(rf)
+    except Exception:
+        pass
+
+    graph_touched = 0
+    try:
+        from core.memory import knowledge_graph
+        gres = knowledge_graph.ingest_extracted_facts(kg_facts, db_path=graph_db_path)
+        graph_touched = int(gres.get("entities_touched", 0))
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "path": str(note_path),
+        "rel_path": rel_path,
+        "rag_indexed": rag_indexed,
+        "deduped": deduped,
+        "chunks": chunk_count,
+        "rag_note": rag_note,
+        "graph_entities": graph_touched,
+    }
 
 
 def index_vault(

@@ -1,10 +1,10 @@
 # Mark-LVII EvoCore & OmniCore Upgrade Progress
 
-- **Active Milestone:** **Milestone 15 — Live Fixes (Screen Vision, Chrome Default, Cross-Session Memory) & 24/7 Researcher/Engineer Agents — Verified, STOPPED for review (not merged, Jarvis not restarted)**
-- **Current Branch:** `milestone/15-live-fixes-memory-and-247-agents` (branched off `main` `98221d4`; your uncommitted UI/goddess edits left untouched in the working tree and NOT committed)
-- **Base `main` Commit (Untouched):** `98221d4`
+- **Active Milestone:** **Milestone 18 — Specialist Expert Router, Auto-RAG, Lifelike Presence, `romantic_charm` Persona & Ethical `persuasion_coach`**
+- **Current Branch:** `main`
+- **Tags:** `v16-evocore-40emotions` (`da424a1`), `v17-privacy-tunnel-ready` (`9f5a48c`), `v18-expert-alive-charm`
 - **Test Runners Installed:**
-  - `pytest 9.2.0` (`C:\Users\tanis\AppData\Local\Python\pythoncore-3.13-64\python.exe`)
+  - `pytest 9.2.0` (`C:\Users\tanishq\AppData\Local\Python\pythoncore-3.13-64\python.exe` / Windows Python `3.13.17`)
   - OpenJDK 17 (`EclipseAdoptium.Temurin.17.JDK`), Gradle `8.10.2`, Android SDK `android-35` + `build-tools 34.0.0/35.0.0` + `adb`
 
 ---
@@ -13,17 +13,38 @@
 
 | Track | Target | Verified Implementation | Status |
 | :--- | :--- | :--- | :--- |
+| **Milestone 18: Expert Intelligence, Lifelike Presence & Charm** | 3 / 3 | 5-mode Specialist Expert Router + Silent `Think -> Critic-Verify -> Respond` (`core/brain/expert_router.py`), Auto-Compounding `knowledge_rag` + `knowledge_graph.sqlite`, Emotion-matched sentence-by-sentence TTS + Soul/Avatar breathing/blink/gaze/listening reactivity, Configurable quiet-hours KG+Mind proactive check-ins, `romantic_charm` English/Hinglish persona + callbacks & ethical `persuasion_coach` (`plugins/persuasion_coach.py`) | **COMPLETE** |
+| **Milestone 17: Privacy Mode, Cloudflared Tunnel & Setup Wizard** | 3 / 3 | 3-Layer Strict Local Privacy Mode (`core/privacy.py`, local Ollama/Whisper/SAPI5, blocked external sockets/tools/cloud LLMs), 1-command Phone Remote Cloudflare Quick Tunnel + 5-min PIN + ASCII QR (`scripts/phone_link.py`, `dashboard/server.py`, `gui/overlays.py`), IP & Privacy Audit (`IP_AND_PRIVACY_AUDIT.md`) + `.env`/MCP Setup Wizard (`scripts/setup_integrations.py`) | **COMPLETE (`9f5a48c`)** |
+| **Milestone 16: 40-Emotion Affective Engine & Goddess HUD** | 1 / 1 | 40-emotion 6-family engine (`core/emotions.py`), facial warps (`core/goddess_warp.py`), painted portrait HUD (`core/goddess_portrait.py`), `emotion_soul` & Antigravity bridge (`core/antigravity_bridge.py`) | **COMPLETE (`da424a1`)** |
 | **EvoCore Auto-Evolution Engines** | 5 / 5 | Telemetry SQLite WAL, Safety Guard + Rollback, Self-Healer + Replay Benchmark, Habit Compiler, Skill Synthesizer + Reflection Loop | **5 / 5 COMPLETE** |
 | **Milestone 10: Security, Hybrid Router & Planner Core** | 6 / 6 | Adaptive Router (`local_router.py`), RAG Consolidation & Failure Immunity, Replay Self-Benchmarking, Verified Planner + Choice HUD (`confirm.py`), Uniform `SAFE`/`CONFIRM`/`LOCKED` gates, AES-256-GCM `file_vault` + Defender + 3-Persona | **6 / 6 COMPLETE** |
 | **Milestone 11: Windows Desktop Parity** | 41 / 41 | Biometric Voice Lock, Cron SQLite Routines, Network Speed/IP, `system_cleaner`, Spotify, MediaPipe Gestures, Auto-Scroll & Notepad Dictation, `.pptx` Decks, Scraper + Price Comparator, Website & Image Generators, `office_suite` (Excel/PDF/Convert), Email SMTP/IMAP, WhatsApp Media/Calls, Dev Workspace + Profiles, AES Form Filler, YouTube Whisper Fallback, Market Finance, 2D Avatar Overlay (8 Gestures) | **41 / 41 COMPLETE** |
 | **Milestone 12: Android MAX Companion & PC Bridge** | 7 / 7 | Setup Pre-Flight (`setup_android_env.ps1`), Bidirectional TLS `/ws` Bridge + Instant PWA (`/pwa`), `android_bridge` Plugin, Native Kotlin App (`AntiTheftGuardService`, `WakeWordVoiceService`, `WhatsAppAndCallController`, `MobileToggleManager`, `ScreenVisionScrollService`, `EmergencySosManager`, `VoiceCameraController`) + On-Device Privacy Mode | **7 / 7 COMPLETE** |
 | **Milestone 13: Closed-Loop Autonomous Screen Agent** | 2 / 2 | Hybrid UIA + Vision/OCR Grounding (`core/evolution/screen_agent.py`), Post-Action Settle Polling (up to 3s), Stuck-State Recovery + `ChoiceBanner` Fallback, Multi-Step Wiring (`planner.py`, `autonomous_brain.py`, `plugins/autonomous_screen_agent.py`, `main.py`), `CONFIRM`/`LOCKED` Irreversible Gate, ESC / Corner / `"Jarvis stop"` Kill-Switches, Step Telemetry for `habit_compiler.py` | **COMPLETE** |
 | **Milestone 14: Phone HTTPS Fix & Mark-LVII OmniCore** | 6 / 6 | LAN Wi-Fi + SAN HTTPS `:8000` + QR Pairing + 4G/5G Tunnel + Live Screen/Voice/1-Tap Approval (`dashboard/server.py`, `pwa.html`, `android_companion/`), Parallel Multi-Agent Swarm + Critic (`core/evolution/swarm.py`), Persistent SQLite Missions (`core/evolution/mission_runner.py`), Entity-Relation Knowledge Graph (`core/memory/knowledge_graph.py`), Idle Meta-Optimizer (`core/evolution/meta_optimizer.py`), Universal MCP Client Bridge (`core/mcp_client.py`, `plugins/mcp_bridge.py`) | **6 / 6 COMPLETE** |
-| **Milestone 15: Live Fixes + 24/7 Agents** | 5 / 5 | Per-Monitor-V2 DPI + non-blank threaded capture + alias-aware verification + spoken step status + async goal queue (`core/dpi.py`, `screen_grounding.py`), Chrome default everywhere (`config_manager`, `browser_control`, `web_search`, `core/tasks/web.py` Playwright `channel="chrome"`), append-only cross-session memory (`conversation_store.py`, `memory_extractor.py`, `live_memory.py`), idle/budgeted Researcher (`research_daemon.py`), worktree-isolated Engineer (`engineer_daemon.py`, `agents_247.py`) | **5 / 5 COMPLETE (pending review)** |
+| **Milestone 15: Live Fixes + 24/7 Agents** | 5 / 5 | Per-Monitor-V2 DPI + non-blank threaded capture + alias-aware verification + spoken step status + async goal queue (`core/dpi.py`, `screen_grounding.py`), Chrome default everywhere (`config_manager`, `browser_control`, `web_search`, `core/tasks/web.py` Playwright `channel="chrome"`), append-only cross-session memory (`conversation_store.py`, `memory_extractor.py`, `live_memory.py`), idle/budgeted Researcher (`research_daemon.py`), worktree-isolated Engineer (`engineer_daemon.py`, `agents_247.py`) | **5 / 5 COMPLETE** |
 
 ---
 
-## Milestone 15 — Live Fixes, Cross-Session Memory & 24/7 Agents (branch `milestone/15-live-fixes-memory-and-247-agents`)
+## Milestone 18 — Specialist Expert Router, Auto-Compounding Knowledge, Lifelike Presence & `romantic_charm`
+
+- **Specialist Expert Router (`core/brain/expert_router.py`):** 5 domain modes (`software_architect`, `deep_researcher`, `finance_strategy`, `science_math`, `creative_writer`), automatic intent classification & privacy-filtered tool-set selection, and silent `Think -> Critic-Verify -> Respond` pass verifying Python AST syntax, safe AST arithmetic identities, and internal-thought stripping before speaking; wired into `main.py` & `core/evolution/planner.py`.
+- **Auto-Compounding Knowledge (`plugins/knowledge_rag.py`, `core/tasks/engine.py`, `core/tasks/research.py`):** Added `auto_compound_artifact()` with SHA-256 deduplication writing `knowledge/compounded/*.md`, indexing chunks into `.rag_index.sqlite`, and upserting structured entities/relations into `knowledge_graph.sqlite` automatically on completed tasks and research reports.
+- **Lifelike Presence & Expressiveness (`core/emotions.py`, `providers/tts_system.py`, `providers/engine_pipeline.py`, `core/goddess_soul.py`, `core/avatar.py`, `gui/avatar_overlay.py`, `gui/hud.py`, `ui.py`, `actions/proactive.py`, `memory/config_manager.py`):** Emotion-matched sentence-by-sentence TTS rate & breathing pause pacing; `dt`-integrated smooth idle breathing, natural blink/gaze shifts, and reactive user-voice listening expressions across `Soul`, `HoloAvatar`, `HudCanvas`, and `AvatarOverlayWindow`; configurable quiet hours + Knowledge Graph deadlines + `goddess_mind` drive check-ins in `ProactiveEngine`.
+- **`romantic_charm` Persona & Ethical `persuasion_coach` (`core/persona.py`, `plugins/persona_control.py`, `plugins/persuasion_coach.py`):** Playful, witty, deeply affectionate English/Hinglish companion preset synced with `tender`/`playful`/`shy`/`loving` expression cues and `conversations.sqlite` callbacks, plus an ethical negotiation & pitch preparation strategist with anti-manipulation guardrails.
+- **Immutability Preserved:** `core/evolution/safety_guard.py`, `plugins/file_vault.py`, `plugins/voice_lock.py`, and `core/confirm.py` untouched.
+- **Verification:** `pytest -B -v` **98 passed, 4 skipped**; `providers._tests` **108 passed, 0 failed**; `scripts/validate_plugin.py` **36/36 PASS (0 errors, 0 warnings)**; `scripts/verify_wake_activation.py` **8/8 passed**.
+
+---
+
+## Milestone 17 — Privacy Mode, Cloudflare Quick Tunnel, IP Audit & Setup Wizard (`9f5a48c`, `v17-privacy-tunnel-ready`)
+
+- **Strict Local Privacy Mode (`core/privacy.py`):** Blocks outbound sockets outside loopback, forces local Ollama/Whisper/SAPI5 routing, gates external tools behind explicit allowlists, and requires on-screen HUD confirmation to disable.
+- **1-Command Phone Tunnel & Setup (`scripts/phone_link.py`, `dashboard/server.py`, `gui/overlays.py`, `scripts/setup_integrations.py`, `IP_AND_PRIVACY_AUDIT.md`):** Auto-starts Cloudflare Quick Tunnel + 5-min pairing PIN + terminal ASCII QR code, non-blocking tunnel UI activation, clean provenance/IP audit, and interactive `.env`/MCP wizard.
+
+---
+
+## Milestone 15 — Live Fixes, Cross-Session Memory & 24/7 Agents (`branch` merged)
 
 ### Part 1 — Live bugs, diagnosed from real runtime logs/telemetry (not mocks)
 - **(1) Screen vision + autonomous completion.** Root causes found in `startup.log` / telemetry:

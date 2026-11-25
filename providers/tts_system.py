@@ -224,7 +224,7 @@ class SystemTTS:
         self._engine = engine_name()
 
     # -- per platform, all returning a WAV file's bytes ----------------------
-    def _windows(self, text_file: str, wav_file: str) -> None:
+    def _windows(self, text_file: str, wav_file: str, *, rate: int | None = None) -> None:
         ps = _powershell()
         if not ps:
             raise RuntimeError("PowerShell was not found")
@@ -234,11 +234,12 @@ class SystemTTS:
         # apostrophe cannot end the string early.
         voice = self.voice.replace("'", "''")
         select = (f"$s.SelectVoice('{voice}');" if self.voice else "")
+        eff_rate = self.rate if rate is None else rate
         script = (
             "Add-Type -AssemblyName System.Speech;"
             "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
             f"{select}"
-            f"$s.Rate = {max(-10, min(10, self.rate))};"
+            f"$s.Rate = {max(-10, min(10, int(eff_rate)))};"
             f"$t = [System.IO.File]::ReadAllText('{text_file}',"
             " [System.Text.Encoding]::UTF8);"
             f"$s.SetOutputToWaveFile('{wav_file}');"
@@ -250,31 +251,33 @@ class SystemTTS:
             raise RuntimeError(r.stderr.decode("utf-8", "replace")[:200]
                                or "the speech engine failed")
 
-    def _macos(self, text_file: str, wav_file: str) -> None:
+    def _macos(self, text_file: str, wav_file: str, *, rate: int | None = None) -> None:
+        eff_rate = self.rate if rate is None else int(rate)
         args = ["say", "-f", text_file, "-o", wav_file,
                 # Ask for exactly what the speaker wants, so nothing is
                 # resampled on the way out.
                 "--data-format=LEI16@24000"]
         if self.voice:
             args[1:1] = ["-v", self.voice]
-        if self.rate:
+        if eff_rate:
             # `say` takes words per minute; 175 is its default, and the -10..10
             # scale is mapped onto it so one setting means the same thing on
             # every platform.
-            args[1:1] = ["-r", str(max(90, min(400, 175 + self.rate * 15)))]
+            args[1:1] = ["-r", str(max(90, min(400, 175 + eff_rate * 15)))]
         r = _run(args)
         if r.returncode != 0:
             raise RuntimeError(r.stderr.decode("utf-8", "replace")[:200]
                                or "`say` failed")
 
-    def _linux(self, text_file: str, wav_file: str) -> None:
+    def _linux(self, text_file: str, wav_file: str, *, rate: int | None = None) -> None:
+        eff_rate = self.rate if rate is None else int(rate)
         exe = shutil.which("espeak-ng") or shutil.which("espeak")
         if exe:
             args = [exe, "-f", text_file, "-w", wav_file]
             if self.voice:
                 args += ["-v", self.voice]
-            if self.rate:
-                args += ["-s", str(max(80, min(450, 175 + self.rate * 15)))]
+            if eff_rate:
+                args += ["-s", str(max(80, min(450, 175 + eff_rate * 15)))]
             r = _run(args)
             if r.returncode != 0:
                 raise RuntimeError(r.stderr.decode("utf-8", "replace")[:200]
@@ -284,7 +287,8 @@ class SystemTTS:
             "no speech engine found — install espeak-ng "
             "(apt install espeak-ng, dnf install espeak-ng, pacman -S espeak-ng)")
 
-    def _synth_blocking(self, text: str) -> bytes:
+    def _synth_blocking(self, text: str, *, rate: int = 0) -> bytes:
+        rate_i = max(-10, min(10, int(self.rate if rate == 0 else rate)))
         # Both files are created and closed before the engine is pointed at
         # them: on Windows a file still open in this process cannot be written
         # by another one, which is the standard way this fails there and not
@@ -296,19 +300,26 @@ class SystemTTS:
             with open(txt, "w", encoding="utf-8") as f:
                 f.write(text)
             if _SYS == "Windows":
-                self._windows(txt, wav)
+                self._windows(txt, wav, rate=rate_i)
             elif _SYS == "Darwin":
-                self._macos(txt, wav)
+                self._macos(txt, wav, rate=rate_i)
             else:
-                self._linux(txt, wav)
+                self._linux(txt, wav, rate=rate_i)
             with open(wav, "rb") as f:
                 return f.read()
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
     # -- the contract -------------------------------------------------------
-    async def speak(self, text: str, voice: str = "") -> AsyncIterator[bytes]:
-        """24 kHz mono PCM, a sentence at a time.
+    async def speak(
+        self,
+        text: str,
+        voice: str = "",
+        *,
+        rate: int = 0,
+        pause_ms: int = 0,
+    ) -> AsyncIterator[bytes]:
+        """24 kHz mono PCM, a sentence at a time with optional emotion-matched pacing.
 
         Sentence by sentence rather than all at once because the whole answer
         can be several seconds of synthesis, and waiting for the last word
@@ -319,12 +330,22 @@ class SystemTTS:
             self.voice = voice
         produced = 0
         sentences = _split(text)
-        for sentence in sentences:
-            wav = await asyncio.to_thread(self._synth_blocking, sentence)
+        eff_pause = max(0, min(800, int(pause_ms or 0)))
+        for idx, sentence in enumerate(sentences):
+            if rate:
+                wav = await asyncio.to_thread(self._synth_blocking, sentence, rate=rate)
+            else:
+                wav = await asyncio.to_thread(self._synth_blocking, sentence)
             pcm = audio.wav_to_pcm(wav, audio.SPEAKER_RATE)
             produced += len(pcm)
             for piece in audio.chunk(pcm):
                 yield piece
+            if eff_pause > 0 and pcm and idx < len(sentences) - 1:
+                pad_samples = int(audio.SPEAKER_RATE * eff_pause / 1000.0)
+                if pad_samples > 0:
+                    silence = b"\x00\x00" * pad_samples
+                    for piece in audio.chunk(silence):
+                        yield piece
 
         # A system voice given a script it does not cover returns SUCCESS and no
         # audio. Measured on an ordinary Windows install: the two voices present

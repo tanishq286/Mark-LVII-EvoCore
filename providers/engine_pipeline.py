@@ -609,6 +609,32 @@ class PipelineEngine:
         if language and _accepts_language(self._tts):
             kwargs["language"] = language
         try:
+            import inspect
+            sig_params = inspect.signature(self._tts.speak).parameters
+            accepts_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values())
+            if accepts_varkw or "rate" in sig_params or "pause_ms" in sig_params:
+                from core import emotions as _emo
+                persona_mode = ""
+                try:
+                    from memory.config_manager import get_persona_mode
+                    persona_mode = get_persona_mode()
+                except Exception:
+                    pass
+                pros = _emo.tts_prosody_for_state(persona=persona_mode)
+                rate = int(pros.get("rate", 0))
+                pause_ms = int(pros.get("pause_ms", 180))
+                stripped = text.rstrip()
+                if stripped.endswith("!"):
+                    rate = min(5, rate + 1)
+                elif stripped.endswith(("?", "...", "…")):
+                    pause_ms = min(450, pause_ms + 70)
+                if accepts_varkw or "rate" in sig_params:
+                    kwargs["rate"] = rate
+                if accepts_varkw or "pause_ms" in sig_params:
+                    kwargs["pause_ms"] = pause_ms
+        except Exception:
+            pass
+        try:
             async for pcm in self._tts.speak(text, **kwargs):
                 if pcm:
                     if first is None:

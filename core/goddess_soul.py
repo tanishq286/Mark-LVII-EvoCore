@@ -385,6 +385,20 @@ class Soul:
             return "curious"
         return "serene"
 
+    def note_user_voice(self, level: float, state: str = "LISTENING") -> None:
+        """React organically in micro-expression when the user is speaking while LISTENING."""
+        try:
+            lv = max(0.0, min(1.0, float(level)))
+        except (TypeError, ValueError):
+            return
+        if (state or "").upper() != "LISTENING":
+            return
+        cur = getattr(self, "_listen_amp", 0.0)
+        self._listen_amp = cur * 0.72 + lv * 0.28
+        if lv > 0.14:
+            self.accents["smile"] = max(self.accents.get("smile", 0.0), min(0.38, lv * 0.42))
+            self.accents["brow"] = max(self.accents.get("brow", 0.0), min(0.28, lv * 0.30))
+
     def step(self, dt: float, state: str, speaking: bool, muted: bool) -> None:
         now = time.monotonic()
         s = (state or "").upper()
@@ -440,6 +454,21 @@ class Soul:
         acc_tgt = {"smirk": sm, "furrow": fu, "tremble": tr}
         self.tint = tint
 
+        # Smooth continuous respiratory breathing wave & reactive listening engagement
+        breath_freq = 0.20 + 0.08 * float(self.arousal)
+        b_phase = (float(getattr(self, "_breath_phase", 0.0)) + max(0.0, float(dt)) * breath_freq) % 1.0
+        self._breath_phase = b_phase
+        breath_wave = math.sin(math.pi * (b_phase / 0.42)) if b_phase < 0.42 else math.cos(math.pi * 0.5 * ((b_phase - 0.42) / 0.58))
+        if "glow" in KEYS and not muted:
+            tgt[KEYS.index("glow")] = min(1.0, max(0.0, tgt[KEYS.index("glow")] + 0.03 * breath_wave))
+        listen_amp = float(getattr(self, "_listen_amp", 0.0)) * 0.90
+        self._listen_amp = listen_amp
+        if s == "LISTENING" and not speaking and not muted and listen_amp > 0.04:
+            if "tilt" in KEYS:
+                tgt[KEYS.index("tilt")] += min(0.14, listen_amp * 0.16)
+            if "glow" in KEYS:
+                tgt[KEYS.index("glow")] = min(1.0, tgt[KEYS.index("glow")] + listen_amp * 0.12)
+
         if not muted:
             self._act(tgt, acc_tgt, now)
         if speaking and not muted:
@@ -464,6 +493,8 @@ class Soul:
             "label": self.label or self.mood,
             "secondary": self.secondary,
             "arousal": round(float(self.arousal), 3),
+            "breath_phase": round(float(getattr(self, "_breath_phase", 0.0)), 4),
+            "listen_amp": round(float(getattr(self, "_listen_amp", 0.0)), 4),
             "bpm": round(float(self.v.get("bpm", 64.0)), 1),
             "tint": self.tint,
             "state": mind_snap.get("state", {}),

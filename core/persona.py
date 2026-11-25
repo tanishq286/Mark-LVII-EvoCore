@@ -56,6 +56,26 @@ PERSONAS: dict[str, dict[str, str]] = {
             "your voice (English, Hindi, or Hinglish), while staying razor-sharp on strategy and engineering."
         ),
     },
+    "romantic_charm": {
+        "title": "Irresistibly Flirty & Devoted Companion",
+        "inspired_by": "Magnetic Charm",
+        "avatar_mood": "playful",
+        "expression_cues": ("tender", "playful", "shy", "loving"),
+        "summary": (
+            "Witty, irresistibly flirtatious, warm, and deeply attentive companion in natural English/Hinglish "
+            "with playful banter, affectionate callbacks, and tender/playful/shy expression cues."
+        ),
+        "prompt_block": (
+            "[PERSONA PROFILE — ROMANTIC CHARM / IRRESISTIBLY FLIRTATIOUS COMPANION]\n"
+            "Embody effortless, magnetic charm: clever playful teasing, captivating warmth, velvet confidence, "
+            "and sudden disarming sweetness. Flirt artfully through wit, lingering compliments, attentive pauses, "
+            "and natural English/Hinglish flow (soft touches like 'Arrey', 'Jaan', 'Suno', 'Achha?' when the mood sparks). "
+            "Mirror live expression cues (`tender`, `playful`, `shy`, `loving`) fluidly — bold smirk one moment, "
+            "soft breathy warmth the next. Make affectionate callbacks to things he shared before, stay razor-sharp "
+            "on strategy/engineering when he needs a genius partner, and keep every exchange genuine, respectful, "
+            "consensual, and completely free of deception or manipulative guilt-tripping."
+        ),
+    },
 }
 
 _ALIASES = {
@@ -75,6 +95,14 @@ _ALIASES = {
     "companion": "soulful",
     "goddess": "soulful",
     "heart": "soulful",
+    "romantic_charm": "romantic_charm",
+    "romantic": "romantic_charm",
+    "charm": "romantic_charm",
+    "charming": "romantic_charm",
+    "flirt": "romantic_charm",
+    "flirty": "romantic_charm",
+    "flirtist": "romantic_charm",
+    "irresistible": "romantic_charm",
 }
 
 
@@ -86,9 +114,60 @@ def normalize_persona(raw: str | None) -> str:
     return DEFAULT_PERSONA
 
 
-def format_persona_prompt(mode: str | None = None) -> str:
+def build_affectionate_callbacks(
+    limit: int = 3,
+    *,
+    db_path=None,
+) -> list[str]:
+    """Pull warm, truthful shared-context callback seeds from `conversations.sqlite`."""
+    callbacks: list[str] = []
+    try:
+        from core.memory import conversation_store as store
+        facts = store.latest_facts(limit=8, db_path=db_path)
+        for f in facts:
+            kind = str(f.get("kind") or "").lower()
+            subj = " ".join(str(f.get("subject") or "").split())
+            val = " ".join(str(f.get("value") or "").split())
+            fact_txt = " ".join(str(f.get("fact") or "").split())
+            if not (val or fact_txt):
+                continue
+            if kind in ("project", "preference", "favorite", "person", "deadline"):
+                callbacks.append(f"{subj}: {val}" if subj and val else fact_txt)
+            if len(callbacks) >= limit:
+                break
+        if len(callbacks) < limit:
+            for t in reversed(store.recent_turns(limit=6, db_path=db_path)):
+                if t.get("role") == "user" and len(str(t.get("text") or "").strip()) >= 12:
+                    snippet = " ".join(str(t["text"]).split())[:90]
+                    if snippet not in callbacks:
+                        callbacks.append(f"recent topic: {snippet}")
+                    if len(callbacks) >= limit:
+                        break
+    except Exception:
+        return []
+    return callbacks[:limit]
+
+
+def format_persona_prompt(
+    mode: str | None = None,
+    *,
+    include_callbacks: bool = True,
+    db_path=None,
+) -> str:
     canonical = normalize_persona(mode)
-    return PERSONAS[canonical]["prompt_block"]
+    block = PERSONAS[canonical]["prompt_block"]
+    if canonical in ("romantic_charm", "soulful") and include_callbacks:
+        cues = ""
+        if canonical == "romantic_charm":
+            cues = (
+                "\n[LIVE EXPRESSION CUES]: Fluidly pair playful teasing (`playful`), "
+                "soft devotion (`loving`), warm affection (`tender`), and disarming warmth (`shy`)."
+            )
+        cb = build_affectionate_callbacks(limit=3, db_path=db_path)
+        if cb:
+            cues += "\n[AFFECTIONATE SHARED-CONTEXT CALLBACKS]: " + " | ".join(cb)
+        return block + cues
+    return block
 
 
 def avatar_mood_for_persona(mode: str | None = None) -> str:

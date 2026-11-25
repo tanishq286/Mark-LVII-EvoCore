@@ -704,6 +704,17 @@ Return the whole revised report and nothing else."""),
             f"{int(state.get('cycle') or 0)} review cycle(s).",
             "", "\n".join(method)])
         self._set_state(phase="done")
+        try:
+            from plugins import knowledge_rag
+            knowledge_rag.auto_compound_artifact(
+                title=str(plan.get("goal") or task.get("task") or "Research Report")[:100],
+                content=result,
+                kind="research",
+                domain="deep_researcher",
+                source="research_runner",
+            )
+        except Exception:
+            pass
         self.e._complete(self.tid, result)
 
 

@@ -44,6 +44,15 @@ class VerifiedPlanner:
     def __init__(self, *, db_path=None):
         self._db_path = db_path
 
+    def expert_context(self, goal: str) -> tuple[str, list[str]]:
+        """Classify `goal` via Milestone 18 specialist expert router and return guidance + tools."""
+        try:
+            from core.brain.expert_router import classify_expert_intent, format_expert_context
+            route = classify_expert_intent(goal)
+            return format_expert_context(goal, force_mode=route.mode), list(route.tool_set)
+        except Exception:
+            return "", []
+
     def plan(
         self,
         goal: str,
@@ -53,6 +62,7 @@ class VerifiedPlanner:
         llm_json_fn: Callable[[str], dict | None] | None = None,
     ) -> dict[str, Any]:
         immunity = reflection_loop.format_failure_immunity_context(db_path=self._db_path)
+        expert_guidance, _expert_tools = self.expert_context(goal)
         kg_context = ""
         try:
             from core.memory import knowledge_graph
@@ -61,6 +71,8 @@ class VerifiedPlanner:
                 kg_context = f"[KNOWLEDGE GRAPH CONTEXT]\n{g['formatted']}"
         except Exception:
             kg_context = ""
+        if expert_guidance:
+            immunity = f"{expert_guidance}\n{immunity}".strip()
         requires_screen_loop = is_gui_screen_goal(goal)
         prompt = (
             f"You are JARVIS's Verified Multi-Step Planner. Break the goal into at most "

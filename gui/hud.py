@@ -381,6 +381,11 @@ class HudCanvas(QWidget):
         if self._goddess is not None and self.hud_style == "goddess":
             self._goddess.step(dt, amp, speaking=self.speaking, muted=self.muted,
                                state=self.state, v_open=v_open)
+            try:
+                if (not self.speaking) and (not self.muted) and self.state == "LISTENING":
+                    self._goddess.soul.note_user_voice(amp, state=self.state)
+            except Exception:
+                pass
         elif self._avatar is not None and self.hud_style == "face":
             self._avatar.step(dt, amp, speaking=self.speaking,
                               muted=self.muted, state=self.state,

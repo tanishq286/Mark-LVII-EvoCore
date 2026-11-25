@@ -259,6 +259,10 @@ class JarvisUI:
         GIL, so no signal/lock is needed for this cosmetic value."""
         try:
             self._win.hud.set_audio_level(level)
+            ov = getattr(self._win, "_avatar_overlay", None)
+            if ov is not None and hasattr(ov, "set_listening_level"):
+                if not getattr(self._win.hud, "speaking", False):
+                    ov.set_listening_level(level)
         except Exception:
             pass
 
@@ -306,6 +310,9 @@ class JarvisUI:
         """Thread-safe: explicitly set the avatar's felt mood."""
         try:
             self._win.hud.set_mood(mood, intensity, hold)
+            ov = getattr(self._win, "_avatar_overlay", None)
+            if ov is not None and hasattr(ov, "set_mood"):
+                ov.set_mood(mood)
         except Exception:
             pass
 
@@ -321,6 +328,12 @@ class JarvisUI:
 
     def set_state(self, state: str):
         self._win._state_sig.emit(state)
+        try:
+            ov = getattr(self._win, "_avatar_overlay", None)
+            if ov is not None and hasattr(ov, "set_state"):
+                ov.set_state(state)
+        except Exception:
+            pass
 
     def write_log(self, text: str):
         self._win._log_sig.emit(text)

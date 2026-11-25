@@ -692,7 +692,7 @@ def save_providers(mode: str = None, pipeline: dict = None, creds: dict = None,
 
 
 def get_persona_mode() -> str:
-    """Active communication persona ('precision', 'empathetic', or 'expressive')."""
+    """Active communication persona ('precision', 'empathetic', 'expressive', 'soulful', or 'romantic_charm')."""
     try:
         from core.persona import normalize_persona
         return normalize_persona(load_api_keys().get("persona_mode", "precision"))
@@ -706,6 +706,38 @@ def save_persona_mode(mode: str) -> str:
     canonical = normalize_persona(mode)
     _patch_config(persona_mode=canonical)
     return canonical
+
+
+_DEFAULT_PROACTIVE_SETTINGS: dict = {
+    "enabled": True,
+    "quiet_hours_start": "23:00",
+    "quiet_hours_end": "07:30",
+    "cooldown_minutes": 30,
+    "min_idle_minutes": 30,
+    "respect_privacy": True,
+}
+
+
+def get_proactive_settings() -> dict:
+    """Configurable respectful proactive check-in preferences & quiet hours."""
+    out = dict(_DEFAULT_PROACTIVE_SETTINGS)
+    try:
+        saved = load_api_keys().get("proactive_settings")
+        if isinstance(saved, dict):
+            out.update(saved)
+    except Exception:
+        pass
+    return out
+
+
+def save_proactive_settings(**kwargs) -> dict:
+    """Update and persist proactive check-in preferences & quiet hours cleanly."""
+    cur = get_proactive_settings()
+    for k, v in kwargs.items():
+        if k in _DEFAULT_PROACTIVE_SETTINGS and v is not None:
+            cur[k] = v
+    _patch_config(proactive_settings=cur)
+    return cur
 
 
 # ── Milestone 15: Chrome is JARVIS's default browser everywhere ─────────────

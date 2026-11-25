@@ -460,6 +460,10 @@ class HoloAvatar:
                 gap = 5.5 if thinking else 3.4
                 self._blink_at = t + gap + 3.1 * random.random()
 
+    def blink(self) -> None:
+        """Trigger an immediate natural blink cycle."""
+        self._blink_t = 0.0
+
     def glance(self, dx: float, dy: float, hold: float = 1.1) -> None:
         """Look deliberately somewhere for `hold` seconds, then wander again.
 

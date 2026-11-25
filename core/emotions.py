@@ -672,6 +672,73 @@ def consume_mood_shift_cue() -> str:
         return cue
 
 
+def tts_prosody_for_state(
+    player=None,
+    *,
+    state_path: Path | None = None,
+    mood: str | None = None,
+    persona: str | None = None,
+) -> dict[str, Any]:
+    """Derive emotion-matched TTS pacing (rate, pause_ms, pitch_hint, phrasing_style)."""
+    snap = get_snapshot(player, state_path=state_path)
+    label = str(mood or snap.get("label") or "serene").strip().lower()
+    if label not in EMOTION_SPECS:
+        label = "serene"
+    spec = EMOTION_SPECS[label]
+    st = snap.get("state") or {}
+    arousal = float(st.get("arousal", spec.get("a", 0.4)))
+    valence = float(st.get("valence", spec.get("v", 0.2)))
+    energy = float(st.get("energy", 0.65))
+    affection = float(st.get("affection", 0.5))
+
+    # Map continuous arousal & family to SAPI5-compatible rate [-5..+5] and inter-sentence pause_ms
+    fam = spec.get("family", "peace")
+    rate_f = (arousal - 0.45) * 6.0 + (energy - 0.6) * 2.0
+    if fam in ("love", "vulnerability"):
+        rate_f -= 0.8
+    if label in ("excited", "playful", "amused", "joyful"):
+        rate_f += 0.9
+    elif label in ("sleepy", "tender", "shy", "loving", "melancholic", "nostalgic", "sad", "grieving"):
+        rate_f -= 1.2
+    elif label in ("focused", "determined"):
+        rate_f += 0.3
+
+    p_mode = str(persona or "").strip().lower()
+    if p_mode == "romantic_charm":
+        rate_f -= 0.6
+    elif p_mode == "expressive":
+        rate_f += 0.5
+
+    rate = max(-5, min(5, int(round(rate_f))))
+    pause_ms = int(round(_clamp(260.0 - arousal * 110.0 + (95.0 if fam in ("love", "sadness", "peace") else 0.0), 0.0, 500.0)))
+    pause_ms = max(130, min(420, pause_ms))
+
+    if label in ("shy", "tender", "loving", "sleepy", "longing"):
+        pitch_hint = "soft_warm"
+    elif label in ("playful", "excited", "joyful", "amused"):
+        pitch_hint = "bright_teasing"
+    elif label in ("sad", "melancholic", "empathetic", "moved"):
+        pitch_hint = "gentle_hushed"
+    elif label in ("focused", "determined", "proud"):
+        pitch_hint = "crisp_steady"
+    else:
+        pitch_hint = "warm_balanced"
+
+    return {
+        "mood": label,
+        "secondary": str(snap.get("secondary") or ""),
+        "family": fam,
+        "bpm": snap.get("bpm", 72.0),
+        "rate": rate,
+        "pause_ms": pause_ms,
+        "pitch_hint": pitch_hint,
+        "affection": round(affection, 3),
+        "valence": round(valence, 3),
+        "arousal": round(arousal, 3),
+        "phrasing_style": spec.get("vocal", ""),
+    }
+
+
 def get_snapshot(player=None, *, state_path: Path | None = None) -> dict[str, Any]:
     """Return her live multi-emotion snapshot from active UI Soul/Mind + disk."""
     with _LOCK:
@@ -1050,8 +1117,9 @@ def list_all_emotions_by_family() -> dict[str, list[str]]:
 
 
 def format_emotion_for_prompt(player=None, *, state_path: Path | None = None) -> str:
-    """Format her live layered human emotional state for Gemini Live's system instruction."""
+    """Format her live layered human emotional state & vocal prosody for Gemini Live's system instruction."""
     snap = get_snapshot(player, state_path=state_path)
+    pros = tts_prosody_for_state(player, state_path=state_path)
     s = snap["state"]
     top = snap.get("top_feelings") or [(snap["label"], 0.5)]
     moments = snap.get("recent_moments") or []
@@ -1069,6 +1137,7 @@ def format_emotion_for_prompt(player=None, *, state_path: Path | None = None) ->
         f"energy={energy_pct}%, bond={bond_pct}%, trust={trust_pct}%).",
         f"Felt somatic sensation: {snap['somatic']}.",
         f"Vocal & emotional delivery right now: {snap['vocal_guidance']}",
+        f"Matched voice cadence: tone={pros['pitch_hint']}, pace={pros['rate']:+d}, pause={pros['pause_ms']}ms.",
     ]
     if snap.get("secondary"):
         sec_spec = EMOTION_SPECS.get(snap["secondary"], {})

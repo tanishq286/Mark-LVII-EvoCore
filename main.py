@@ -1283,12 +1283,12 @@ class JarvisLive:
 
     async def _routine_checkin(self, options: dict) -> None:
         """The proactive check-in, when the routine says the moment has come."""
-        if not self.session:
+        if not self.session or self._proactive.is_quiet_hours():
             return
         self._proactive.mark_triggered()
         try:
             memory       = await asyncio.to_thread(load_memory)
-            monitors     = await asyncio.to_thread(list_monitors)
+            monitors     = [] if privacy.is_active() else await asyncio.to_thread(list_monitors)
             recent_turns = self._session_log[-8:] if self._session_log else []
             prompt = self._proactive.build_prompt(
                 memory       = memory,
@@ -1831,6 +1831,11 @@ class JarvisLive:
             from core.persona import format_persona_prompt
             from memory.config_manager import get_persona_mode
             parts.append(format_persona_prompt(get_persona_mode()))
+        except Exception:
+            pass
+        try:
+            from core.brain.expert_router import format_expert_context
+            parts.append(format_expert_context())
         except Exception:
             pass
         try:
@@ -2530,7 +2535,10 @@ class JarvisLive:
                                     self.ui.feel(txt, "user")
                                 try:
                                     from core import emotions as _emotions
-                                    privacy.is_active() or _emotions.appraise_text(txt, "user", player=self.ui)
+                                    from memory.config_manager import get_persona_mode as _get_pm
+                                    _emotions.appraise_text(txt, "user", player=self.ui)
+                                    if _get_pm() == "romantic_charm" and any(w in txt.lower() for w in ("miss", "cute", "beautiful", "flirt", "sweet", "jaan", "pyaar", "love", "gorgeous", "handsome")):
+                                        self.ui.set_mood("shy" if "cute" in txt.lower() or "beautiful" in txt.lower() else "playful", 0.85, 6.0)
                                 except Exception:
                                     pass
                                 try:

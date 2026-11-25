@@ -477,6 +477,19 @@ class TaskEngine:
             report = str(self._write_report(task, result))
         except Exception as e:
             self._log(f"[Tasks] report for {tid} could not be written: {e}")
+        if len(str(result or "").strip()) >= 80:
+            try:
+                from plugins import knowledge_rag
+                agent_kind = str(task.get("agent") or "general")
+                knowledge_rag.auto_compound_artifact(
+                    title=str(task.get("title") or task.get("task") or tid)[:100],
+                    content=str(result),
+                    kind="research" if agent_kind == "research" else "solved_task",
+                    domain=agent_kind,
+                    source="task_engine",
+                )
+            except Exception:
+                pass
         self._finish(tid, "done", result=result[:_RESULT_CAP], report=report)
 
     def _write_report(self, task: dict, result: str) -> Path:
