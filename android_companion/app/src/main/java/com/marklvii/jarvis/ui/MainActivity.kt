@@ -1,10 +1,15 @@
 package com.marklvii.jarvis.ui
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.graphics.BitmapFactory
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -12,9 +17,12 @@ import android.speech.tts.TextToSpeech
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -36,6 +44,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -45,12 +54,19 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.marklvii.jarvis.core.AndroidResult
+import com.marklvii.jarvis.core.HudChoicePrompt
+import com.marklvii.jarvis.core.HudConfirmPrompt
 import com.marklvii.jarvis.core.JarvisWebSocketClient
+import com.marklvii.jarvis.core.PairingQrPayload
 import com.marklvii.jarvis.core.PcToAndroidCommand
 import com.marklvii.jarvis.core.PrivacyConfig
 import com.marklvii.jarvis.modules.antitheft.AntiTheftGuardService
@@ -61,7 +77,12 @@ import com.marklvii.jarvis.modules.sos.EmergencySosManager
 import com.marklvii.jarvis.modules.toggles.MobileToggleManager
 import com.marklvii.jarvis.modules.vision.ScreenVisionScrollService
 import com.marklvii.jarvis.modules.wakeword.WakeWordVoiceService
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.util.Locale
 
@@ -72,9 +93,13 @@ class MainActivity : ComponentActivity() {
     private lateinit var cameraController: VoiceCameraController
     private var tts: TextToSpeech? = null
     private lateinit var wsClient: JarvisWebSocketClient
+    private var pttJob: Job? = null
 
     private val statusState = mutableStateOf("OFFLINE")
-    private val logsState = mutableStateListOf("Ready for LAN pairing or offline local mode.")
+    private val logsState = mutableStateListOf("Ready for 1-tap HTTPS QR pairing or offline local mode.")
+    private val missionLogsState = mutableStateListOf("Waiting for Brain / Swarm / Mission stream…")
+    private val confirmPromptState = mutableStateOf<HudConfirmPrompt?>(null)
+    private val choicePromptState = mutableStateOf<HudChoicePrompt?>(null)
 
     private val permLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -95,6 +120,9 @@ class MainActivity : ComponentActivity() {
         wsClient = JarvisWebSocketClient(
             onStatus = { s -> runOnUiThread { statusState.value = s } },
             onLog = { line -> appendLog(line) },
+            onMissionLog = { line -> appendMissionLog(line) },
+            onConfirmPrompt = { p -> runOnUiThread { confirmPromptState.value = p } },
+            onChoicePrompt = { p -> runOnUiThread { choicePromptState.value = p } },
             onPcCommand = { cmd -> handlePcCommand(cmd) }
         ).apply {
             telemetryProvider = {
@@ -150,6 +178,59 @@ class MainActivity : ComponentActivity() {
         runOnUiThread {
             logsState.add(0, msg)
             if (logsState.size > 40) logsState.removeAt(logsState.lastIndex)
+        }
+    }
+
+    private fun appendMissionLog(msg: String) {
+        runOnUiThread {
+            if (missionLogsState.firstOrNull()?.startsWith("Waiting for") == true) {
+                missionLogsState.clear()
+            }
+            missionLogsState.add(0, msg)
+            if (missionLogsState.size > 50) missionLogsState.removeAt(missionLogsState.lastIndex)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun togglePushToTalk(active: Boolean, scope: kotlinx.coroutines.CoroutineScope) {
+        if (!active) {
+            pttJob?.cancel()
+            pttJob = null
+            wsClient.closePhoneAudioSocket()
+            return
+        }
+        if (!wsClient.openPhoneAudioSocket()) {
+            appendLog("Pair first before streaming push-to-talk audio.")
+            return
+        }
+        pttJob?.cancel()
+        pttJob = scope.launch(Dispatchers.IO) {
+            val rate = 16000
+            val minBuf = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            val bufSize = maxOf(minBuf, 2048)
+            val recorder = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                rate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufSize
+            )
+            val buf = ByteArray(2048)
+            try {
+                recorder.startRecording()
+                while (isActive) {
+                    val read = recorder.read(buf, 0, buf.size)
+                    if (read > 0) {
+                        wsClient.sendPhoneAudioPcm16(buf.copyOf(read))
+                    }
+                }
+            } catch (e: Exception) {
+                appendLog("PTT mic error: ${e.message}")
+            } finally {
+                try { recorder.stop() } catch (_: Exception) {}
+                recorder.release()
+                wsClient.closePhoneAudioSocket()
+            }
         }
     }
 
@@ -241,13 +322,32 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun CompanionScreen() {
         val scope = rememberCoroutineScope()
-        var serverUrl by remember { mutableStateOf("http://192.168.1.100:8000") }
+        var serverUrl by remember { mutableStateOf("https://172.16.6.143:8000") }
         var pin by remember { mutableStateOf("") }
         var certPin by remember { mutableStateOf("") }
+        var qrRaw by remember { mutableStateOf("") }
         var cmdText by remember { mutableStateOf("") }
+        var remoteTypeText by remember { mutableStateOf("") }
+        var screenStreaming by remember { mutableStateOf(false) }
+        var screenBitmap by remember { mutableStateOf<ImageBitmap?>(null) }
+        var pttStreaming by remember { mutableStateOf(false) }
         var privacyOn by remember { mutableStateOf(PrivacyConfig.onDeviceOnly) }
         var wakeOn by remember { mutableStateOf(WakeWordVoiceService.isListening) }
         var antiTheftOn by remember { mutableStateOf(AntiTheftGuardService.isArmed) }
+
+        val activeConfirm = confirmPromptState.value
+        val activeChoice = choicePromptState.value
+
+        LaunchedEffect(screenStreaming, statusState.value) {
+            while (screenStreaming && statusState.value == "CONNECTED") {
+                val bytes = withContext(Dispatchers.IO) { wsClient.fetchScreenFrameBytes() }
+                if (bytes != null && bytes.isNotEmpty()) {
+                    val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    if (bmp != null) screenBitmap = bmp.asImageBitmap()
+                }
+                delay(900)
+            }
+        }
 
         Column(
             modifier = Modifier
@@ -263,11 +363,11 @@ class MainActivity : ComponentActivity() {
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    "MARK-LVII MAX",
+                    "MARK-LVII OMNICORE",
                     color = Color(0xFF00D4FF),
                     fontSize = 18.sp,
                     fontWeight = FontWeight.Bold,
-                    letterSpacing = 3.sp
+                    letterSpacing = 2.5.sp
                 )
                 Text(
                     statusState.value,
@@ -277,13 +377,76 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
+            // (c) 1-Tap Remote HUD Approval Banner (CONFIRM & ChoiceBanner)
+            if (activeConfirm != null) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF220B05)),
+                    modifier = Modifier.fillMaxWidth().border(2.dp, Color(0xFFFF6B00), RoundedCornerShape(12.dp))
+                ) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("⚠ HUD CONFIRMATION REQUIRED", color = Color(0xFFFF6B00), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        Text(activeConfirm.title, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        if (activeConfirm.detail.isNotBlank()) {
+                            Text(activeConfirm.detail, fontSize = 12.sp, color = Color(0xFFCBD5E1))
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                            Button(
+                                onClick = { wsClient.resolveHudConfirm(true) },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00FF88)),
+                                modifier = Modifier.weight(1f)
+                            ) { Text("CONFIRM", color = Color(0xFF041017), fontWeight = FontWeight.Bold) }
+                            OutlinedButton(
+                                onClick = { wsClient.resolveHudConfirm(false) },
+                                modifier = Modifier.weight(1f)
+                            ) { Text("CANCEL") }
+                        }
+                    }
+                }
+            }
+
+            if (activeChoice != null) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF081826)),
+                    modifier = Modifier.fillMaxWidth().border(2.dp, Color(0xFF00D4FF), RoundedCornerShape(12.dp))
+                ) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("◆ HUD CHOICE BANNER", color = Color(0xFF00D4FF), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        Text(activeChoice.title, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        activeChoice.options.forEachIndexed { idx, opt ->
+                            OutlinedButton(
+                                onClick = { wsClient.resolveHudChoice(idx) },
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text("${idx + 1}. $opt") }
+                        }
+                        OutlinedButton(
+                            onClick = { wsClient.resolveHudChoice(null) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("Cancel Choice") }
+                    }
+                }
+            }
+
+            // 1-Tap QR / HTTPS Pairing Card
             Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF0E1621))) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("PC <-> ANDROID BRIDGE", color = Color(0xFF00D4FF), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    Text("1-TAP HTTPS PAIRING & TLS PIN", color = Color(0xFF00D4FF), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    OutlinedTextField(
+                        value = qrRaw,
+                        onValueChange = { raw ->
+                            qrRaw = raw
+                            PairingQrPayload.parse(raw)?.let { parsed ->
+                                serverUrl = parsed.baseUrl
+                                if (parsed.pin.isNotBlank()) pin = parsed.pin
+                                if (parsed.certSha256.isNotBlank()) certPin = parsed.certSha256
+                            }
+                        },
+                        label = { Text("Paste Scanned QR Link or JSON (1-Tap Auto-Fill)") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
                     OutlinedTextField(
                         value = serverUrl,
                         onValueChange = { serverUrl = it },
-                        label = { Text("Dashboard URL (http/https LAN IP)") },
+                        label = { Text("HTTPS LAN / Tailscale / Tunnel URL") },
                         modifier = Modifier.fillMaxWidth()
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -296,7 +459,7 @@ class MainActivity : ComponentActivity() {
                         OutlinedTextField(
                             value = certPin,
                             onValueChange = { certPin = it },
-                            label = { Text("TLS SHA-256 Pin (Opt)") },
+                            label = { Text("TLS SHA-256 Pin") },
                             modifier = Modifier.weight(1f)
                         )
                     }
@@ -319,15 +482,125 @@ class MainActivity : ComponentActivity() {
                                 deviceName = Build.MODEL ?: "Android Phone",
                                 deviceModel = "${Build.MANUFACTURER} ${Build.MODEL}",
                                 androidVersion = Build.VERSION.RELEASE ?: "Android",
-                                capabilities = listOf("anti_theft", "wakeword", "whatsapp", "toggles", "accessibility_vision", "sos", "camerax"),
+                                capabilities = listOf("anti_theft", "wakeword", "whatsapp", "toggles", "accessibility_vision", "sos", "camerax", "screen_remote", "hud_confirm", "ptt_voice"),
                                 certSha256 = certPin
                             )
                         },
                         modifier = Modifier.fillMaxWidth()
-                    ) { Text("Pair & Connect") }
+                    ) { Text("Pair & Connect (HTTPS Pinned)") }
                 }
             }
 
+            // (a) Live PC Screen Viewer + Remote Tap / Type
+            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF0E1621))) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("LIVE PC SCREEN + TAP/TYPE", color = Color(0xFF00D4FF), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        OutlinedButton(onClick = { screenStreaming = !screenStreaming }) {
+                            Text(if (screenStreaming) "Stop Stream" else "Live Stream")
+                        }
+                    }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(190.dp)
+                            .background(Color(0xFF03060B), RoundedCornerShape(8.dp))
+                            .border(1.dp, Color(0xFF1A3A4A), RoundedCornerShape(8.dp)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        val bmp = screenBitmap
+                        if (bmp != null) {
+                            Image(
+                                bitmap = bmp,
+                                contentDescription = "Live PC Screen",
+                                contentScale = ContentScale.FillBounds,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .pointerInput(Unit) {
+                                        detectTapGestures(
+                                            onTap = { offset ->
+                                                if (size.width > 0 && size.height > 0) {
+                                                    wsClient.sendScreenTap(offset.x / size.width, offset.y / size.height, "tap")
+                                                }
+                                            },
+                                            onDoubleTap = { offset ->
+                                                if (size.width > 0 && size.height > 0) {
+                                                    wsClient.sendScreenTap(offset.x / size.width, offset.y / size.height, "double_click")
+                                                }
+                                            }
+                                        )
+                                    }
+                            )
+                        } else {
+                            Text("Tap 'Live Stream' when connected to view & tap PC", fontSize = 12.sp, color = Color(0xFF7291A6))
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        OutlinedTextField(
+                            value = remoteTypeText,
+                            onValueChange = { remoteTypeText = it },
+                            label = { Text("Type onto PC window") },
+                            modifier = Modifier.weight(1f)
+                        )
+                        Button(onClick = {
+                            if (remoteTypeText.isNotEmpty()) {
+                                wsClient.sendScreenText(remoteTypeText)
+                                remoteTypeText = ""
+                            }
+                        }) { Text("Type") }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                        OutlinedButton(onClick = { wsClient.sendScreenKey("enter") }, modifier = Modifier.weight(1f)) { Text("Enter") }
+                        OutlinedButton(onClick = { wsClient.sendScreenKey("escape") }, modifier = Modifier.weight(1f)) { Text("ESC") }
+                        OutlinedButton(onClick = { wsClient.sendScreenKey("tab") }, modifier = Modifier.weight(1f)) { Text("Tab") }
+                    }
+                }
+            }
+
+            // (b) Push-to-Talk Voice + Mission Command
+            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF0E1621))) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("PUSH-TO-TALK VOICE & COMMAND", color = Color(0xFF00D4FF), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    Button(
+                        onClick = {
+                            pttStreaming = !pttStreaming
+                            togglePushToTalk(pttStreaming, scope)
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (pttStreaming) Color(0xFFFF3355) else Color(0xFF00D4FF)
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            if (pttStreaming) "🔴 STOP LIVE MIC STREAM" else "🎙 PUSH-TO-TALK (16kHz LIVE MIC)",
+                            color = if (pttStreaming) Color.White else Color(0xFF041017),
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    OutlinedTextField(
+                        value = cmdText,
+                        onValueChange = { cmdText = it },
+                        label = { Text("Command or Multi-Agent Swarm Goal") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Button(
+                        onClick = {
+                            if (cmdText.isNotBlank()) {
+                                wsClient.sendCommandText(cmdText)
+                                appendMissionLog("YOU: $cmdText")
+                                cmdText = ""
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Send Encrypted Command") }
+                }
+            }
+
+            // 7/7 MAX Modules Card
             Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF0E1621))) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("7/7 ANDROID MAX MODULES", color = Color(0xFF00D4FF), fontWeight = FontWeight.Bold, fontSize = 12.sp)
@@ -396,27 +669,21 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF0E1621))) {
-                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(
-                        value = cmdText,
-                        onValueChange = { cmdText = it },
-                        label = { Text("Command to Windows JARVIS") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Button(
-                        onClick = {
-                            if (cmdText.isNotBlank()) {
-                                wsClient.sendCommandText(cmdText)
-                                appendLog("TO PC: $cmdText")
-                                cmdText = ""
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("Send Command") }
+            // Live Mission Log Stream
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, Color(0xFF1A3A4A), RoundedCornerShape(10.dp))
+                    .padding(10.dp)
+            ) {
+                Text("LIVE MISSION & SWARM STREAM", color = Color(0xFF00D4FF), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(4.dp))
+                missionLogsState.take(12).forEach { item ->
+                    Text(item, fontFamily = FontFamily.Monospace, fontSize = 11.sp, color = Color(0xFF9DE8FF))
                 }
             }
 
+            // Telemetry Log
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -425,7 +692,7 @@ class MainActivity : ComponentActivity() {
             ) {
                 Text("TELEMETRY LOG", color = Color(0xFF5AB8CC), fontSize = 11.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(4.dp))
-                logsState.take(10).forEach { item ->
+                logsState.take(8).forEach { item ->
                     Text(item, fontFamily = FontFamily.Monospace, fontSize = 11.sp, color = Color(0xFFBCEFFF))
                 }
             }
@@ -433,6 +700,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        pttJob?.cancel()
+        wsClient.closePhoneAudioSocket()
         tts?.shutdown()
         super.onDestroy()
     }

@@ -53,6 +53,14 @@ class VerifiedPlanner:
         llm_json_fn: Callable[[str], dict | None] | None = None,
     ) -> dict[str, Any]:
         immunity = reflection_loop.format_failure_immunity_context(db_path=self._db_path)
+        kg_context = ""
+        try:
+            from core.memory import knowledge_graph
+            g = knowledge_graph.query_graph(goal, max_hops=2, top_k=5)
+            if g.get("nodes"):
+                kg_context = f"[KNOWLEDGE GRAPH CONTEXT]\n{g['formatted']}"
+        except Exception:
+            kg_context = ""
         requires_screen_loop = is_gui_screen_goal(goal)
         prompt = (
             f"You are JARVIS's Verified Multi-Step Planner. Break the goal into at most "
@@ -63,6 +71,7 @@ class VerifiedPlanner:
             "the user to pick an option first, set `ambiguous: true` and provide 2-4 concise `options`.\n"
             f"For risky/uncertain steps, specify `fallback_tool` and `fallback_parameters`.\n\n"
             + (f"{immunity}\n\n" if immunity else "")
+            + (f"{kg_context}\n\n" if kg_context else "")
             + f"Goal: {goal}\n\n"
             f"Available tools:\n{catalog_text or '(standard tools)'}\n\n"
             "Return ONLY valid JSON:\n"

@@ -718,8 +718,11 @@ def start_daemon(player=None, interval_s: float = 180.0) -> None:
             if (now - last_reflection_at) >= 3600.0:
                 last_reflection_at = now
                 try:
-                    from core.evolution import reflection_loop
+                    from core.evolution import meta_optimizer, reflection_loop
+                    from core.memory import knowledge_graph
+                    knowledge_graph.consolidate_graph()
                     reflection_loop.run_reflection_cycle(_BASE, consolidate_rag=True)
+                    meta_optimizer.run_idle_optimization(_BASE, min_idle_seconds=180.0)
                 except Exception as e:
                     print(f"[AutoEvolution] reflection cycle error: {e}")
 

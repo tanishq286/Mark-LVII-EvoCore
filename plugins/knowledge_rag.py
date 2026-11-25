@@ -28,35 +28,55 @@ import numpy as np
 PLUGIN = {
     "name": "knowledge_rag",
     "description": (
-        "100% free local semantic knowledge vault over the git-ignored `knowledge/` folder, "
-        "powered by local Ollama `nomic-embed-text:latest`, SQLite, and NumPy. "
-        "Call with mode='index' to incrementally index or refresh documents in `knowledge/` "
-        "(.md, .txt, .py, .json, .csv, .pdf) using SHA-256 change detection; "
-        "mode='search' (with query and optional top_k) to retrieve semantically matching "
-        "excerpts with exact `knowledge/<file>:L<start>-L<end>` citations wrapped as untrusted data; "
-        "mode='consolidate' to deduplicate near-identical chunks and prune orphans cleanly; "
-        "mode='stats' (default) to inspect indexed files, chunks, DB size, and embedding model health. "
-        "Use this when the user asks to search their personal notes, docs, PDFs, or local knowledge vault."
+        "100% free local semantic knowledge vault + SQLite Entity-Relation Knowledge Graph over "
+        "the git-ignored `knowledge/` folder and multi-week conversation memory, powered by local "
+        "Ollama `nomic-embed-text:latest`, SQLite WAL, and NumPy. "
+        "Modes: 'index' = incrementally index/refresh docs in `knowledge/`; "
+        "'search' = semantic chunk retrieval + multi-hop Entity-Relation Graph context wrapped as untrusted data; "
+        "'consolidate' = deduplicate RAG chunks and consolidate alias entities/edges in the Knowledge Graph; "
+        "'graph_query' = multi-hop relational reasoning across people, projects, file paths, preferences, "
+        "recurring tasks, and past outcomes; "
+        "'graph_ingest' = record a conversation note/observation into the Entity-Relation Graph; "
+        "'graph_stats' / 'stats' (default) = inspect vault & Knowledge Graph health."
     ),
     "brief": (
-        "Search, consolidate, or incrementally index private docs in `knowledge/` via local Ollama "
-        "nomic-embed-text (mode='search'|'index'|'consolidate'|'stats', query, top_k)."
+        "Search or index local `knowledge/` docs and multi-hop Entity-Relation Knowledge Graph "
+        "(mode='search'|'index'|'consolidate'|'graph_query'|'graph_ingest'|'graph_stats'|'stats')."
     ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "mode": {
                 "type": "STRING",
-                "enum": ["stats", "search", "index", "consolidate"],
-                "description": "'stats' (default), 'search' (semantic retrieval), 'index' (incremental SHA-256 sync), or 'consolidate' (dedupe/prune index).",
+                "enum": [
+                    "stats",
+                    "search",
+                    "index",
+                    "consolidate",
+                    "graph_query",
+                    "graph_ingest",
+                    "graph_stats",
+                ],
+                "description": (
+                    "'stats' (default), 'search' (hybrid RAG + graph), 'index', 'consolidate', "
+                    "'graph_query' (multi-hop entity-relation lookup), 'graph_ingest', or 'graph_stats'."
+                ),
             },
             "query": {
                 "type": "STRING",
-                "description": "Natural-language search query (required when mode='search').",
+                "description": "Natural-language search query or observation text (for search/graph_query/graph_ingest).",
             },
             "top_k": {
                 "type": "INTEGER",
-                "description": "Number of top matching chunks to return for mode='search' (1-10, default 5).",
+                "description": "Number of top matching items to return (1-10, default 5).",
+            },
+            "max_hops": {
+                "type": "INTEGER",
+                "description": "Maximum relational hops for graph_query (1-3, default 2).",
+            },
+            "entity_type": {
+                "type": "STRING",
+                "description": "Optional entity_type filter (person, project, file_path, preference, recurring_task, past_outcome).",
             },
         },
         "required": [],
@@ -654,6 +674,12 @@ def consolidate_vault(
         finally:
             conn.close()
 
+    if vault_dir is None:
+        try:
+            from core.memory import knowledge_graph
+            summary["graph_consolidation"] = knowledge_graph.consolidate_graph()
+        except Exception as exc:
+            summary["graph_consolidation"] = {"error": str(exc)}
     return summary
 
 
@@ -693,7 +719,25 @@ def _handle_search(query: str, top_k: int, player=None, vault_dir: Path | None =
         return msg
 
     hits = search_vault(q, top_k=top_k, vault_dir=vault_dir)
+    graph_ctx = ""
+    if vault_dir is None:
+        try:
+            from core.memory import knowledge_graph
+            gres = knowledge_graph.query_graph(q, max_hops=2, top_k=max(3, top_k))
+            if gres.get("nodes"):
+                graph_ctx = str(gres.get("formatted") or "").strip()
+        except Exception:
+            graph_ctx = ""
+
     if not hits:
+        if graph_ctx:
+            from core import outcome
+            wrapped_g = outcome.untrusted("knowledge_rag", f"[ENTITY-RELATION GRAPH]\n{graph_ctx}")
+            msg = (
+                f"No indexed knowledge chunks found for '{q}', but matched Entity-Relation Knowledge Graph context:\n{wrapped_g}"
+            )
+            _notify_hud(player, f"Matched Knowledge Graph context for '{q}'.", "KNOWLEDGE GRAPH SEARCH", graph_ctx)
+            return msg
         msg = (
             f"No indexed knowledge chunks found for '{q}'. "
             "Drop documents into knowledge/ and run knowledge_rag(mode='index') first."
@@ -704,6 +748,8 @@ def _handle_search(query: str, top_k: int, player=None, vault_dir: Path | None =
     blocks: list[str] = []
     for rank, h in enumerate(hits, 1):
         blocks.append(f"[{rank}] {h['citation']} (score={h['score']:.3f})\n{h['text']}")
+    if graph_ctx:
+        blocks.append(f"[ENTITY-RELATION GRAPH]\n{graph_ctx}")
     raw_body = "\n\n---\n\n".join(blocks)
 
     from core import outcome
@@ -778,8 +824,55 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             except (TypeError, ValueError):
                 top_k = 5
             return _handle_search(query, top_k, player=player)
+        if mode == "graph_query":
+            from core import outcome
+            from core.memory import knowledge_graph
+            query = str(params.get("query") or "").strip()
+            etype = str(params.get("entity_type") or "").strip()
+            hops = int(params.get("max_hops") or 2)
+            top_k = int(params.get("top_k") or 8)
+            res = knowledge_graph.query_graph(query, max_hops=hops, top_k=top_k, entity_type=etype)
+            if not res.get("nodes"):
+                msg = f"No Entity-Relation Knowledge Graph matches found for '{query}'."
+                _notify_hud(player, msg)
+                return msg
+            wrapped = outcome.untrusted("knowledge_graph", res["formatted"])
+            _notify_hud(
+                player,
+                f"Knowledge Graph matched {len(res['nodes'])} node(s) and {len(res['edges'])} relation(s).",
+                "KNOWLEDGE GRAPH",
+                res["formatted"],
+            )
+            return (
+                f"Knowledge Graph subgraph ({len(res['nodes'])} entities, {len(res['edges'])} relations):\n{wrapped}"
+            )
+        if mode == "graph_ingest":
+            from core.memory import knowledge_graph
+            text = str(params.get("query") or "").strip()
+            if not text:
+                return "Sir, provide non-empty 'query' text for mode='graph_ingest'."
+            ing = knowledge_graph.ingest_conversation_turn(text)
+            msg = (
+                f"Ingested into Knowledge Graph: {ing['entities_touched']} entity/entities, "
+                f"{ing['relations_touched']} relation(s)."
+            )
+            _notify_hud(player, msg)
+            return msg
+        if mode == "graph_stats":
+            from core.memory import knowledge_graph
+            gst = knowledge_graph.graph_stats()
+            msg = (
+                f"Knowledge Graph stats: {gst['total_entities']} entities, "
+                f"{gst['total_relations']} relations, {gst['total_observations']} observations "
+                f"(by_type={gst['by_type']})."
+            )
+            _notify_hud(player, msg, "KNOWLEDGE GRAPH STATS", msg)
+            return msg
 
-        msg = f"Sir, unknown knowledge_rag mode '{mode}'. Use 'stats', 'index', 'consolidate', or 'search'."
+        msg = (
+            f"Sir, unknown knowledge_rag mode '{mode}'. "
+            "Use 'stats', 'index', 'consolidate', 'search', 'graph_query', 'graph_ingest', or 'graph_stats'."
+        )
         _notify_hud(player, msg)
         return msg
     except Exception as exc:

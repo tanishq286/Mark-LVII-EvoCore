@@ -1,15 +1,15 @@
-# Mark-LVII EvoCore Upgrade Progress
+# Mark-LVII EvoCore & OmniCore Upgrade Progress
 
-- **Active Milestone:** **Milestone 13 — Closed-Loop Autonomous Screen Agent (`Observe -> Verify -> Act -> Re-Observe`) Verified & Ready for Review**
-- **Current Branch:** `milestone/13-autonomous-screen-loop` (`53aa8e3`, branched off `main` `54d60bc`, tagged `v12-evocore-10of10`)
-- **Base `main` Commit (Untouched):** `54d60bc` (`v12-evocore-10of10`)
+- **Active Milestone:** **Milestone 14 — Phone Remote HTTPS Supercharge & Mark-LVII OmniCore (Multi-Agent Swarm, Persistent Missions, Entity-Relation Knowledge Graph, Meta-Optimizer & Universal MCP Bridge) Verified & Ready for Review**
+- **Current Branch:** `milestone/14-omnicore-phone-fix` (branched off `main` `816a95c`, leaving concurrent local UI/goddess working-tree edits intact)
+- **Base `main` Commit (Untouched):** `816a95c`
 - **Test Runners Installed:**
   - `pytest 9.2.0` (`C:\Users\tanis\AppData\Local\Python\pythoncore-3.13-64\python.exe`)
   - OpenJDK 17 (`EclipseAdoptium.Temurin.17.JDK`), Gradle `8.10.2`, Android SDK `android-35` + `build-tools 34.0.0/35.0.0` + `adb`
 
 ---
 
-## Final Modules + 5/5 Evolution Engines Completion Scorecard
+## Final Modules + OmniCore Evolution Engines Completion Scorecard
 
 | Track | Target | Verified Implementation | Status |
 | :--- | :--- | :--- | :--- |
@@ -18,6 +18,51 @@
 | **Milestone 11: Windows Desktop Parity** | 41 / 41 | Biometric Voice Lock, Cron SQLite Routines, Network Speed/IP, `system_cleaner`, Spotify, MediaPipe Gestures, Auto-Scroll & Notepad Dictation, `.pptx` Decks, Scraper + Price Comparator, Website & Image Generators, `office_suite` (Excel/PDF/Convert), Email SMTP/IMAP, WhatsApp Media/Calls, Dev Workspace + Profiles, AES Form Filler, YouTube Whisper Fallback, Market Finance, 2D Avatar Overlay (8 Gestures) | **41 / 41 COMPLETE** |
 | **Milestone 12: Android MAX Companion & PC Bridge** | 7 / 7 | Setup Pre-Flight (`setup_android_env.ps1`), Bidirectional TLS `/ws` Bridge + Instant PWA (`/pwa`), `android_bridge` Plugin, Native Kotlin App (`AntiTheftGuardService`, `WakeWordVoiceService`, `WhatsAppAndCallController`, `MobileToggleManager`, `ScreenVisionScrollService`, `EmergencySosManager`, `VoiceCameraController`) + On-Device Privacy Mode | **7 / 7 COMPLETE** |
 | **Milestone 13: Closed-Loop Autonomous Screen Agent** | 2 / 2 | Hybrid UIA + Vision/OCR Grounding (`core/evolution/screen_agent.py`), Post-Action Settle Polling (up to 3s), Stuck-State Recovery + `ChoiceBanner` Fallback, Multi-Step Wiring (`planner.py`, `autonomous_brain.py`, `plugins/autonomous_screen_agent.py`, `main.py`), `CONFIRM`/`LOCKED` Irreversible Gate, ESC / Corner / `"Jarvis stop"` Kill-Switches, Step Telemetry for `habit_compiler.py` | **COMPLETE** |
+| **Milestone 14: Phone HTTPS Fix & Mark-LVII OmniCore** | 6 / 6 | LAN Wi-Fi + SAN HTTPS `:8000` + QR Pairing + 4G/5G Tunnel + Live Screen/Voice/1-Tap Approval (`dashboard/server.py`, `pwa.html`, `android_companion/`), Parallel Multi-Agent Swarm + Critic (`core/evolution/swarm.py`), Persistent SQLite Missions (`core/evolution/mission_runner.py`), Entity-Relation Knowledge Graph (`core/memory/knowledge_graph.py`), Idle Meta-Optimizer (`core/evolution/meta_optimizer.py`), Universal MCP Client Bridge (`core/mcp_client.py`, `plugins/mcp_bridge.py`) | **6 / 6 COMPLETE** |
+
+---
+
+## Milestone 14 — Phone Remote HTTPS Supercharge & Mark-LVII OmniCore
+
+### Part 1: Phone Remote Root-Cause Fix & Supercharge (`scripts/fix_phone_remote.ps1`, `dashboard/server.py`, `dashboard/static/pwa.html`, `gui/overlays.py`, `android_companion/`)
+- **Root-Cause Network & TLS Fix:**
+  - `detect_lan_ipv4()` filters virtual switches (`WSL`, `vEthernet`, `Hyper-V`, `Docker`, `VMware`, `Tailscale`, `Bluetooth`) by adapter name rather than IP prefix, resolving the active Windows Wi-Fi IPv4 (`172.16.6.143` on Private profile) instead of virtual adapters.
+  - `DashboardServer` now binds **`0.0.0.0:8000` over HTTPS/TLS by default**, auto-generating/refreshing git-ignored `memory/certs/{jarvis.crt,jarvis.key}` with `SubjectAlternativeName` entries covering `DNS:localhost`, `IP:127.0.0.1`, the real Wi-Fi/Ethernet LAN IPv4 (`IP:172.16.6.143`), and any active Tailscale IP, plus an optional HTTP->HTTPS redirector on `:8001`.
+  - Added `scripts/fix_phone_remote.ps1` to verify the active LAN adapter, Windows Defender Firewall TCP 8000 Private/Domain allow rules, SAN TLS certificates, Tailscale/Cloudflare tunnel status, and live HTTPS endpoint reachability.
+- **1-Tap QR Pairing & 4G/5G Anywhere Control:**
+  - Added `/api/android/qr` and `/api/android/tunnel` (`detect_tailscale()`, `start_quick_tunnel()` / `stop_quick_tunnel()` via `cloudflared`), plus upgraded `RemoteKeyOverlay` in `gui/overlays.py` with 1-tap pairing URLs (`https://172.16.6.143:8000/pwa?pin=<PIN>&fp=<SHA256>`), TLS SHA-256 display, and a `4G TUNNEL` toggle.
+- **Supercharged `/pwa` & Native Kotlin Companion (`android_companion/`):**
+  - **Live PC Screen Stream + Remote Tap/Type:** `/api/screen/frame`, `/api/screen/input`, and `/ws` `screen_frame_req` / `screen_input` with normalized coordinate mapping (`nx`/`ny` & `norm_x`/`norm_y`), double-tap, right-click, and remote keyboard input.
+  - **Push-to-Talk Voice + Live Mission Stream:** WebAudio / `AudioRecord` 16 kHz PCM16 streaming over `wss://<host>:8000/ws/phone-audio` (auto-waking sleeping Jarvis) alongside `/api/missions/live` real-time Brain/Swarm/MissionRunner log streaming.
+  - **1-Tap Remote HUD Approvals:** `/api/confirm/pending` and `/api/confirm/resolve` (+ `main.py` `broadcast_hud_prompt` hooks) surface Mark-LVII's `CONFIRM` and `ChoiceBanner` prompts directly on the phone for instant 1-tap approval or rejection while keeping `core/confirm.py` strictly immutable.
+
+### Part 2: Mark-LVII OmniCore (Autonomous Multi-Agent & Meta-Evolution)
+1. **Parallel Multi-Agent Swarm + Independent Critic (`core/evolution/swarm.py`, `plugins/swarm_orchestrator.py`, `plugins/autonomous_brain.py`):**
+   - Spawns parallel dependency waves of specialized sub-agents (`researcher`, `coder`, `visual_screen_operator`, `security_auditor`) sharing a WAL SQLite blackboard (`memory/swarm_blackboard.sqlite`) seeded with multi-hop Knowledge Graph context.
+   - Every sub-agent action and output is audited by `CriticAgent` (pre-execution `safety_guard` side-effect gate, AST evasion & secret-leak check, cross-agent security blocker check, and automatic remediation retry before synthesis).
+2. **Persistent Long-Horizon Missions (`core/evolution/mission_runner.py`, `main.py`):**
+   - SQLite-persisted missions (`memory/missions.sqlite`) with step-level checkpoints surviving process restarts (`_recover_interrupted_missions`), waking on `immediate`, `interval`, 5-field `cron`, `event` (`notify_event`), or desktop `screen_trigger` conditions, self-recovering via exponential backoff, and pushing live alerts/approval requests to the phone.
+3. **Entity-Relation Knowledge Graph (`core/memory/knowledge_graph.py`, `plugins/knowledge_rag.py`, `memory/memory_manager.py`, `main.py`):**
+   - Local WAL SQLite graph (`memory/knowledge_graph.sqlite`) modeling `person`, `project`, `file_path`, `preference`, `recurring_task`, `past_outcome`, `tool`, and `concept` entities with weighted directional relations. Auto-ingests conversation turns and `memory_manager` updates, injects 2-hop relational subgraphs into `VerifiedPlanner`, `SwarmCoordinator`, and `knowledge_rag`, and merges alias duplicates during idle consolidation.
+4. **Meta-Evolution & Prompt/Skill Self-Optimizer (`core/evolution/meta_optimizer.py`, `skill_synthesizer.py`, `reflection_loop.py`, `providers/local_router.py`, `plugins/evolution_control.py`, `core/auto_evolution.py`):**
+   - Analyzes `memory/telemetry.sqlite` during PC idle time (`GetLastInputInfo`) for underperforming mutable plugins, degraded model routes, and recurring prompt/argument friction.
+   - Stages candidate plugin upgrades on isolated `evolve/*` Git worktrees, runs AST safety + `validate_plugin.py` + `pytest` + historical replay & 10D quality benchmarks, **auto-reverts** any non-improving candidate, and queues ONLY measurably better upgrades into `memory/evolution_digest.json` (`"Approve upgrade 1"`), while live-applying approved routing/prompt overrides in `local_router.py` and `reflection_loop.py`. Strictly blocks `safety_guard.py`, `file_vault.py`, `voice_lock.py`, and `core/confirm.py`.
+5. **Universal MCP Client Bridge (`core/mcp_client.py`, `plugins/mcp_bridge.py`, `config/mcp_servers.example.json`):**
+   - Dynamic `tools/list` discovery and SQLite tool mounting (`mcp__<server>__<tool>` in `memory/mcp_registry.sqlite`), built-in presets for GitHub, Google Workspace, Notion, PostgreSQL Databases, Smart Home (Home Assistant), Claude-Mem, and Chrome DevTools, ecosystem summary (`mode='ecosystem'`), and automatic 3-tier `safety_guard` risk wrapping (`SAFE`, `CONFIRM`, `LOCKED` with Biometric Voice Lock + SQL statement inspection + `<<<UNTRUSTED>>>` isolation).
+
+### Milestone 14 Verification Summary
+- **Live Wi-Fi LAN HTTPS Reachability (`172.16.6.143:8000`):**
+  - `GET https://172.16.6.143:8000/pwa` -> **200 OK** (`30,754` bytes)
+  - `GET https://172.16.6.143:8000/api/android/qr` -> **200 OK**
+  - `GET https://172.16.6.143:8000/api/cert-fingerprint` -> **200 OK** (`https=True`, SAN=`DNS:localhost, IP:127.0.0.1, IP:172.16.6.143`, SHA-256=`1e56127cdf1910e72fdc15a602eafeea032ee7fc841b8565d927322de0581bba`)
+  - `WSS wss://172.16.6.143:8000/ws`: invalid token rejected (`HTTP 403`), valid paired token accepted (`confirm_pending`)
+- `scripts/validate_plugin.py`: **5/5 PASS** (**0 errors, 0 warnings** across `swarm_orchestrator`, `autonomous_brain`, `knowledge_rag`, `mcp_bridge`, `evolution_control`; 10D scores `87.5`–`99.0/100`)
+- `pytest -B -v`: **50 passed in 25.79s, 0 failed** (including 6/6 end-to-end suites in `tests/test_m14_omnicore.py`)
+- `.\gradlew.bat testDebugUnitTest assembleDebug`: **BUILD SUCCESSFUL in 20s** (5/5 Kotlin JUnit tests passed + updated `app-debug.apk` built)
+- `python -B -m providers._tests`: **108 passed, 0 failed**
+- `scripts/verify_wake_activation.py`: **8/8 passed** (live WASAPI RAW `false_hits=0`, `plugins_rejected=0, overlap=none`)
+- `scripts/verify_m7_knowledge_rag.py`: **ALL PASSED** (`active=33, rejected=0`)
+- `scripts/health_check.py --allow-dirty`: **ALL HEALTHY** (`active=33, rejected=0, core_checked=28, unignored_secrets=none`; immutable files `safety_guard.py`, `file_vault.py`, `voice_lock.py`, `core/confirm.py` verified untouched)
 
 ---
 
@@ -208,11 +253,13 @@
 
 ## Merge to `main` & Restart Live Mark-LVII (Run When Ready)
 ```powershell
-# 1. Stash or commit any concurrent local UI edits before switching branches, then merge Milestone 13 into main:
+# 1. Stash your concurrent local UI/goddess edits, merge Milestone 14 into main, then restore UI edits:
 cd C:\Users\tanis\Downloads\Mark-LVII-main\Mark-LVII-main
+git stash push -m "local-ui-edits-before-m14-merge"
 git checkout main
-git merge --no-ff milestone/13-autonomous-screen-loop -m "merge: Milestone 13 Closed-Loop Autonomous Screen Agent"
+git merge --no-ff milestone/14-omnicore-phone-fix -m "merge: Milestone 14 Phone HTTPS Supercharge & Mark-LVII OmniCore"
+git stash pop
 
-# 2. Restart live Mark-LVII:
+# 2. Launch Mark-LVII (serves HTTPS phone remote on https://172.16.6.143:8000/pwa):
 C:\Users\tanis\AppData\Local\Python\pythoncore-3.13-64\python.exe -B -u .\scripts\launch_jarvis.pyw
 ```

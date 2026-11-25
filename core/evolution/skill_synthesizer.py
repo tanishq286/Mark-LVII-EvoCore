@@ -286,8 +286,8 @@ def approve_and_hotload(
 
     root = Path(repo_root).resolve()
     br = str(branch or "").strip()
-    if not (br.startswith("skill/") or br.startswith("autofix/")):
-        return {"ok": False, "error": f"Refused: only skill/* or autofix/* branches can be auto-merged (got {br!r})."}
+    if not (br.startswith("skill/") or br.startswith("autofix/") or br.startswith("evolve/")):
+        return {"ok": False, "error": f"Refused: only skill/*, autofix/*, or evolve/* branches can be auto-merged (got {br!r})."}
 
     st = run_git(root, "status", "--porcelain")
     if st.returncode != 0:

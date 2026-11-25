@@ -147,7 +147,23 @@ def adaptive_rank_models(
     except Exception:
         return ordered, False, ""
 
-    if not stats:
+    # Apply approved Meta-Optimizer routing overrides (when present in meta_optimizer.sqlite)
+    preferred_override = ""
+    demoted_overrides: set[str] = set()
+    try:
+        from core.evolution import meta_optimizer
+        for ov in meta_optimizer.list_tuning_overrides():
+            if ov.get("kind") == "routing":
+                pl = ov.get("payload") or {}
+                if str(pl.get("category") or "") == category:
+                    if pl.get("demote_model"):
+                        demoted_overrides.add(str(pl["demote_model"]))
+                    if pl.get("prefer_model") and str(pl["prefer_model"]) != "gemini_cloud_fallback":
+                        preferred_override = str(pl["prefer_model"])
+    except Exception:
+        pass
+
+    if not stats and not preferred_override and not demoted_overrides:
         return ordered, False, ""
 
     evaluated_flags: list[bool] = []
@@ -156,9 +172,10 @@ def adaptive_rank_models(
 
     for idx, model in enumerate(ordered):
         rec = stats.get((category, model))
+        ov_bonus = -1 if (preferred_override and model == preferred_override) else (1 if model in demoted_overrides else 0)
         if not rec or int(rec.get("calls", 0)) < min_samples:
             # Cold-start: preserve static order among unmeasured candidates without outranking proven healthy ones
-            scored.append(((0, -min_success_rate, 1e9, idx), model))
+            scored.append(((ov_bonus, -min_success_rate, 1e9, idx), model))
             evaluated_flags.append(False)
             degraded_flags.append(False)
             continue
@@ -166,9 +183,9 @@ def adaptive_rank_models(
         evaluated_flags.append(True)
         sr = float(rec.get("success_rate", 1.0))
         p95 = float(rec.get("p95_ms", 0.0))
-        is_bad = (sr < min_success_rate) or (p95 > max_p95_ms)
+        is_bad = (sr < min_success_rate) or (p95 > max_p95_ms) or (model in demoted_overrides)
         degraded_flags.append(is_bad)
-        tier_rank = 1 if is_bad else 0
+        tier_rank = (1 if is_bad else 0) + ov_bonus
         scored.append(((tier_rank, -sr, p95, idx), model))
 
     scored.sort(key=lambda item: item[0])

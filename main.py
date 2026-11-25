@@ -2378,6 +2378,19 @@ class JarvisLive:
                                 if not out_streamed:
                                     self.ui.write_log(f"{self._asst_name}: {full_out}")
                                 self._session_log.append(f"{self._asst_name}: {full_out}")
+                                try:
+                                    from core.memory import knowledge_graph as _kg
+                                    _prev_u = ""
+                                    for _sl in reversed(self._session_log[:-1]):
+                                        if not _sl.startswith(f"{self._asst_name}:"):
+                                            _prev_u = _sl.split(":", 1)[-1].strip()
+                                            break
+                                    if _prev_u or full_out:
+                                        asyncio.get_running_loop().run_in_executor(
+                                            None, _kg.ingest_conversation_turn, _prev_u, full_out
+                                        )
+                                except Exception:
+                                    pass
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "jarvis",
@@ -3044,14 +3057,46 @@ class JarvisLive:
         # The confirmation gate is useless without a way to ask, and a memory
         # trim is invisible without a way to say so. Both are bound once here
         # rather than passed down through every action signature.
+        def _hud_show_confirm(title: str, detail: str) -> None:
+            self.ui.show_confirm(title, detail)
+            try:
+                from dashboard.server import broadcast_hud_prompt
+                broadcast_hud_prompt("confirm_prompt", {"title": title, "detail": detail, "expires_in": 90.0})
+            except Exception:
+                pass
+
+        def _hud_hide_confirm() -> None:
+            self.ui.hide_confirm()
+            try:
+                from dashboard.server import broadcast_hud_prompt
+                broadcast_hud_prompt("confirm_cleared", {})
+            except Exception:
+                pass
+
+        def _hud_show_choice(title: str, detail: str, options: list[str]) -> None:
+            self.ui.show_choice(title, detail, options)
+            try:
+                from dashboard.server import broadcast_hud_prompt
+                broadcast_hud_prompt("choice_prompt", {"title": title, "detail": detail, "options": list(options or [])})
+            except Exception:
+                pass
+
+        def _hud_hide_choice() -> None:
+            self.ui.hide_choice()
+            try:
+                from dashboard.server import broadcast_hud_prompt
+                broadcast_hud_prompt("choice_cleared", {})
+            except Exception:
+                pass
+
         confirm_gate.bind(
-            show = self.ui.show_confirm,
-            hide = self.ui.hide_confirm,
+            show = _hud_show_confirm,
+            hide = _hud_hide_confirm,
             log  = self.ui.write_log,
         )
         confirm_gate.bind_choice(
-            show_choice = self.ui.show_choice,
-            hide_choice = self.ui.hide_choice,
+            show_choice = _hud_show_choice,
+            hide_choice = _hud_hide_choice,
         )
         set_trim_notifier(self.ui.write_log)
 
@@ -3080,6 +3125,12 @@ class JarvisLive:
                 ev_name = str(ev.get("event") or "event")
                 dev = str(ev.get("device_id") or "android")
                 self.ui.write_log(f"PHONE [{dev}]: {ev_name} {ev.get('payload') or ''}".strip())
+                try:
+                    from core.evolution.mission_runner import get_default_runner
+                    get_default_runner().notify_event(ev_name, ev.get("payload") if isinstance(ev.get("payload"), dict) else {})
+                except Exception:
+                    pass
+            self._dashboard.set_wake_callback(lambda: self.wake(reason="phone remote") if (self._activation_gated and not self._awake) else None)
             self._dashboard.set_tool_executor(_dash_tool_exec)
             self._dashboard.set_event_callback(_dash_android_event)
             self._keep_task(asyncio.create_task(self._dashboard.serve()))
@@ -3088,6 +3139,13 @@ class JarvisLive:
         except Exception as e:
             print(f"[Dashboard] Disabled: {e}")
             self._dashboard = None
+
+        # Start persistent SQLite MissionRunner daemon (survives restarts, pushes alerts to phone)
+        try:
+            from core.evolution.mission_runner import get_default_runner
+            get_default_runner().start_background_loop(poll_interval_s=5.0)
+        except Exception as e:
+            print(f"[MissionRunner] Unavailable: {e}")
 
         while True:
             try:

@@ -14,6 +14,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okio.ByteString.Companion.toByteString
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.security.cert.CertificateException
@@ -24,17 +25,22 @@ import javax.net.ssl.SSLContext
 import javax.net.ssl.X509TrustManager
 
 /**
- * Bidirectional TLS-pinned WebSocket client bridging the Android companion
+ * Bidirectional TLS-pinned WebSocket & HTTPS client bridging the Android companion
  * with Mark-LVII's dashboard/server.py (`device_register`, `heartbeat`,
- * `pc_to_android` -> `android_result`, and `tool_invoke` / `android_event`).
+ * `pc_to_android` -> `android_result`, live PC screen viewer + tap/type,
+ * push-to-talk PCM16 `/ws/phone-audio`, mission log stream, and 1-tap HUD approvals).
  */
 class JarvisWebSocketClient(
     private val onStatus: (String) -> Unit = {},
     private val onLog: (String) -> Unit = {},
+    private val onMissionLog: (String) -> Unit = {},
+    private val onConfirmPrompt: (HudConfirmPrompt?) -> Unit = {},
+    private val onChoicePrompt: (HudChoicePrompt?) -> Unit = {},
     private val onPcCommand: suspend (PcToAndroidCommand) -> AndroidResult
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var webSocket: WebSocket? = null
+    private var audioWebSocket: WebSocket? = null
     private var heartbeatJob: Job? = null
     private var client: OkHttpClient = buildClient("")
 
@@ -51,6 +57,10 @@ class JarvisWebSocketClient(
         private set
 
     @Volatile
+    var pinnedCertSha256: String = ""
+        private set
+
+    @Volatile
     var aesKey: ByteArray? = null
         private set
 
@@ -63,14 +73,14 @@ class JarvisWebSocketClient(
 
     var telemetryProvider: () -> Pair<Int?, Boolean?> = { Pair(null, null) }
 
-    private fun buildClient(expectedSha256: String): OkHttpClient {
+    private fun buildClient(expectedSha256: String, allowTofuBootstrap: Boolean = false): OkHttpClient {
         val builder = OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.SECONDS)
             .pingInterval(20, TimeUnit.SECONDS)
 
         val pin = expectedSha256.trim().lowercase().replace(":", "")
-        if (pin.isNotEmpty()) {
+        if (pin.isNotEmpty() || allowTofuBootstrap) {
             val trustManager = object : X509TrustManager {
                 override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
                 override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
@@ -80,8 +90,11 @@ class JarvisWebSocketClient(
                     val digest = MessageDigest.getInstance("SHA-256")
                         .digest(leaf.encoded)
                         .joinToString("") { "%02x".format(it) }
-                    if (digest != pin) {
+                    if (pin.isNotEmpty() && digest != pin) {
                         throw CertificateException("TLS pin mismatch: expected=$pin actual=$digest")
+                    }
+                    if (pin.isEmpty() && allowTofuBootstrap) {
+                        pinnedCertSha256 = digest
                     }
                 }
             }
@@ -108,11 +121,13 @@ class JarvisWebSocketClient(
             return
         }
         serverBaseUrl = baseUrl.trimEnd('/')
-        client = buildClient(certSha256)
+        val explicitPin = certSha256.trim().lowercase().replace(":", "")
+        pinnedCertSha256 = explicitPin
+        client = buildClient(explicitPin, allowTofuBootstrap = serverBaseUrl.startsWith("https://") && explicitPin.isEmpty())
         scope.launch {
             try {
                 val payload = JSONObject().apply {
-                    put("pin", pin.trim())
+                    put("pin", pin.trim().uppercase())
                     put("device_id", deviceId)
                     put("name", deviceName)
                     put("model", deviceModel)
@@ -132,11 +147,14 @@ class JarvisWebSocketClient(
                         return@use
                     }
                     authToken = json.getString("token")
-                    sessionKey = json.optString("session_key", pin.trim())
+                    sessionKey = json.optString("session_key", pin.trim().uppercase())
                     aesKey = CryptoEnvelope.deriveKey(sessionKey)
-                    val pinnedHash = certSha256.ifBlank { json.optString("cert_sha256", "") }
-                    if (pinnedHash.isNotBlank() && certSha256.isBlank()) {
-                        client = buildClient(pinnedHash)
+                    val serverFp = json.optString("cert_sha256", "").trim().lowercase()
+                    val finalPin = explicitPin.ifBlank { serverFp.ifBlank { pinnedCertSha256 } }
+                    if (finalPin.isNotBlank()) {
+                        pinnedCertSha256 = finalPin
+                        client = buildClient(finalPin, allowTofuBootstrap = false)
+                        onLog("Pinned TLS SHA-256: ${finalPin.take(20)}…")
                     }
                     val (batt, chg) = telemetryProvider()
                     lastRegisterMeta = DeviceRegister(
@@ -173,6 +191,7 @@ class JarvisWebSocketClient(
                 onStatus("CONNECTED")
                 onLog("TLS WebSocket paired cleanly.")
                 lastRegisterMeta?.let { webSocket.send(it.toJson().toString()) }
+                webSocket.send(JSONObject().put("type", "confirm_pending_req").toString())
                 startHeartbeat()
             }
 
@@ -212,6 +231,48 @@ class JarvisWebSocketClient(
                         AndroidResult(cmd.requestId, ok = false, error = e.message ?: "error")
                     }
                     ws.send(res.toJson().toString())
+                }
+                "mission_log" -> {
+                    val src = obj.optString("source", "brain")
+                    onMissionLog("[$src] ${obj.optString("text")}")
+                }
+                "log" -> {
+                    val spk = obj.optString("speaker", "jarvis").uppercase()
+                    onMissionLog("$spk: ${obj.optString("text")}")
+                }
+                "confirm_prompt" -> {
+                    onConfirmPrompt(
+                        HudConfirmPrompt(
+                            title = obj.optString("title", "Confirm Action"),
+                            detail = obj.optString("detail", ""),
+                            expiresInSec = obj.optDouble("expires_in", 90.0)
+                        )
+                    )
+                }
+                "choice_prompt" -> {
+                    val arr = obj.optJSONArray("options")
+                    val opts = mutableListOf<String>()
+                    if (arr != null) {
+                        for (i in 0 until arr.length()) opts.add(arr.optString(i))
+                    }
+                    onChoicePrompt(HudChoicePrompt(obj.optString("title", "Select Option"), obj.optString("detail", ""), opts))
+                }
+                "confirm_pending" -> {
+                    val cf = obj.optJSONObject("confirm")
+                    onConfirmPrompt(if (cf != null) HudConfirmPrompt(cf.optString("title"), cf.optString("detail"), cf.optDouble("expires_in", 90.0)) else null)
+                    val ch = obj.optJSONObject("choice")
+                    if (ch != null) {
+                        val arr = ch.optJSONArray("options")
+                        val opts = mutableListOf<String>()
+                        if (arr != null) for (i in 0 until arr.length()) opts.add(arr.optString(i))
+                        onChoicePrompt(HudChoicePrompt(ch.optString("title"), ch.optString("detail"), opts))
+                    } else {
+                        onChoicePrompt(null)
+                    }
+                }
+                "confirm_cleared", "choice_cleared", "confirm_resolved" -> {
+                    onConfirmPrompt(null)
+                    onChoicePrompt(null)
                 }
                 "tool_result" -> onLog("PC Tool [${obj.optString("request_id")}]: ${obj.optString("result", obj.optString("error"))}")
                 "sys", "jarvis_reply" -> onLog("JARVIS: ${obj.optString("text")}")
@@ -261,6 +322,73 @@ class JarvisWebSocketClient(
         return ws.send(payload.toString())
     }
 
+    fun sendScreenTap(normX: Float, normY: Float, action: String = "tap"): Boolean {
+        if (!PrivacyConfig.isOutboundSyncAllowed()) return false
+        val ws = webSocket ?: return false
+        return ws.send(ScreenInputCommand(action = action, normX = normX, normY = normY).toJson().toString())
+    }
+
+    fun sendScreenText(text: String): Boolean {
+        if (!PrivacyConfig.isOutboundSyncAllowed() || text.isEmpty()) return false
+        val ws = webSocket ?: return false
+        return ws.send(ScreenInputCommand(action = "type", text = text).toJson().toString())
+    }
+
+    fun sendScreenKey(keys: String): Boolean {
+        if (!PrivacyConfig.isOutboundSyncAllowed() || keys.isBlank()) return false
+        val ws = webSocket ?: return false
+        return ws.send(ScreenInputCommand(action = "key", keys = keys).toJson().toString())
+    }
+
+    fun resolveHudConfirm(accepted: Boolean): Boolean {
+        if (!PrivacyConfig.isOutboundSyncAllowed()) return false
+        val ws = webSocket ?: return false
+        onConfirmPrompt(null)
+        return ws.send(ConfirmResolveCommand(kind = "confirm", accepted = accepted).toJson().toString())
+    }
+
+    fun resolveHudChoice(selection: Int?): Boolean {
+        if (!PrivacyConfig.isOutboundSyncAllowed()) return false
+        val ws = webSocket ?: return false
+        onChoicePrompt(null)
+        return ws.send(ConfirmResolveCommand(kind = "choice", selection = selection).toJson().toString())
+    }
+
+    fun fetchScreenFrameBytes(): ByteArray? {
+        if (!PrivacyConfig.isOutboundSyncAllowed() || authToken.isBlank() || serverBaseUrl.isBlank()) return null
+        return try {
+            val req = Request.Builder()
+                .url("$serverBaseUrl/api/screen/frame")
+                .header("Authorization", "Bearer $authToken")
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) resp.body?.bytes() else null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun openPhoneAudioSocket(): Boolean {
+        if (!PrivacyConfig.isOutboundSyncAllowed() || authToken.isBlank() || serverBaseUrl.isBlank()) return false
+        audioWebSocket?.close(1000, "Reset")
+        val wsUrl = serverBaseUrl
+            .replaceFirst("https://", "wss://")
+            .replaceFirst("http://", "ws://") + "/ws/phone-audio?token=$authToken"
+        audioWebSocket = client.newWebSocket(Request.Builder().url(wsUrl).build(), object : WebSocketListener() {})
+        return true
+    }
+
+    fun sendPhoneAudioPcm16(pcmBytes: ByteArray): Boolean {
+        if (!PrivacyConfig.isOutboundSyncAllowed()) return false
+        return audioWebSocket?.send(pcmBytes.toByteString(0, pcmBytes.size)) ?: false
+    }
+
+    fun closePhoneAudioSocket() {
+        audioWebSocket?.close(1000, "PTT released")
+        audioWebSocket = null
+    }
+
     fun invokePcTool(tool: String, parameters: JSONObject = JSONObject()): Boolean {
         if (!PrivacyConfig.isOutboundSyncAllowed()) return false
         val ws = webSocket ?: return false
@@ -278,6 +406,7 @@ class JarvisWebSocketClient(
         PrivacyConfig.onDeviceOnly = enabled
         if (enabled) {
             stopHeartbeat()
+            closePhoneAudioSocket()
             webSocket?.close(1000, "On-Device Privacy Mode enabled")
             webSocket = null
             onStatus("PRIVACY LOCAL")

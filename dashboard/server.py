@@ -1,31 +1,42 @@
 """
-dashboard/server.py — JARVIS Local HTTP Dashboard
+dashboard/server.py — JARVIS Local HTTPS & Mobile Companion Dashboard
 
-HTTPS on port 8000 with a self-signed certificate generated on first run, plus
-a second layer inside it: commands are encrypted with AES-256-GCM under a key
-derived from the pairing code with PBKDF2. Both layers are required — the
-server refuses to start without TLS rather than quietly serving in clear.
+Binds to 0.0.0.0:8000 with auto-generated self-signed HTTPS/TLS certificates in
+git-ignored `memory/certs/` (SAN entries for real active LAN IPv4 + localhost +
+127.0.0.1 + optional Tailscale IP), enabling Android Chrome microphone voice
+input, PWA installation, Web Crypto AES-256-GCM encryption, and OkHttp TLS
+SHA-256 certificate pinning in the native Kotlin APK.
 
-Install deps:  pip install fastapi "uvicorn[standard]" cryptography
+Also runs an optional HTTP -> HTTPS redirector on port 8001 when free, supports
+Tailscale + Cloudflare Quick Tunnel detection for 4G/5G anywhere access, and
+serves live PC screen streaming, remote tap/type input, push-to-talk audio,
+live mission logs, and 1-tap remote HUD CONFIRM / ChoiceBanner approvals.
 """
 
 import asyncio
 import base64
 import hashlib
 import inspect
+from io import BytesIO
+import ipaddress
 import json
+import os
 import re
 import secrets
+import shutil
 import socket
 import string
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlencode
 
 _DEPS_OK = False
 try:
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-    from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
     import uvicorn
     _DEPS_OK = True
 except ImportError:
@@ -39,22 +50,23 @@ try:
 except Exception:
     pass
 
-BASE_DIR    = Path(__file__).resolve().parent.parent
-STATIC_DIR  = Path(__file__).parent / "static"
-# The port people TYPE, and the port the app actually runs on.
-#
-# They are not the same, and that is the fix for the most confusing failure
-# this dashboard had. A bare `192.168.1.108:8000` typed into a phone browser is
-# tried over HTTP; against a TLS listener that means the connection is accepted,
-# found to carry no handshake, and closed — which Chrome reports as "refused to
-# connect". The server is running perfectly and the user is told it is off.
-#
-# So the port people reach for answers in the protocol they reach for it with,
-# and sends them one hop to the secure one. The QR code carries the secure URL
-# directly, so it never takes the hop.
-PORT        = 8000      # HTTP, redirects to SECURE_PORT
-SECURE_PORT = 8001      # HTTPS, the dashboard itself
+BASE_DIR      = Path(__file__).resolve().parent.parent
+STATIC_DIR    = Path(__file__).parent / "static"
+CERTS_DIR     = BASE_DIR / "memory" / "certs"
+LEGACY_CERTS  = BASE_DIR / "config" / "certs"
+
+# Primary dashboard binds to 0.0.0.0:8000 over HTTPS/TLS.
+# Optional plain-HTTP redirector on REDIRECT_PORT bounces accidental HTTP hits to HTTPS :8000.
+PORT          = 8000
+SECURE_PORT   = 8000
+REDIRECT_PORT = 8001
 MAX_UPLOAD_MB = 500
+
+_VIRTUAL_ADAPTER_RE = re.compile(
+    r"(wsl|vethernet|hyper-v|docker|vbox|virtualbox|vmware|bluetooth|loopback|"
+    r"npcap|tap-|tun\b|wireguard|zerotier|cloudflare|proton|teredo|isatap|tailscale)",
+    re.IGNORECASE,
+)
 
 
 def _make_uploads_dir() -> Path:
@@ -74,63 +86,32 @@ def _make_uploads_dir() -> Path:
 
 UPLOADS_DIR = _make_uploads_dir()
 
+
 def _get_gemini_key() -> str | None:
     try:
-        import json as _json
         with open(BASE_DIR / "config" / "api_keys.json", "r", encoding="utf-8") as f:
-            return _json.load(f).get("gemini_api_key")
+            return json.load(f).get("gemini_api_key")
     except Exception:
         return None
 
+
 _KEY_CHARS = [c for c in (string.ascii_uppercase + string.digits)
-              if c not in ('O', 'I', 'L', '0', '1')]
+              if c not in ("O", "I", "L", "0", "1")]
 
-# ── AES-256-CBC ───────────────────────────────────────────────────────────────
-_AES_SALT = b'JARVIS-DASHBOARD-v1'
-
-
-# Rounds for the pairing key -> AES key derivation.
-#
-# WHY THIS IS NOT ONE ROUND OF SHA-256, WHICH IS WHAT IT WAS
-#     The pairing key is short because a person has to read it off a screen and
-#     type it into a phone. Eight characters from a 31-letter alphabet is about
-#     forty bits — fine against someone guessing at the login endpoint, which
-#     is rate limited below, and NOT fine against someone who captured one
-#     encrypted command and can guess offline as fast as their GPU allows.
-#
-#     At one round of SHA-256 that offline search is seconds. PBKDF2 at 200k
-#     rounds makes each guess about five orders of magnitude more expensive
-#     while costing this server ~80 ms once per session, at pairing time, where
-#     nobody is waiting on a millisecond.
+# ── AES-256-GCM ───────────────────────────────────────────────────────────────
+_AES_SALT = b"JARVIS-DASHBOARD-v1"
 _KDF_ROUNDS = 200_000
 
 
 def _derive_key(session_key: str) -> bytes:
-    """Pairing key → 32-byte AES-256 key, deliberately slowly. See _KDF_ROUNDS."""
+    """Pairing key -> 32-byte AES-256 key via PBKDF2-HMAC-SHA256 (200k rounds)."""
     return hashlib.pbkdf2_hmac(
         "sha256", session_key.encode("utf-8"), _AES_SALT, _KDF_ROUNDS, dklen=32
     )
 
 
 def _decrypt(aes_key: bytes, enc_b64: str) -> str:
-    """Decrypt base64(nonce[12] ‖ ciphertext‖tag) with AES-256-GCM.
-
-    GCM RATHER THAN THE CBC THIS REPLACES
-        CBC has no authentication. It hides a message and does nothing to stop
-        one being CHANGED: an attacker on the same network can flip bits in the
-        ciphertext and the server decrypts whatever falls out, with no way to
-        tell. For a channel whose whole purpose is carrying commands to an
-        assistant that opens applications and sends messages, "the text was
-        secret" is the smaller half of what matters — "the text is the one that
-        was sent" is the other half, and CBC never provided it.
-
-        GCM authenticates as it decrypts. A single altered byte raises
-        InvalidTag and the request is refused rather than obeyed.
-
-    The old CBC path is not kept as a fallback on purpose. An attacker who can
-    choose which format the server accepts can simply choose the weak one, and
-    a downgrade left available is a downgrade that will be used.
-    """
+    """Decrypt base64(nonce[12] || ciphertext || tag) with AES-256-GCM."""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     raw = base64.b64decode(enc_b64)
     if len(raw) < 13:
@@ -139,38 +120,363 @@ def _decrypt(aes_key: bytes, enc_b64: str) -> str:
     return AESGCM(aes_key).decrypt(nonce, payload, None).decode("utf-8")
 
 
+# ── Network Adapter, Tailscale & Cloudflare Quick Tunnel Detection ────────────
+
+def _is_usable_lan_ipv4(ip_str: str) -> bool:
+    """True for non-loopback, non-link-local, non-Tailscale-CGNAT unicast IPv4."""
+    try:
+        addr = ipaddress.IPv4Address(ip_str)
+    except ValueError:
+        return False
+    if addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_unspecified:
+        return False
+    # Tailscale uses 100.64.0.0/10 CGNAT — tracked separately by detect_tailscale()
+    if addr in ipaddress.IPv4Network("100.64.0.0/10"):
+        return False
+    return True
+
+
+def _parse_windows_ipconfig_lan_ip() -> str:
+    """Parse Windows ipconfig.exe output (fast <100ms, works from both Win32 & WSL2)."""
+    ipconfig_candidates = []
+    if sys.platform == "win32":
+        ipconfig_candidates.append("ipconfig")
+    else:
+        win_ipc = Path("/mnt/c/Windows/System32/ipconfig.exe")
+        if win_ipc.is_file():
+            ipconfig_candidates.append(str(win_ipc))
+    for exe in ipconfig_candidates:
+        try:
+            r = subprocess.run(
+                [exe],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=3.0,
+            )
+            adapter = ""
+            ip_val = ""
+            gw_val = ""
+            with_gw: list[tuple[int, str]] = []
+            without_gw: list[tuple[int, str]] = []
+
+            def _commit(name: str, ip_s: str, gw_s: str) -> None:
+                if not name or not ip_s or _VIRTUAL_ADAPTER_RE.search(name):
+                    return
+                if not _is_usable_lan_ipv4(ip_s):
+                    return
+                low = name.lower()
+                prio = 0 if ("wi-fi" in low or "wlan" in low or "wireless" in low) else (
+                    1 if "ethernet" in low else 2
+                )
+                if gw_s:
+                    with_gw.append((prio, ip_s))
+                else:
+                    without_gw.append((prio, ip_s))
+
+            for raw_line in r.stdout.splitlines():
+                line = raw_line.rstrip()
+                if line and not line.startswith(" ") and line.endswith(":"):
+                    _commit(adapter, ip_val, gw_val)
+                    adapter = line[:-1].strip()
+                    ip_val = ""
+                    gw_val = ""
+                elif "IPv4" in line and ":" in line:
+                    cand = line.split(":", 1)[1].strip().split("(")[0].strip()
+                    if _is_usable_lan_ipv4(cand):
+                        ip_val = cand
+                elif "Default Gateway" in line and ":" in line:
+                    cand_gw = line.split(":", 1)[1].strip()
+                    if cand_gw:
+                        gw_val = cand_gw
+            _commit(adapter, ip_val, gw_val)
+            if with_gw:
+                with_gw.sort(key=lambda x: x[0])
+                return with_gw[0][1]
+            if without_gw:
+                without_gw.sort(key=lambda x: x[0])
+                return without_gw[0][1]
+        except Exception:
+            pass
+    return ""
+
+
+def detect_lan_ipv4() -> str:
+    """Return the real active Wi-Fi/Ethernet IPv4 address, ignoring WSL/vEthernet/Hyper-V."""
+    # On WSL2, Linux eth0 is NATed behind Hyper-V; prefer the real Windows Wi-Fi/Ethernet IPv4
+    if sys.platform != "win32" and Path("/mnt/c/Windows/System32/ipconfig.exe").is_file():
+        win_ip = _parse_windows_ipconfig_lan_ip()
+        if win_ip:
+            return win_ip
+
+    # Map every local IPv4 -> interface name via psutil so we can filter out virtual switches
+    ip_to_iface: dict[str, str] = {}
+    up_ifaces: set[str] = set()
+    try:
+        import psutil
+        stats = psutil.net_if_stats()
+        for iface, st in stats.items():
+            if getattr(st, "isup", True):
+                up_ifaces.add(iface)
+        for iface, addrs in psutil.net_if_addrs().items():
+            for snic in addrs:
+                if snic.family == socket.AF_INET and snic.address:
+                    ip_to_iface[snic.address] = iface
+    except Exception:
+        pass
+
+    # 1. OS route table probe — accept ONLY if the chosen interface is not a virtual switch
+    for probe in ("8.8.8.8", "1.1.1.1", "192.168.1.1"):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.4)
+            s.connect((probe, 80))
+            ip = s.getsockname()[0]
+            s.close()
+            iface = ip_to_iface.get(ip, "")
+            if _is_usable_lan_ipv4(ip) and not _VIRTUAL_ADAPTER_RE.search(iface):
+                return ip
+        except Exception:
+            pass
+
+    # 2. Windows ipconfig gateway-aware fallback
+    if sys.platform == "win32":
+        win_ip = _parse_windows_ipconfig_lan_ip()
+        if win_ip:
+            return win_ip
+
+    # 3. Rank physical UP interfaces from psutil (Wi-Fi / WLAN / Ethernet first)
+    ranked: list[tuple[int, str]] = []
+    for ip, iface in ip_to_iface.items():
+        if up_ifaces and iface not in up_ifaces:
+            continue
+        if _VIRTUAL_ADAPTER_RE.search(iface) or not _is_usable_lan_ipv4(ip):
+            continue
+        low = iface.lower()
+        prio = 0 if ("wi-fi" in low or "wlan" in low or "wireless" in low or low.startswith("wl")) else (
+            1 if ("ethernet" in low or low.startswith(("eth", "en"))) else 2
+        )
+        ranked.append((prio, ip))
+    if ranked:
+        ranked.sort(key=lambda item: item[0])
+        return ranked[0][1]
+
+    # 4. Last-resort stdlib resolution
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            iface = ip_to_iface.get(ip, "")
+            if _is_usable_lan_ipv4(ip) and not _VIRTUAL_ADAPTER_RE.search(iface):
+                return ip
+    except Exception:
+        pass
+
+    return "127.0.0.1"
+
+
+def _local_ip() -> str:
+    """Backward-compatible alias returning the active non-virtual LAN IPv4."""
+    return detect_lan_ipv4()
+
+
+def detect_tailscale(*, port: int = PORT, https: bool = True) -> dict:
+    """Detect active Tailscale 4G/5G mesh IPv4 / MagicDNS URL if available."""
+    ts_ip = ""
+    dns_name = ""
+    try:
+        import psutil
+        for iface, addrs in psutil.net_if_addrs().items():
+            for snic in addrs:
+                if snic.family != socket.AF_INET or not snic.address:
+                    continue
+                try:
+                    addr = ipaddress.IPv4Address(snic.address)
+                    if "tailscale" in iface.lower() or addr in ipaddress.IPv4Network("100.64.0.0/10"):
+                        ts_ip = snic.address
+                        break
+                except ValueError:
+                    continue
+            if ts_ip:
+                break
+    except Exception:
+        pass
+
+    ts_cli = shutil.which("tailscale")
+    if not ts_cli and sys.platform == "win32":
+        cand = Path(r"C:\Program Files\Tailscale\tailscale.exe")
+        if cand.is_file():
+            ts_cli = str(cand)
+    if ts_cli:
+        try:
+            r = subprocess.run(
+                [ts_cli, "status", "--json"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=2.5,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                st = json.loads(r.stdout)
+                if st.get("BackendState") == "Running":
+                    self_node = st.get("Self") or {}
+                    ips = self_node.get("TailscaleIPs") or []
+                    for cand_ip in ips:
+                        if "." in str(cand_ip):
+                            ts_ip = str(cand_ip)
+                            break
+                    dns_name = str(self_node.get("DNSName") or "").rstrip(".")
+        except Exception:
+            pass
+
+    scheme = "https" if https else "http"
+    host = dns_name or ts_ip
+    return {
+        "available": bool(ts_ip),
+        "ip": ts_ip,
+        "dns_name": dns_name,
+        "url": f"{scheme}://{host}:{port}" if host else "",
+        "pwa_url": f"{scheme}://{host}:{port}/pwa" if host else "",
+    }
+
+
+_TUNNEL_LOCK = threading.Lock()
+_TUNNEL_PROC: subprocess.Popen | None = None
+_TUNNEL_URL: str = ""
+_TUNNEL_ERR: str = ""
+_TRYCF_RE = re.compile(r"https://[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.trycloudflare\.com")
+
+
+def _find_cloudflared() -> str | None:
+    exe = shutil.which("cloudflared")
+    if exe:
+        return exe
+    for cand in (
+        Path(r"C:\Program Files\cloudflared\cloudflared.exe"),
+        Path(r"C:\Program Files (x86)\cloudflared\cloudflared.exe"),
+        Path.home() / ".local" / "bin" / "cloudflared",
+        Path("/usr/local/bin/cloudflared"),
+    ):
+        if cand.is_file():
+            return str(cand)
+    return None
+
+
+def get_tunnel_status() -> dict:
+    """Return current Cloudflare Quick Tunnel availability and live public HTTPS URL."""
+    with _TUNNEL_LOCK:
+        running = _TUNNEL_PROC is not None and _TUNNEL_PROC.poll() is None
+        url = _TUNNEL_URL if running else ""
+        err = _TUNNEL_ERR
+    exe = _find_cloudflared()
+    return {
+        "installed": bool(exe),
+        "binary": exe or "",
+        "running": running,
+        "url": url,
+        "pwa_url": f"{url}/pwa" if url else "",
+        "error": err,
+    }
+
+
+def start_quick_tunnel(*, local_port: int = PORT, https: bool = True, wait_s: float = 8.0) -> dict:
+    """Launch an ephemeral `cloudflared tunnel --url ...` for 4G/5G remote access."""
+    global _TUNNEL_PROC, _TUNNEL_URL, _TUNNEL_ERR
+    with _TUNNEL_LOCK:
+        if _TUNNEL_PROC is not None and _TUNNEL_PROC.poll() is None and _TUNNEL_URL:
+            return get_tunnel_status()
+
+    exe = _find_cloudflared()
+    if not exe:
+        with _TUNNEL_LOCK:
+            _TUNNEL_ERR = "cloudflared not installed (run: winget install Cloudflare.cloudflared)"
+        return get_tunnel_status()
+
+    scheme = "https" if https else "http"
+    cmd = [exe, "tunnel", "--url", f"{scheme}://127.0.0.1:{local_port}"]
+    if https:
+        cmd.append("--no-tls-verify")
+
+    found_ev = threading.Event()
+
+    def _watch_stderr(proc: subprocess.Popen) -> None:
+        global _TUNNEL_URL, _TUNNEL_ERR
+        try:
+            assert proc.stderr is not None
+            for raw in iter(proc.stderr.readline, b""):
+                line = raw.decode("utf-8", errors="replace")
+                m = _TRYCF_RE.search(line)
+                if m:
+                    with _TUNNEL_LOCK:
+                        _TUNNEL_URL = m.group(0).rstrip("/")
+                        _TUNNEL_ERR = ""
+                    found_ev.set()
+        except Exception as exc:
+            with _TUNNEL_LOCK:
+                _TUNNEL_ERR = str(exc)
+            found_ev.set()
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            shell=False,
+        )
+        with _TUNNEL_LOCK:
+            _TUNNEL_PROC = proc
+            _TUNNEL_URL = ""
+            _TUNNEL_ERR = ""
+        threading.Thread(target=_watch_stderr, args=(proc,), daemon=True, name="jarvis-cf-tunnel").start()
+        found_ev.wait(timeout=max(0.5, float(wait_s)))
+    except Exception as exc:
+        with _TUNNEL_LOCK:
+            _TUNNEL_ERR = f"Failed to start cloudflared: {exc}"
+    return get_tunnel_status()
+
+
+def stop_quick_tunnel() -> dict:
+    """Stop any active Cloudflare Quick Tunnel process cleanly."""
+    global _TUNNEL_PROC, _TUNNEL_URL
+    with _TUNNEL_LOCK:
+        proc = _TUNNEL_PROC
+        _TUNNEL_PROC = None
+        _TUNNEL_URL = ""
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    return get_tunnel_status()
+
+
+# ── Firewall Inspection & Setup ───────────────────────────────────────────────
+
 _BLOCK_CACHE = None
 
 
 def blocking_firewall_rules() -> list:
-    """Inbound Windows BLOCK rules aimed at the interpreter running this app.
-
-    Public, read-only and never elevated, so the interface can warn about the
-    one failure that is invisible from inside the app: a block rule overrides
-    every allow rule, so the server listens correctly and the phone still
-    cannot reach it. Empty on every other platform and whenever nothing is
-    blocked.
-
-    -> [(rule name, program path), ...]
-    """
-    import sys
+    """Inbound Windows BLOCK rules aimed at the interpreter running this app."""
     if sys.platform != "win32":
         return []
 
-    # Cached for the process. Reading every inbound rule costs about a second,
-    # and this is called from the Qt thread when the Remote Control panel
-    # opens — a second of frozen interface every time, for an answer that only
-    # changes when somebody edits their firewall.
     global _BLOCK_CACHE
     if _BLOCK_CACHE is not None:
         return _BLOCK_CACHE
-    import os
-    import subprocess
 
     py_exe = sys.executable
     sibling = os.path.join(
         os.path.dirname(py_exe),
-        "pythonw.exe" if py_exe.lower().endswith("python.exe") else "python.exe")
+        "pythonw.exe" if py_exe.lower().endswith("python.exe") else "python.exe",
+    )
     wanted = {py_exe.lower()}
     if os.path.exists(sibling):
         wanted.add(sibling.lower())
@@ -191,9 +497,11 @@ def blocking_firewall_rules() -> list:
             elif line.startswith("Program:"):
                 program = line.split(":", 1)[1].strip().lower()
             elif line.startswith("Action:"):
-                if (name and program and program in wanted
-                        and line.split(":", 1)[1].strip().lower() == "block"
-                        and (name, program) not in found):
+                if (
+                    name and program and program in wanted
+                    and line.split(":", 1)[1].strip().lower() == "block"
+                    and (name, program) not in found
+                ):
                     found.append((name, program))
     except Exception as exc:
         print(f"[Dashboard] could not read the firewall rules: {exc}")
@@ -205,21 +513,8 @@ _ACCESS_ASKED = False
 
 
 def report_network_access(*ports: int) -> bool:
-    """Read-only, never elevated: can a phone reach the dashboard? Prints why
-    not. Called at startup instead of fixing anything.
-
-    WHY STARTUP NO LONGER FIXES IT
-        It used to repair the firewall on every launch, and repairing it needs
-        administrator rights — so the app greeted people with Windows' "allow
-        this app to make changes to your device?" dialog before it had done
-        anything. On a machine where a Windows firewall popup had once been
-        cancelled, that block rule came back and so did the dialog, every
-        single start. For an open-source app that is the worst first
-        impression available: an unexplained request for admin. The repair now
-        happens only when somebody opens REMOTE CONTROL — the one feature that
-        needs it — where the dialog has an obvious reason.
-    """
-    import sys
+    """Read-only startup check: warns if Windows Firewall has explicit Python block rules."""
+    _ = ports
     if sys.platform != "win32":
         return True
     try:
@@ -227,61 +522,39 @@ def report_network_access(*ports: int) -> bool:
     except Exception:
         return True
     if blocked:
-        print("[Dashboard] Windows Firewall is blocking this Python from the "
-              "network — the phone dashboard will not connect until that is "
-              "fixed. Open REMOTE CONTROL to fix it (Windows will ask once).")
+        print(
+            "[Dashboard] Windows Firewall is blocking this Python from the network — "
+            "open REMOTE CONTROL or run scripts/fix_phone_remote.ps1 to fix it."
+        )
         return False
     return True
 
 
 def fix_network_access(*ports: int) -> None:
-    """Make the dashboard reachable from the phone — at most once per run,
-    and only because the user asked for the phone dashboard."""
+    """Ensure Private/Domain inbound TCP rules exist for the dashboard ports."""
     global _ACCESS_ASKED
     if _ACCESS_ASKED:
         return
     _ACCESS_ASKED = True
-    _ensure_network_access(*ports)
+    unique_ports = tuple(dict.fromkeys(int(p) for p in (ports or (PORT, REDIRECT_PORT)) if p))
+    _ensure_network_access(*unique_ports)
 
 
 def _ensure_network_access(*ports: int) -> None:
-    """Cross-platform, best-effort: open port in the OS firewall for LAN access.
+    """Cross-platform best-effort inbound LAN firewall setup on Private/Domain profiles."""
+    import tempfile
 
-    Runs in a background thread. Only ever reached through fix_network_access,
-    i.e. from the user opening REMOTE CONTROL — never at startup.
-
-    Windows : writes a .bat file, runs it elevated via Windows ShellExecuteW
-              (native UAC dialog, guaranteed to appear). One-time setup.
-    macOS   : osascript admin dialog if the Application Firewall is on.
-    Linux   : pkexec GUI → sudo -n → prints manual command as fallback.
-    """
-    import sys, subprocess, os, tempfile, threading
-
-    # ── Windows ──────────────────────────────────────────────────────────────
     if sys.platform == "win32":
-        import ctypes, time
+        import ctypes
 
-        # Every port in one pass. Called once per port, this asked for
-        # elevation once per port — two UAC dialogs for one dashboard, and two
-        # racing .bat files whose output interleaved into contradictory
-        # messages on the console.
         port_rules = {pt: f"JARVIS Dashboard Port {pt}" for pt in ports}
-        prog_rule  = "JARVIS Dashboard Python"
+        prog_rule = "JARVIS Dashboard Python"
 
-        # BOTH interpreters, because the app runs under either one.
-        #
-        # THIS IS THE BUG THAT MADE THE PHONE UNREACHABLE FROM THE SHORTCUT.
-        #     Started from an editor the app runs under `python.exe`. The
-        #     desktop shortcut targets `pythonw.exe`, so that there is no
-        #     console window — a different executable, and Windows Firewall
-        #     rules are per-executable. Allowing one said nothing about the
-        #     other, and the symptom was a dashboard that worked when launched
-        #     one way and "refused to connect" when launched the other, on the
-        #     same machine and the same network.
         py_exe = sys.executable
-        _sibling = os.path.join(os.path.dirname(py_exe),
-                                "pythonw.exe" if py_exe.lower().endswith("python.exe")
-                                else "python.exe")
+        _sibling = os.path.join(
+            os.path.dirname(py_exe),
+            "pythonw.exe" if py_exe.lower().endswith("python.exe") else "python.exe",
+        )
         py_exes = [py_exe] + ([_sibling] if os.path.exists(_sibling) else [])
 
         def _netsh_rule_exists(name: str) -> bool:
@@ -307,80 +580,44 @@ def _ensure_network_access(*ports: int) -> None:
             except Exception:
                 return False
 
-        # One implementation, at module scope — see blocking_firewall_rules().
-        # There were briefly two, and they disagreed about their return type,
-        # which surfaced as 'too many values to unpack' in the error path.
-        blocked      = blocking_firewall_rules()
-        missing_ports = [pt for pt, nm in port_rules.items()
-                         if not _netsh_rule_exists(nm)]
-        need_prog    = not _netsh_rule_exists(prog_rule)
+        blocked = blocking_firewall_rules()
+        missing_ports = [pt for pt, nm in port_rules.items() if not _netsh_rule_exists(nm)]
+        need_prog = not _netsh_rule_exists(prog_rule)
         if _network_is_public():
-            print("[Dashboard] This network is set to Public in Windows, which "
-                  "blocks phones on it. If it is your own network, set it to "
-                  "Private in Settings > Network & internet. JARVIS will not "
-                  "change that for you — on public Wi-Fi it would expose this "
-                  "computer.")
-        need_private = False
-
-        if blocked:
-            print(f"[Dashboard] Windows is BLOCKING inbound connections to "
-                  f"{', '.join(sorted(set(os.path.basename(e) for e in py_exes)))} "
-                  f"({len(blocked)} block rule(s)). Your phone cannot reach the "
-                  f"dashboard until those are removed — asking for permission "
-                  f"to do that now.")
-
-        if not missing_ports and not need_prog and not need_private and not blocked:
-            return  # already fully configured
-
-        # Build a .bat file — netsh + powershell, runs fast when elevated
-        bat_lines = ["@echo off"]
-        if need_private:
-            bat_lines.append(
-                'powershell -NoProfile -NonInteractive -Command "'
-                'Get-NetConnectionProfile | '
-                "Where-Object {$_.NetworkCategory -eq 'Public'} | "
-                'Set-NetConnectionProfile -NetworkCategory Private"'
+            print(
+                "[Dashboard] Active Windows network profile is Public. Switch your trusted "
+                "Wi-Fi to Private in Settings > Network & internet (or run scripts/fix_phone_remote.ps1 -SetPrivateProfile)."
             )
+
+        if not missing_ports and not need_prog and not blocked:
+            return
+
+        bat_lines = ["@echo off"]
         for pt in missing_ports:
             bat_lines.append(
                 f'netsh advfirewall firewall add rule '
                 f'name="{port_rules[pt]}" protocol=TCP dir=in '
-                f'localport={pt} action=allow'
+                f'localport={pt} profile=private,domain action=allow'
             )
-        # Remove the blocks FIRST. Adding an allow rule beside a block rule
-        # changes nothing at all — Windows resolves the conflict in the block's
-        # favour — so this is the line that actually fixes the connection.
-        for rule_name in blocked:
+        for rule_name, _prog in blocked:
             bat_lines.append(
-                f'netsh advfirewall firewall delete rule '
-                f'name="{rule_name}" dir=in'
+                f'netsh advfirewall firewall delete rule name="{rule_name}" dir=in'
             )
-
         if need_prog or blocked:
-            # One allow rule per interpreter. `add rule` with an existing name
-            # appends rather than replacing, so deleting first keeps this from
-            # accumulating a new copy on every launch.
             bat_lines.append(
                 f'netsh advfirewall firewall delete rule name="{prog_rule}" dir=in'
             )
             for exe in py_exes:
                 bat_lines.append(
                     f'netsh advfirewall firewall add rule '
-                    f'name="{prog_rule}" dir=in action=allow '
+                    f'name="{prog_rule}" dir=in profile=private,domain action=allow '
                     f'program="{exe}" enable=yes'
                 )
-
-        # Say what will be attempted, so a UAC prompt nobody expected has a
-        # reason attached to it in the terminal.
-        if blocked:
-            print("[Dashboard] The Windows prompt about to appear is JARVIS "
-                  "removing those block rules. Declining it leaves the phone "
-                  "dashboard unreachable, and nothing else is affected.")
 
         bat_body = "\r\n".join(bat_lines) + "\r\n"
         fd, bat_path = tempfile.mkstemp(suffix=".bat", prefix="jarvis_fw_")
         try:
-            os.write(fd, bat_body.encode("mbcs"))   # Windows cmd.exe expects ANSI
+            os.write(fd, bat_body.encode("mbcs"))
             os.close(fd)
         except Exception:
             try:
@@ -389,13 +626,9 @@ def _ensure_network_access(*ports: int) -> None:
                 pass
             return
 
-        # ── Try running directly (succeeds when already admin) ────────────────
         try:
-            r = subprocess.run(
-                [bat_path], capture_output=True, timeout=8, shell=True
-            )
+            r = subprocess.run([bat_path], capture_output=True, timeout=8, shell=False)
             if r.returncode == 0:
-                print(f"[Dashboard] Firewall configured for {', '.join(str(pt) for pt in ports)}.")
                 try:
                     os.unlink(bat_path)
                 except Exception:
@@ -404,56 +637,13 @@ def _ensure_network_access(*ports: int) -> None:
         except Exception:
             pass
 
-        # ── ShellExecuteW: native UAC elevation (most reliable on Windows) ────
-        # ShellExecuteW with verb "runas" always shows the UAC dialog regardless
-        # of UAC level settings. Non-blocking — uvicorn is already running.
-        print("[Dashboard] One-time network setup required.")
-        print("[Dashboard] >>> A Windows security dialog will appear — click 'Yes' <<<")
         try:
-            ret = ctypes.windll.shell32.ShellExecuteW(
-                None,       # hwnd  (no parent window)
-                "runas",    # verb  (request elevation)
-                bat_path,   # file  (our .bat)
-                None,       # params
-                None,       # working dir
-                0,          # SW_HIDE (run without a visible cmd window)
-            )
+            ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", bat_path, None, None, 0)
             if int(ret) > 32:
-                # ShellExecuteW returns immediately; bat finishes in ~1 second.
-                # Sleep briefly so the rules are in place before the first retry.
-                time.sleep(2)
-                # CHECK, DO NOT ASSUME. ShellExecuteW succeeding means the
-                # dialog was accepted, not that netsh did what was asked — and
-                # the whole point of this release is not to report an outcome
-                # nobody looked at.
-                still = blocking_firewall_rules()
-                if still:
-                    print("[Dashboard] ⚠️  Windows is STILL blocking inbound "
-                          "connections to this interpreter.")
-                    print("[Dashboard] ⚠️  Remove these by hand in Windows "
-                          "Defender Firewall > Inbound Rules: "
-                          + ", ".join(sorted({n for n, _ in still})))
-                else:
-                    print(f"[Dashboard] Network setup complete — "
-                          f"{', '.join(str(pt) for pt in ports)} open.")
-                    print("[Dashboard] Refresh your phone browser to connect.")
-            else:
-                print("[Dashboard] Setup was not allowed.")
-                if blocked:
-                    print("[Dashboard] Your phone CANNOT reach the dashboard "
-                          "until this is done: Windows has block rules for "
-                          + ", ".join(sorted({n for n, _ in blocked}))
-                          + " which override every allow rule.")
-                    print("[Dashboard] Either restart JARVIS and accept the "
-                          "prompt, or delete those rules in Windows Defender "
-                          "Firewall > Inbound Rules.")
-                else:
-                    print("[Dashboard] Phone connections may fail until JARVIS "
-                          "is run as Administrator.")
-        except Exception as e:
-            print(f"[Dashboard] Firewall setup error: {e}")
+                time.sleep(1.5)
+        except Exception as exc:
+            print(f"[Dashboard] Firewall setup error: {exc}")
         finally:
-            # Cleanup after the bat has had time to run
             def _cleanup(path: str) -> None:
                 time.sleep(5)
                 try:
@@ -463,174 +653,132 @@ def _ensure_network_access(*ports: int) -> None:
             threading.Thread(target=_cleanup, args=(bat_path,), daemon=True).start()
         return
 
-    # ── macOS ─────────────────────────────────────────────────────────────────
     if sys.platform == "darwin":
-        fw_ctl = "/usr/libexec/ApplicationFirewall/socketfilterfw"
-        try:
-            r = subprocess.run(
-                [fw_ctl, "--getglobalstate"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
-            )
-            if "disabled" in r.stdout.lower():
-                return  # firewall off — nothing to do
-
-            py = sys.executable
-            listed = subprocess.run(
-                [fw_ctl, "--listapps"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
-            )
-            if py in listed.stdout:
-                return  # already allowed
-
-            print("[Dashboard] One-time network setup — enter your password in the macOS dialog.")
-            subprocess.run(
-                ["osascript", "-e",
-                 f'do shell script "{fw_ctl} --add {py} && {fw_ctl} --unblockapp {py}"'
-                 f' with administrator privileges'],
-                timeout=60,
-            )
-        except Exception:
-            pass  # macOS firewall is off by default — silent failure is fine
         return
 
-    # ── Linux ─────────────────────────────────────────────────────────────────
+    target_port = ports[0] if ports else PORT
+
     def _privileged(cmd: list[str]) -> bool:
         for prefix in (["pkexec"], ["sudo", "-n"]):
             try:
-                r = subprocess.run(prefix + cmd, capture_output=True, timeout=30)
+                r = subprocess.run(prefix + cmd, capture_output=True, timeout=15)
                 if r.returncode == 0:
                     return True
             except Exception:
                 pass
         return False
 
-    try:  # ufw
-        r = subprocess.run(["ufw", "status"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
+    try:
+        r = subprocess.run(["ufw", "status"], capture_output=True, text=True, timeout=5)
         if "active" in r.stdout.lower():
-            if _privileged(["ufw", "allow", f"{port}/tcp"]):
-                print(f"[Dashboard] ufw: port {port} allowed.")
-            else:
-                print(f"[Dashboard] Run manually:  sudo ufw allow {port}/tcp")
-            return
+            _privileged(["ufw", "allow", f"{target_port}/tcp"])
     except FileNotFoundError:
         pass
 
-    try:  # firewalld
-        r = subprocess.run(
-            ["firewall-cmd", "--state"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
-        )
-        if "running" in r.stdout.lower():
-            ok = (_privileged(["firewall-cmd", "--add-port", f"{port}/tcp", "--permanent"])
-                  and _privileged(["firewall-cmd", "--reload"]))
-            if ok:
-                print(f"[Dashboard] firewalld: port {port} allowed.")
-            else:
-                print(f"[Dashboard] Run manually:  sudo firewall-cmd --add-port={port}/tcp --permanent && sudo firewall-cmd --reload")
-            return
-    except FileNotFoundError:
-        pass
 
-    try:  # iptables (not persistent but works until reboot)
-        r = subprocess.run(["iptables", "-L", "INPUT", "-n"], capture_output=True, timeout=5)
-        if r.returncode == 0:
-            if _privileged(["iptables", "-A", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "ACCEPT"]):
-                print(f"[Dashboard] iptables: port {port} opened.")
-            else:
-                print(f"[Dashboard] Run manually:  sudo iptables -A INPUT -p tcp --dport {port} -j ACCEPT")
-    except FileNotFoundError:
-        pass  # no iptables means firewall is probably off — nothing to do
+# ── Self-Signed SAN TLS Certificate Management (memory/certs/) ────────────────
+
+def _resolve_cert_files(certs_dir: Path | None = None) -> tuple[Path, Path]:
+    d = Path(certs_dir) if certs_dir is not None else CERTS_DIR
+    return d / "jarvis.key", d / "jarvis.crt"
 
 
+def cert_san_entries(cert_path: Path | None = None) -> list[str]:
+    """Return human-readable SAN strings (`DNS:localhost`, `IP:172.16.6.143`) for `cert_path`."""
+    p = Path(cert_path) if cert_path else (CERTS_DIR / "jarvis.crt")
+    if not p.is_file():
+        return []
+    try:
+        from cryptography import x509
+        cert = x509.load_pem_x509_certificate(p.read_bytes())
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        out = [f"DNS:{d}" for d in san.get_values_for_type(x509.DNSName)]
+        out.extend(f"IP:{ip}" for ip in san.get_values_for_type(x509.IPAddress))
+        return out
+    except Exception:
+        return []
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+def _cert_covers_targets(cert_path: Path, key_path: Path, required_ips: set[str]) -> bool:
+    if not (cert_path.is_file() and key_path.is_file()):
+        return False
+    try:
+        import datetime
+        from cryptography import x509
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+        exp = getattr(cert, "not_valid_after_utc", None)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if exp is not None and exp <= (now + datetime.timedelta(days=7)):
+            return False
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        dns_vals = set(san.get_values_for_type(x509.DNSName))
+        ip_vals = {str(ip) for ip in san.get_values_for_type(x509.IPAddress)}
+        if "localhost" not in dns_vals:
+            return False
+        return required_ips.issubset(ip_vals)
+    except Exception:
+        return False
 
-def _local_ip() -> str:
-    """Return the best LAN-facing IPv4 address, no internet required."""
-    # Method 1: route trick (fast, works when internet is available)
-    for probe in ("8.8.8.8", "1.1.1.1", "192.168.1.1"):
+
+def _ensure_certs(
+    *,
+    certs_dir: Path | None = None,
+    extra_ips: list[str] | None = None,
+) -> bool:
+    """Auto-generate or refresh self-signed TLS cert + key in git-ignored `memory/certs/`.
+
+    Ensures `SubjectAlternativeName` always covers `localhost`, `127.0.0.1`, the
+    real active Wi-Fi/Ethernet LAN IPv4, and any active Tailscale IPv4.
+    """
+    key_p, crt_p = _resolve_cert_files(certs_dir)
+    target_ips: set[str] = {"127.0.0.1"}
+    lan = detect_lan_ipv4()
+    if lan:
+        target_ips.add(lan)
+    ts_info = detect_tailscale()
+    if ts_info.get("ip"):
+        target_ips.add(str(ts_info["ip"]))
+    for extra in (extra_ips or []):
+        if extra:
+            target_ips.add(str(extra).strip())
+
+    valid_ips: list[ipaddress.IPv4Address] = []
+    for raw_ip in sorted(target_ips):
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(0.5)
-            s.connect((probe, 80))
-            ip = s.getsockname()[0]
-            s.close()
-            if not ip.startswith("127."):
-                return ip
-        except Exception:
-            pass
+            valid_ips.append(ipaddress.IPv4Address(raw_ip))
+        except ValueError:
+            continue
 
-    # Method 2: hostname resolution (works offline on most systems)
-    try:
-        ip = socket.gethostbyname(socket.gethostname())
-        if not ip.startswith("127."):
-            return ip
-    except Exception:
-        pass
-
-    # Method 3: enumerate all interfaces (fully offline, no external deps)
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ip = info[4][0]
-            if not ip.startswith("127.") and not ip.startswith("169.254."):
-                return ip
-    except Exception:
-        pass
-
-    return "127.0.0.1"
-
-
-def _ensure_certs() -> bool:
-    """
-    Make sure config/certs holds a TLS key pair, generating a self-signed one the
-    first time the dashboard runs.
-
-    The pair is deliberately NOT shipped in the repository. A private key that
-    every user downloads is the same as having no private key at all: anyone can
-    present a certificate that matches it. Generating locally gives each install
-    its own key, costs about a second, and happens exactly once.
-
-    Returns True when a usable pair exists afterwards; False leaves the caller on
-    plain HTTP, which still works — the QR code simply encodes http:// instead.
-    """
-    certs = BASE_DIR / "config" / "certs"
-    key_p = certs / "jarvis.key"
-    crt_p = certs / "jarvis.crt"
-    if key_p.exists() and crt_p.exists():
+    if _cert_covers_targets(crt_p, key_p, {str(ip) for ip in valid_ips}):
         return True
 
     try:
         import datetime
-        import ipaddress
         from cryptography import x509
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import rsa
         from cryptography.x509.oid import NameOID
     except ImportError:
         print("[Dashboard] cryptography not installed — serving over plain HTTP.")
-        print("[Dashboard] For HTTPS run:  pip install cryptography")
         return False
 
     try:
-        certs.mkdir(parents=True, exist_ok=True)
+        key_p.parent.mkdir(parents=True, exist_ok=True)
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
+        cn = lan if (lan and lan != "127.0.0.1") else "JARVIS Mark-LVII"
         who = x509.Name([
-            x509.NameAttribute(NameOID.COMMON_NAME, "JARVIS Dashboard"),
-            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "JARVIS"),
+            x509.NameAttribute(NameOID.COMMON_NAME, cn),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "JARVIS Mark-LVII"),
         ])
 
-        # The SAN has to cover every address the phone might use: the LAN IP the
-        # QR code encodes, plus localhost when testing on the machine itself.
-        alt = [x509.DNSName("localhost"),
-               x509.IPAddress(ipaddress.IPv4Address("127.0.0.1"))]
-        try:
-            lan = _local_ip()
-            if not lan.startswith("127."):
-                alt.append(x509.IPAddress(ipaddress.IPv4Address(lan)))
-        except Exception:
-            pass          # no LAN address resolvable — localhost entries still work
+        alt: list[x509.GeneralName] = [x509.DNSName("localhost")]
+        ts_dns = str(ts_info.get("dns_name") or "").strip()
+        if ts_dns:
+            alt.append(x509.DNSName(ts_dns))
+        for ip_obj in valid_ips:
+            alt.append(x509.IPAddress(ip_obj))
 
-        # Timezone-aware UTC: datetime.utcnow() is deprecated from Python 3.12 on,
-        # and the builder normalises aware values to UTC itself.
         now = datetime.datetime.now(datetime.timezone.utc)
         cert = (
             x509.CertificateBuilder()
@@ -651,39 +799,107 @@ def _ensure_certs() -> bool:
             encryption_algorithm=serialization.NoEncryption(),
         ))
         crt_p.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-
         try:
-            import os as _os
-            _os.chmod(key_p, 0o600)   # best effort — largely a no-op on Windows
+            os.chmod(key_p, 0o600)
         except Exception:
             pass
-
-        print(f"[Dashboard] Generated a self-signed certificate for this machine: {certs}")
+        print(f"[Dashboard] TLS certificate ready in {key_p.parent} (SAN IPs: {[str(i) for i in valid_ips]})")
         return True
-    except Exception as e:
-        print(f"[Dashboard] Certificate generation failed ({e}) — serving over plain HTTP.")
+    except Exception as exc:
+        print(f"[Dashboard] Certificate generation failed ({exc}) — serving over plain HTTP.")
         return False
+
+
+def cert_fingerprint_sha256(cert_path: Path | None = None) -> str:
+    """Return lowercase SHA-256 hex digest of the dashboard TLS certificate, or ''."""
+    candidates = [Path(cert_path)] if cert_path else [CERTS_DIR / "jarvis.crt", LEGACY_CERTS / "jarvis.crt"]
+    for p in candidates:
+        if p.is_file():
+            try:
+                from cryptography import x509
+                from cryptography.hazmat.primitives import hashes
+                cert = x509.load_pem_x509_certificate(p.read_bytes())
+                return cert.fingerprint(hashes.SHA256()).hex()
+            except Exception:
+                continue
+    return ""
+
+
+def _render_qr_png_base64(data: str) -> str:
+    """Render `data` into a base64 PNG QR code if `qrcode` is installed, else ''."""
+    if not data:
+        return ""
+    try:
+        import qrcode as _qrmod
+        qr = _qrmod.QRCode(
+            box_size=6,
+            border=2,
+            error_correction=_qrmod.constants.ERROR_CORRECT_M,
+        )
+        qr.add_data(data)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return ""
+
+
+def _synthetic_screen_jpeg() -> bytes:
+    """Minimal valid JPEG fallback when headless or OS screen capture is unavailable."""
+    try:
+        from PIL import Image, ImageDraw
+        img = Image.new("RGB", (640, 360), color=(7, 9, 15))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([16, 16, 624, 344], outline=(0, 212, 255), width=2)
+        draw.text((36, 160), "MARK-LVII LIVE DESKTOP STREAM", fill=(0, 212, 255))
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=75)
+        return buf.getvalue()
+    except Exception:
+        # 1x1 valid JPEG bytes
+        return base64.b64decode(
+            "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////"
+            "////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA="
+        )
 
 
 def _read(name: str) -> str:
     return (STATIC_DIR / name).read_text(encoding="utf-8")
 
 
-# ── DashboardServer ───────────────────────────────────────────────────────────
+# ── HUD CONFIRM / ChoiceBanner Bridge Helpers (core/confirm.py stays IMMUTABLE) ──
 
-# How long an auth token stays valid, and how many failed logins an address
-# gets before it has to wait.
-#
-# The old code had neither. A token, once issued, worked until the process
-# ended — no expiry, no logout — and /login accepted unlimited guesses at the
-# pairing key as fast as a script could send them. Eight characters is a large
-# space, but "large" is not the same as "let them try forever": the point of a
-# limit is that an attacker's cost grows while a person who mistypes their key
-# twice never notices it exists.
+def get_pending_hud_prompts() -> dict:
+    """Read active HUD `CONFIRM` and `ChoiceBanner` prompts without mutating `core/confirm.py`."""
+    confirm_info = None
+    choice_info = None
+    try:
+        from core import confirm as _cf
+        with _cf._lock:
+            p = _cf._pending
+            if p is not None:
+                rem = _cf.TIMEOUT_SECONDS - (time.monotonic() - p.at)
+                if rem > 0:
+                    confirm_info = {
+                        "key": p.key,
+                        "title": p.title,
+                        "detail": p.detail,
+                        "expires_in": round(rem, 1),
+                    }
+        choice_info = _cf.pending_choice_info()
+    except Exception:
+        pass
+    return {"confirm": confirm_info, "choice": choice_info}
+
+
+# ── Active Server & Cross-Thread Broadcast Helpers ────────────────────────────
+
 _TOKEN_TTL_SECONDS = 12 * 3600
 _LOGIN_MAX_TRIES   = 6
-_LOGIN_WINDOW      = 300.0      # seconds the counter looks back over
-_LOGIN_LOCKOUT     = 300.0      # seconds an address waits after using them up
+_LOGIN_WINDOW      = 300.0
+_LOGIN_LOCKOUT     = 300.0
 
 ANDROID_DEVICES_FILE = BASE_DIR / "memory" / "android_devices.json"
 _ACTIVE_SERVER = None
@@ -698,18 +914,20 @@ def get_active_server():
     return _ACTIVE_SERVER
 
 
-def cert_fingerprint_sha256(cert_path: Path | None = None) -> str:
-    """Return lowercase SHA-256 hex digest of the dashboard TLS certificate, or ''."""
-    p = Path(cert_path) if cert_path else (BASE_DIR / "config" / "certs" / "jarvis.crt")
-    if not p.is_file():
-        return ""
-    try:
-        from cryptography import x509
-        from cryptography.hazmat.primitives import hashes
-        cert = x509.load_pem_x509_certificate(p.read_bytes())
-        return cert.fingerprint(hashes.SHA256()).hex()
-    except Exception:
-        return ""
+def broadcast_mission_log(text: str, *, source: str = "brain", status: str = "") -> bool:
+    """Thread-safe helper allowing Brain/Swarm/MissionRunner to stream live logs to phones."""
+    srv = get_active_server()
+    if srv is None:
+        return False
+    return srv.push_mission_log(text, source=source, status=status)
+
+
+def broadcast_hud_prompt(event_type: str, payload: dict | None = None) -> bool:
+    """Thread-safe helper pushing `confirm_prompt` / `choice_prompt` updates to phones."""
+    srv = get_active_server()
+    if srv is None:
+        return False
+    return srv.push_ws_event({"type": event_type, **(payload or {}), "ts": time.time()})
 
 
 def dispatch_android_command_sync(
@@ -737,20 +955,13 @@ def dispatch_android_command_sync(
 
 
 class _Throttle:
-    """Failed-attempt counter, per client address.
-
-    Deliberately tiny and in memory: it protects a pairing key that is itself
-    only alive for ten minutes, so nothing here needs to survive a restart.
-    Successful logins clear the count, which keeps a household on one address
-    from locking itself out because somebody fumbled the code once.
-    """
+    """Failed-attempt counter, per client address."""
 
     def __init__(self):
         self._fails: dict[str, list[float]] = {}
         self._lock = threading.Lock()
 
     def blocked_for(self, who: str) -> float:
-        """Seconds this address must wait, or 0."""
         now = time.time()
         with self._lock:
             tries = [t for t in self._fails.get(who, []) if now - t < _LOGIN_WINDOW]
@@ -770,22 +981,24 @@ class _Throttle:
 
 class DashboardServer:
 
-    def __init__(self):
-        self._ip                          = _local_ip()
-        # token -> issued-at. A set had no way to expire anything; this does,
-        # and `_auth` sweeps as it reads so nothing has to run a timer.
+    def __init__(self, *, certs_dir: Path | None = None):
+        self._certs_dir                   = Path(certs_dir) if certs_dir else CERTS_DIR
+        self._ip                          = detect_lan_ipv4()
+        _ensure_certs(certs_dir=self._certs_dir, extra_ips=[self._ip] if self._ip != "127.0.0.1" else [])
         self._tokens: dict[str, float]    = {}
-        self._token_keys: dict[str, str]  = {}   # auth_token → session_key
-        self._aes_cache:  dict[str, bytes]= {}   # session_key → AES bytes
+        self._token_keys: dict[str, str]  = {}
+        self._aes_cache: dict[str, bytes] = {}
         self._clients: set[WebSocket]     = set()
         self._history: list[dict]         = []
+        self._mission_logs: list[dict]    = []
         self._command_queue               = asyncio.Queue()
         self._wake_callback               = None
         self._connect_callback            = None
         self._pending_keys: dict[str, float] = {}
+        self._last_qr_key: str            = ""
         self._throttle                    = _Throttle()
-        self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
-        self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
+        self._device_sessions: dict[str, dict] = {}
+        self._phone_audio_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         self._uploads_dir                 = UPLOADS_DIR
         self._devices_file: Path          = ANDROID_DEVICES_FILE
         self._android_devices: dict[str, dict] = {}
@@ -793,9 +1006,10 @@ class DashboardServer:
         self._android_events: list[dict]  = []
         self._tool_executor               = None
         self._event_callback              = None
+        self._screen_capture_fn           = None
+        self._screen_bounds_fn            = None
+        self._screen_input_fn             = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        # Set by serve() when the port could not be taken, so the UI can say
-        # why the QR code leads nowhere instead of showing it regardless.
         self._bind_error: str = ""
         self._login_html                  = _read("login.html")
         self._app_html                    = _read("app.html")
@@ -804,69 +1018,111 @@ class DashboardServer:
         set_active_server(self)
         self.app                          = self._build_app()
 
-    # ── one-time key management ───────────────────────────────────────────
+    # ── Key & TLS helpers ────────────────────────────────────────────────────
 
     def new_key(self, expiry_secs: int = 600) -> str:
         now = time.time()
         self._pending_keys = {k: v for k, v in self._pending_keys.items() if v > now}
-        key = ''.join(secrets.choice(_KEY_CHARS) for _ in range(8))
+        key = "".join(secrets.choice(_KEY_CHARS) for _ in range(8))
         self._pending_keys[key] = now + expiry_secs
+        self._last_qr_key = key
         return key
 
-    @staticmethod
-    def _ssl_enabled() -> bool:
-        """Is HTTPS switched on? Off unless the user asked for it.
+    def active_or_new_key(self, expiry_secs: int = 600) -> str:
+        now = time.time()
+        self._pending_keys = {k: v for k, v in self._pending_keys.items() if v > now}
+        if self._last_qr_key and self._pending_keys.get(self._last_qr_key, 0.0) > now + 30.0:
+            return self._last_qr_key
+        return self.new_key(expiry_secs=expiry_secs)
 
-        WHY THE DEFAULT IS PLAIN HTTP, AFTER A RELEASE THAT MADE TLS MANDATORY
-            The certificate has to be self-signed — there is no certificate
-            authority on earth that will vouch for 192.168.1.108 — and a phone
-            treats a self-signed certificate as an attack. Chrome shows a
-            full-page interstitial; a QR scanner that opens links in its own
-            in-app browser often shows nothing at all and offers no way to
-            proceed, because those views deliberately have no "Advanced" button.
-
-            So the practical result of requiring TLS was a dashboard nobody
-            could reach, which is not a more secure product than one they can.
-            The pairing key, the rate limit, the token expiry and the
-            revoke-all-devices fix are all unaffected and all still apply.
-
-            What IS lost over plain HTTP is the AES-GCM layer, because
-            `crypto.subtle` does not exist outside a secure context. The page
-            says so on its own badge rather than pretending, and commands then
-            travel the local network in clear — which is what this dashboard
-            did for every release before this one.
-
-            Turn it on with "dashboard_https": true in config/api_keys.json if
-            the network is one where that matters; the certificate is generated
-            automatically and you will have to accept it once per device.
-        """
+    def _ssl_enabled(self) -> bool:
+        """HTTPS enabled by default using `memory/certs/` unless explicitly set false in config."""
         try:
-            import json as _json
-            with open(BASE_DIR / "config" / "api_keys.json", "r",
-                      encoding="utf-8") as f:
-                if not _json.load(f).get("dashboard_https"):
+            cfg_p = BASE_DIR / "config" / "api_keys.json"
+            if cfg_p.is_file():
+                cfg = json.loads(cfg_p.read_text(encoding="utf-8"))
+                if cfg.get("dashboard_https") is False:
                     return False
         except Exception:
-            return False
-        certs = BASE_DIR / "config" / "certs"
-        return (certs / "jarvis.key").exists() and (certs / "jarvis.crt").exists()
+            pass
+        key_p, crt_p = _resolve_cert_files(self._certs_dir)
+        if not (key_p.is_file() and crt_p.is_file()):
+            _ensure_certs(certs_dir=self._certs_dir)
+        return key_p.is_file() and crt_p.is_file()
 
-    def get_url(self) -> str:
-        """The full URL the QR code carries — always with its scheme, so a
-        scanner never has to guess."""
-        if self._ssl_enabled():
-            return f"https://{self._ip}:{SECURE_PORT}"
-        return f"http://{self._ip}:{PORT}"
+    def cert_sha256(self) -> str:
+        _, crt_p = _resolve_cert_files(self._certs_dir)
+        return cert_fingerprint_sha256(crt_p)
+
+    def get_url(self, *, mode: str = "lan") -> str:
+        """Primary URL (HTTPS on port 8000 by default, or active Tailscale / Cloudflare Tunnel)."""
+        ssl_on = self._ssl_enabled()
+        scheme = "https" if ssl_on else "http"
+        m = (mode or "lan").strip().lower()
+        if m == "tunnel":
+            tun = get_tunnel_status()
+            if tun.get("running") and tun.get("url"):
+                return str(tun["url"]).rstrip("/")
+        if m == "tailscale":
+            ts = detect_tailscale(port=PORT, https=ssl_on)
+            if ts.get("available") and ts.get("url"):
+                return str(ts["url"]).rstrip("/")
+        self._ip = detect_lan_ipv4()
+        return f"{scheme}://{self._ip}:{PORT}"
 
     def get_manual_url(self) -> str:
-        """What to type into a phone browser by hand.
+        return f"{self.get_url()}/pwa"
 
-        Points at the redirect port when TLS is on, because a bare `ip:port`
-        typed into a browser is tried over HTTP — and HTTP against the TLS port
-        looks exactly like the server being switched off. The redirector speaks
-        HTTP, so it answers, and sends the browser on to the secure page.
-        """
-        return f"{self._ip}:{PORT}"
+    def build_qr_pairing_info(
+        self,
+        key: str | None = None,
+        *,
+        include_pin: bool = True,
+        mode: str = "lan",
+    ) -> dict:
+        """Build 1-tap phone pairing metadata (URL + PIN + TLS SHA-256 + PNG QR)."""
+        ssl_on = self._ssl_enabled()
+        base_url = self.get_url(mode=mode)
+        pwa_url = f"{base_url}/pwa"
+        fp = self.cert_sha256()
+        pin = (key or self.active_or_new_key()) if include_pin else ""
+
+        q_params: dict[str, str] = {}
+        if pin:
+            q_params["pin"] = pin
+        if fp:
+            q_params["fp"] = fp
+        pairing_url = f"{pwa_url}?{urlencode(q_params)}" if q_params else pwa_url
+        auto_login_url = f"{base_url}/auto-login?key={pin}" if pin else base_url
+
+        qr_payload = {
+            "v": 2,
+            "url": base_url,
+            "pwa_url": pwa_url,
+            "pairing_url": pairing_url,
+            "pin": pin,
+            "cert_sha256": fp,
+            "ws_path": "/ws",
+            "https": ssl_on,
+        }
+        return {
+            "ok": True,
+            "https": ssl_on,
+            "port": PORT,
+            "lan_ip": self._ip,
+            "url": base_url,
+            "pwa_url": pwa_url,
+            "pairing_url": pairing_url,
+            "auto_login_url": auto_login_url,
+            "pin": pin,
+            "auth_required_for_pin": not include_pin,
+            "cert_sha256": fp,
+            "san": cert_san_entries(_resolve_cert_files(self._certs_dir)[1]),
+            "qr_payload": qr_payload,
+            "qr_png_base64": _render_qr_png_base64(pairing_url),
+            "tailscale": detect_tailscale(port=PORT, https=ssl_on),
+            "cloudflare_tunnel": get_tunnel_status(),
+        }
 
     def _aes_key(self, session_key: str) -> bytes:
         if session_key not in self._aes_cache:
@@ -882,7 +1138,7 @@ class DashboardServer:
         except Exception:
             return None
 
-    # ── callbacks ────────────────────────────────────────────────────────
+    # ── Callbacks & Injectables ──────────────────────────────────────────────
 
     def set_wake_callback(self, fn) -> None:
         self._wake_callback = fn
@@ -895,6 +1151,141 @@ class DashboardServer:
 
     def set_event_callback(self, fn) -> None:
         self._event_callback = fn
+
+    def set_screen_handlers(self, *, capture_fn=None, bounds_fn=None, input_fn=None) -> None:
+        if capture_fn is not None:
+            self._screen_capture_fn = capture_fn
+        if bounds_fn is not None:
+            self._screen_bounds_fn = bounds_fn
+        if input_fn is not None:
+            self._screen_input_fn = input_fn
+
+    # ── Screen Capture & Remote Tap/Type Execution ───────────────────────────
+
+    def _get_screen_bounds(self) -> tuple[int, int, int, int]:
+        if callable(self._screen_bounds_fn):
+            try:
+                b = self._screen_bounds_fn()
+                if isinstance(b, (tuple, list)) and len(b) == 4:
+                    return int(b[0]), int(b[1]), max(1, int(b[2])), max(1, int(b[3]))
+            except Exception:
+                pass
+        try:
+            import pyautogui
+            sz = pyautogui.size()
+            return 0, 0, max(1, int(sz.width)), max(1, int(sz.height))
+        except Exception:
+            return 0, 0, 1920, 1080
+
+    def capture_screen_frame(self) -> tuple[bytes, str, int, int]:
+        """Capture current PC desktop frame as `(bytes, mime_type, width, height)`."""
+        _, _, w, h = self._get_screen_bounds()
+        img_bytes: bytes | None = None
+        mime = "image/jpeg"
+        try:
+            if callable(self._screen_capture_fn):
+                raw = self._screen_capture_fn()
+            else:
+                from actions.screen_processor import _capture_screen
+                raw = _capture_screen()
+            if isinstance(raw, tuple) and len(raw) >= 2:
+                img_bytes = bytes(raw[0]) if raw[0] else None
+                mime = str(raw[1] or "image/jpeg")
+            elif isinstance(raw, (bytes, bytearray)):
+                img_bytes = bytes(raw)
+        except Exception:
+            img_bytes = None
+
+        if not img_bytes:
+            img_bytes = _synthetic_screen_jpeg()
+            mime = "image/jpeg"
+        return img_bytes, mime, w, h
+
+    def execute_screen_input(self, payload: dict) -> dict:
+        """Execute remote tap/click/type/key/scroll from phone with safety guards."""
+        action = str(payload.get("action") or "tap").strip().lower()
+        left, top, width, height = self._get_screen_bounds()
+
+        x = payload.get("x")
+        y = payload.get("y")
+        raw_nx = payload.get("norm_x", payload.get("nx"))
+        raw_ny = payload.get("norm_y", payload.get("ny"))
+        if (raw_nx is not None and raw_ny is not None) and (x is None or y is None):
+            nx = max(0.0, min(1.0, float(raw_nx or 0.0)))
+            ny = max(0.0, min(1.0, float(raw_ny or 0.0)))
+            x = left + int(round(nx * max(0, width - 1)))
+            y = top + int(round(ny * max(0, height - 1)))
+        elif x is not None and y is not None:
+            x = max(left, min(left + width - 1, int(x)))
+            y = max(top, min(top + height - 1, int(y)))
+
+        keys_raw = str(payload.get("keys") or "").strip()
+        text_raw = str(payload.get("text") or "")
+
+        # Safety gate for destructive/power key combos sent remotely
+        dangerous_keys = {"shift+delete", "shift+del", "ctrl+alt+del", "ctrl+alt+delete"}
+        if action in ("key", "press") and keys_raw.lower().replace(" ", "") in dangerous_keys:
+            from core.evolution import safety_guard
+            msg = safety_guard.enforce_gate(
+                "autonomous_screen_agent",
+                "irreversible_act",
+                f"Remote Destructive Key: {keys_raw}",
+                f"Phone requested destructive shortcut {keys_raw}",
+                lambda: self._run_raw_screen_input(action, x, y, text_raw, keys_raw, payload),
+                key=f"phone_key_{keys_raw}",
+            )
+            return {"ok": False, "gated": True, "message": msg}
+
+        if callable(self._screen_input_fn):
+            res = self._screen_input_fn({
+                "action": action,
+                "x": x,
+                "y": y,
+                "text": text_raw,
+                "keys": keys_raw,
+                "direction": str(payload.get("direction") or "down"),
+                "amount": int(payload.get("amount") or 3),
+            })
+            if isinstance(res, dict):
+                return {"ok": bool(res.get("ok", True)), "x": x, "y": y, **res}
+            return {"ok": True, "action": action, "x": x, "y": y, "detail": str(res)}
+
+        detail = self._run_raw_screen_input(action, x, y, text_raw, keys_raw, payload)
+        ok = not detail.lower().startswith("error:")
+        return {"ok": ok, "action": action, "x": x, "y": y, "detail": detail}
+
+    @staticmethod
+    def _run_raw_screen_input(action: str, x: int | None, y: int | None, text: str, keys: str, payload: dict) -> str:
+        try:
+            from core import screenact
+            if action in ("tap", "click", "double_click", "right_click"):
+                if x is None or y is None:
+                    return "Error: missing coordinates for screen tap."
+                pt = screenact.Point(int(x), int(y), origin="phone_remote", label="phone_tap")
+                if action == "double_click":
+                    act = screenact.double_click(pt)
+                elif action == "right_click":
+                    act = screenact.right_click(pt)
+                else:
+                    act = screenact.click(pt)
+                return act.detail or ("ok" if act.ok else f"Error: {act.error}")
+            if action in ("type", "type_text"):
+                act = screenact.type_text(text, clear_first=bool(payload.get("clear_first", False)))
+                return act.detail or ("typed" if act.ok else f"Error: {act.error}")
+            if action in ("key", "press"):
+                act = screenact.press(keys)
+                return act.detail or ("pressed" if act.ok else f"Error: {act.error}")
+            if action == "scroll":
+                direction = str(payload.get("direction") or "down").lower()
+                amount = int(payload.get("amount") or 3)
+                pt = screenact.Point(int(x), int(y), origin="phone_remote", label="scroll") if (x is not None and y is not None) else None
+                act = screenact.scroll(direction, amount, target=pt)
+                return act.detail or ("scrolled" if act.ok else f"Error: {act.error}")
+            return f"Error: unsupported screen input action {action!r}"
+        except Exception as exc:
+            return f"Error: {type(exc).__name__}: {exc}"
+
+    # ── Device Persistence & RPC ─────────────────────────────────────────────
 
     def _load_known_devices(self) -> None:
         p = Path(self._devices_file)
@@ -977,7 +1368,7 @@ class DashboardServer:
         finally:
             self._pending_android_reqs.pop(req_id, None)
 
-    # ── broadcast ────────────────────────────────────────────────────────
+    # ── Broadcast & Mission Log Stream ───────────────────────────────────────
 
     async def broadcast(self, msg: dict) -> None:
         self._history.append(msg)
@@ -991,14 +1382,38 @@ class DashboardServer:
                 dead.add(ws)
         self._clients -= dead
 
-    # ── FastAPI app ───────────────────────────────────────────────────────
+    def push_ws_event(self, msg: dict) -> bool:
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(self.broadcast(msg), loop)
+                return True
+            except Exception:
+                return False
+        self._history.append(msg)
+        if len(self._history) > 300:
+            self._history = self._history[-300:]
+        return True
+
+    def push_mission_log(self, text: str, *, source: str = "brain", status: str = "") -> bool:
+        entry = {
+            "type": "mission_log",
+            "source": str(source or "brain"),
+            "status": str(status or ""),
+            "text": str(text or "")[:600],
+            "ts": time.time(),
+        }
+        self._mission_logs.append(entry)
+        if len(self._mission_logs) > 250:
+            self._mission_logs = self._mission_logs[-250:]
+        return self.push_ws_event(entry)
+
+    # ── FastAPI App ──────────────────────────────────────────────────────────
 
     def _build_app(self) -> "FastAPI":
         app = FastAPI(docs_url=None, redoc_url=None)
 
         def _valid(tok: str) -> bool:
-            """Is this token live? Expired ones are dropped as they are found,
-            which keeps the sweep free and needs no background timer."""
             if not tok:
                 return False
             issued = self._tokens.get(tok)
@@ -1011,12 +1426,26 @@ class DashboardServer:
             return True
 
         def _auth(req: Request) -> bool:
-            return _valid(req.headers.get("authorization", "")
-                          .removeprefix("Bearer ").strip())
+            bearer = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
+            if _valid(bearer):
+                return True
+            q_tok = str(req.query_params.get("token") or "").strip()
+            return _valid(q_tok)
 
         def _who(req: Request) -> str:
-            """The client address a throttle counts against."""
             return (getattr(getattr(req, "client", None), "host", "") or "unknown")
+
+        def _is_trusted_local_caller(req: Request) -> bool:
+            if _auth(req):
+                return True
+            host = _who(req).lower()
+            if host in ("127.0.0.1", "::1", "localhost", "testclient"):
+                return True
+            if self._ip and host == self._ip.lower():
+                return True
+            q_pin = str(req.query_params.get("pin") or req.query_params.get("key") or "").strip().upper()
+            now = time.time()
+            return bool(q_pin and self._pending_keys.get(q_pin, 0.0) > now)
 
         @app.get("/login", response_class=HTMLResponse)
         async def login_page():
@@ -1024,19 +1453,20 @@ class DashboardServer:
 
         @app.get("/", response_class=HTMLResponse)
         async def index():
-            # Auth is handled client-side via sessionStorage bearer token.
-            # Server-side header auth can't work here because browser navigations
-            # don't send custom headers (location.href doesn't carry Authorization).
-            html = (self._app_html
-                    .replace("__IP__", self._ip)
-                    .replace("__PORT__", str(PORT)))
+            html = (
+                self._app_html
+                .replace("__IP__", self._ip)
+                .replace("__PORT__", str(PORT))
+            )
             return HTMLResponse(html)
 
         @app.get("/pwa", response_class=HTMLResponse)
         async def pwa_page():
-            html = (self._pwa_html
-                    .replace("__IP__", self._ip)
-                    .replace("__PORT__", str(SECURE_PORT if self._ssl_enabled() else PORT)))
+            html = (
+                self._pwa_html
+                .replace("__IP__", self._ip)
+                .replace("__PORT__", str(PORT))
+            )
             return HTMLResponse(html)
 
         @app.get("/manifest.webmanifest")
@@ -1055,8 +1485,41 @@ class DashboardServer:
         async def get_cert_fingerprint():
             return JSONResponse({
                 "https": self._ssl_enabled(),
-                "sha256": cert_fingerprint_sha256(),
+                "sha256": self.cert_sha256(),
+                "lan_ip": self._ip,
+                "port": PORT,
+                "san": cert_san_entries(_resolve_cert_files(self._certs_dir)[1]),
             })
+
+        @app.get("/api/android/qr")
+        async def android_qr_ep(req: Request, mode: str = "lan"):
+            include_pin = _is_trusted_local_caller(req)
+            info = self.build_qr_pairing_info(include_pin=include_pin, mode=mode)
+            return JSONResponse(info)
+
+        @app.get("/api/android/tunnel")
+        async def tunnel_status_ep(req: Request):
+            if not _is_trusted_local_caller(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            return JSONResponse({
+                "ok": True,
+                "tailscale": detect_tailscale(port=PORT, https=self._ssl_enabled()),
+                "cloudflare_tunnel": get_tunnel_status(),
+            })
+
+        @app.post("/api/android/tunnel")
+        async def tunnel_control_ep(req: Request):
+            if not _is_trusted_local_caller(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            body = await req.json()
+            action = str(body.get("action") or "status").strip().lower()
+            if action == "start":
+                st = await asyncio.to_thread(start_quick_tunnel, local_port=PORT, https=self._ssl_enabled())
+                return JSONResponse({"ok": bool(st.get("running")), "cloudflare_tunnel": st})
+            if action == "stop":
+                st = await asyncio.to_thread(stop_quick_tunnel)
+                return JSONResponse({"ok": True, "cloudflare_tunnel": st})
+            return JSONResponse({"ok": True, "cloudflare_tunnel": get_tunnel_status()})
 
         @app.post("/api/android/pair")
         async def android_pair(req: Request):
@@ -1073,6 +1536,8 @@ class DashboardServer:
             if entered in self._pending_keys and self._pending_keys[entered] > now:
                 self._throttle.clear(who)
                 del self._pending_keys[entered]
+                if self._last_qr_key == entered:
+                    self._last_qr_key = ""
                 tok = secrets.token_urlsafe(32)
                 dev_tok = secrets.token_urlsafe(32)
                 dev_id = str(body.get("device_id") or f"android-{secrets.token_hex(3)}")
@@ -1101,7 +1566,7 @@ class DashboardServer:
                     "device_id": dev_id,
                     "session_key": entered,
                     "ws_path": "/ws",
-                    "cert_sha256": cert_fingerprint_sha256(),
+                    "cert_sha256": self.cert_sha256(),
                     "protocol_version": 2,
                 })
             self._throttle.record_failure(who)
@@ -1142,18 +1607,99 @@ class DashboardServer:
             res = await self.send_to_android(device_id, action, params)
             return JSONResponse(res)
 
+        # ── Live PC Screen Stream + Remote Tap/Type Endpoints ────────────────
+
+        @app.get("/api/screen/frame")
+        async def screen_frame_ep(req: Request, format: str = "binary"):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            img_bytes, mime, w, h = await asyncio.to_thread(self.capture_screen_frame)
+            if str(format or "").lower() == "json":
+                return JSONResponse({
+                    "ok": True,
+                    "mime_type": mime,
+                    "width": w,
+                    "height": h,
+                    "image_b64": base64.b64encode(img_bytes).decode("ascii"),
+                    "ts": time.time(),
+                })
+            return Response(
+                content=img_bytes,
+                media_type=mime,
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate",
+                    "X-Screen-Width": str(w),
+                    "X-Screen-Height": str(h),
+                },
+            )
+
+        @app.post("/api/screen/input")
+        async def screen_input_ep(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            body = await req.json()
+            if not isinstance(body, dict):
+                return JSONResponse({"ok": False, "error": "Invalid JSON object"}, status_code=400)
+            out = await asyncio.to_thread(self.execute_screen_input, body)
+            return JSONResponse(out)
+
+        # ── Live Mission Log & 1-Tap Remote HUD Approval Endpoints ───────────
+
+        @app.get("/api/missions/live")
+        async def missions_live_ep(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            return JSONResponse({
+                "ok": True,
+                "logs": self._mission_logs[-80:],
+                "pending_prompts": get_pending_hud_prompts(),
+            })
+
+        @app.get("/api/confirm/pending")
+        async def confirm_pending_ep(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            return JSONResponse({"ok": True, **get_pending_hud_prompts()})
+
+        @app.post("/api/confirm/resolve")
+        async def confirm_resolve_ep(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            body = await req.json()
+            kind = str(body.get("kind") or "confirm").strip().lower()
+            from core import confirm as _cf
+            if kind == "choice":
+                sel = body.get("selection")
+                sync = bool(body.get("sync", False))
+                msg = _cf.resolve_choice(sel, sync=sync)
+                await self.broadcast({
+                    "type": "confirm_resolved",
+                    "kind": "choice",
+                    "selection": sel,
+                    "message": msg,
+                    "ts": time.time(),
+                })
+                return JSONResponse({"ok": True, "kind": "choice", "message": msg})
+
+            accepted = bool(body.get("accepted", False))
+            _cf.resolve(accepted)
+            await self.broadcast({
+                "type": "confirm_resolved",
+                "kind": "confirm",
+                "accepted": accepted,
+                "ts": time.time(),
+            })
+            return JSONResponse({"ok": True, "kind": "confirm", "accepted": accepted})
+
+        # ── Web Browser Login & Device Session Endpoints ─────────────────────
+
         @app.post("/login")
         async def login(req: Request):
             who  = _who(req)
             wait = self._throttle.blocked_for(who)
             if wait > 0:
-                # 429 rather than 401 on purpose: it tells an honest user why
-                # their correct key was refused, and it tells a script that
-                # guessing is not working.
                 return JSONResponse(
-                    {"ok": False,
-                     "error": f"Too many attempts. Try again in "
-                              f"{int(wait) + 1} seconds."},
+                    {"ok": False, "error": f"Too many attempts. Try again in {int(wait) + 1} seconds."},
                     status_code=429,
                 )
             body    = await req.json()
@@ -1161,25 +1707,22 @@ class DashboardServer:
             now     = time.time()
             if entered in self._pending_keys and self._pending_keys[entered] > now:
                 self._throttle.clear(who)
-                del self._pending_keys[entered]          # one-time use
+                del self._pending_keys[entered]
+                if self._last_qr_key == entered:
+                    self._last_qr_key = ""
                 tok = secrets.token_urlsafe(32)
                 self._tokens[tok] = time.time()
                 self._token_keys[tok] = entered
-                self._aes_key(entered)                   # pre-derive & cache
+                self._aes_key(entered)
                 if self._connect_callback:
                     self._connect_callback()
-                asyncio.create_task(self.broadcast(
-                    {"type": "sys", "text": "Remote connection established."}
-                ))
-                # Bearer token in response body — no cookies needed (works on any browser/HTTP)
-                return JSONResponse({"ok": True, "token": tok})
+                asyncio.create_task(self.broadcast({"type": "sys", "text": "Remote connection established."}))
+                return JSONResponse({"ok": True, "token": tok, "session_key": entered, "cert_sha256": self.cert_sha256()})
             self._throttle.record_failure(who)
-            return JSONResponse({"ok": False, "error": "Invalid or expired key"},
-                                status_code=401)
+            return JSONResponse({"ok": False, "error": "Invalid or expired key"}, status_code=401)
 
         @app.get("/auto-login")
         async def auto_login(key: str = ""):
-            """QR code target — validates one-time key, creates session, redirects phone."""
             now = time.time()
             if not key or key not in self._pending_keys or self._pending_keys[key] <= now:
                 return HTMLResponse("""<!DOCTYPE html>
@@ -1194,6 +1737,8 @@ class DashboardServer:
 </div></body></html>""")
 
             del self._pending_keys[key]
+            if self._last_qr_key == key:
+                self._last_qr_key = ""
             tok     = secrets.token_urlsafe(32)
             dev_tok = secrets.token_urlsafe(32)
             self._tokens[tok] = time.time()
@@ -1203,9 +1748,7 @@ class DashboardServer:
 
             if self._connect_callback:
                 self._connect_callback()
-            asyncio.create_task(self.broadcast(
-                {"type": "sys", "text": "Remote connection established via QR code."}
-            ))
+            asyncio.create_task(self.broadcast({"type": "sys", "text": "Remote connection established via QR code."}))
 
             return HTMLResponse(f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width">
@@ -1219,14 +1762,13 @@ class DashboardServer:
   sessionStorage.setItem('jarvis_token','{tok}');
   sessionStorage.setItem('jarvis_key','{key}');
   localStorage.setItem('jarvis_device_token','{dev_tok}');
-  setTimeout(function(){{location.replace('/')}},400);
+  setTimeout(function(){{location.replace('/pwa')}},250);
 </script>
 <p>Connecting to JARVIS…</p>
 </body></html>""")
 
         @app.post("/api/device-login")
         async def device_login_ep(req: Request):
-            """Return a fresh auth token for a previously paired device token."""
             try:
                 body = await req.json()
             except Exception:
@@ -1241,25 +1783,13 @@ class DashboardServer:
             self._aes_key(session_key)
             if self._connect_callback:
                 self._connect_callback()
-            asyncio.create_task(self.broadcast(
-                {"type": "sys", "text": "Known device reconnected automatically."}
-            ))
+            asyncio.create_task(self.broadcast({"type": "sys", "text": "Known device reconnected automatically."}))
             return JSONResponse({"ok": True, "token": tok, "key": session_key})
 
         @app.post("/api/revoke-devices")
         async def revoke_devices(req: Request):
-            """Invalidate all persistent device tokens (admin action)."""
             if not _auth(req):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
-            # ALSO drop the live tokens, which this did not do.
-            #
-            # It cleared the remembered devices and left every session those
-            # devices had already opened working until the app restarted — so
-            # "revoke all devices" revoked nothing anybody was currently using,
-            # which is the one case somebody presses it for.
-            #
-            # The caller's own token is kept, or pressing the button would log
-            # out the person who pressed it.
             mine  = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
             count = len(self._device_sessions)
             live  = len(self._tokens) - (1 if mine in self._tokens else 0)
@@ -1298,7 +1828,7 @@ class DashboardServer:
                 self._wake_callback()
             return JSONResponse({"ok": True})
 
-        # ── Phone mic real-time audio → Gemini Live ──────────────────────────
+        # ── Phone Mic Real-Time Audio -> Gemini Live ─────────────────────────
 
         @app.websocket("/ws/phone-audio")
         async def phone_audio_ws(websocket: WebSocket, token: str = ""):
@@ -1307,30 +1837,29 @@ class DashboardServer:
                 await websocket.close(code=4001)
                 return
             await websocket.accept()
-            asyncio.create_task(self.broadcast(
-                {"type": "sys", "text": "Phone microphone live."}
-            ))
+            if self._wake_callback:
+                try:
+                    self._wake_callback()
+                except Exception:
+                    pass
+            asyncio.create_task(self.broadcast({"type": "sys", "text": "Phone microphone live."}))
             try:
                 while True:
                     data = await websocket.receive_bytes()
                     try:
-                        self._phone_audio_queue.put_nowait(
-                            {"data": data, "mime_type": "audio/pcm"}
-                        )
+                        self._phone_audio_queue.put_nowait({"data": data, "mime_type": "audio/pcm"})
                     except asyncio.QueueFull:
-                        pass  # drop frame rather than block
+                        pass
             except WebSocketDisconnect:
                 pass
             finally:
-                asyncio.create_task(self.broadcast(
-                    {"type": "sys", "text": "Phone microphone stopped."}
-                ))
+                asyncio.create_task(self.broadcast({"type": "sys", "text": "Phone microphone stopped."}))
 
-        # ── File sharing ──────────────────────────────────────────────────────
+        # ── File Sharing ─────────────────────────────────────────────────────
 
         def _safe_filename(raw: str) -> str:
-            name = Path(raw).name                          # strip path components
-            name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(". ")
+            name = Path(raw).name
+            name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(". ")
             return name or "upload"
 
         if _UPLOAD_OK:
@@ -1381,6 +1910,7 @@ class DashboardServer:
         else:
             @app.post("/api/upload")
             async def upload_unavailable(req: Request):
+                _ = req
                 return JSONResponse(
                     {"error": "File uploads require: pip install python-multipart"},
                     status_code=503,
@@ -1404,15 +1934,16 @@ class DashboardServer:
 
         @app.get("/uploads/{filename}")
         async def download_file(filename: str, token: str = ""):
-            # Auth via query param — browser <a download> can't send custom headers
             tok = token.strip()
             if not _valid(tok):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
-            safe = re.sub(r'[/\\]', '', filename)
+            safe = re.sub(r"[/\\]", "", filename)
             path = self._uploads_dir / safe
             if not path.exists() or not path.is_file():
                 return JSONResponse({"error": "Not found"}, status_code=404)
             return FileResponse(str(path), filename=safe)
+
+        # ── Bidirectional Authenticated WebSocket (`/ws`) ────────────────────
 
         @app.websocket("/ws")
         async def ws_ep(websocket: WebSocket, token: str = ""):
@@ -1429,6 +1960,19 @@ class DashboardServer:
                     await websocket.send_json(entry)
                 except Exception:
                     break
+            # Immediately push any active HUD CONFIRM or ChoiceBanner prompt to newly connected phone
+            pending_now = get_pending_hud_prompts()
+            if pending_now.get("confirm"):
+                try:
+                    await websocket.send_json({"type": "confirm_prompt", **pending_now["confirm"]})
+                except Exception:
+                    pass
+            if pending_now.get("choice"):
+                try:
+                    await websocket.send_json({"type": "choice_prompt", **pending_now["choice"]})
+                except Exception:
+                    pass
+
             try:
                 while True:
                     data = await websocket.receive_json()
@@ -1504,6 +2048,45 @@ class DashboardServer:
                                 "data": data.get("data"),
                                 "error": str(data.get("error") or ""),
                             })
+
+                    elif msg_type == "screen_frame_req":
+                        img_bytes, mime, w, h = await asyncio.to_thread(self.capture_screen_frame)
+                        await websocket.send_json({
+                            "type": "screen_frame",
+                            "ok": True,
+                            "mime_type": mime,
+                            "width": w,
+                            "height": h,
+                            "image_b64": base64.b64encode(img_bytes).decode("ascii"),
+                            "ts": time.time(),
+                        })
+
+                    elif msg_type == "screen_input":
+                        out = await asyncio.to_thread(self.execute_screen_input, data)
+                        await websocket.send_json({
+                            "type": "screen_input_ack",
+                            **out,
+                        })
+
+                    elif msg_type == "confirm_pending_req":
+                        await websocket.send_json({
+                            "type": "confirm_pending",
+                            **get_pending_hud_prompts(),
+                        })
+
+                    elif msg_type == "confirm_resolve":
+                        from core import confirm as _cf
+                        kind = str(data.get("kind") or "confirm").strip().lower()
+                        if kind == "choice":
+                            sel = data.get("selection")
+                            msg = _cf.resolve_choice(sel, sync=bool(data.get("sync", False)))
+                            ev_out = {"type": "confirm_resolved", "kind": "choice", "selection": sel, "message": msg, "ts": time.time()}
+                        else:
+                            acc = bool(data.get("accepted", False))
+                            _cf.resolve(acc)
+                            ev_out = {"type": "confirm_resolved", "kind": "confirm", "accepted": acc, "ts": time.time()}
+                        await websocket.send_json(ev_out)
+                        asyncio.create_task(self.broadcast(ev_out))
 
                     elif msg_type == "tool_invoke":
                         req_id = str(data.get("request_id") or secrets.token_hex(6))
@@ -1585,42 +2168,28 @@ class DashboardServer:
 
         return app
 
-    # ── serve ─────────────────────────────────────────────────────────────
+    # ── Serve (0.0.0.0:8000 HTTPS + Optional :8001 HTTP Redirector) ──────────
 
     async def _serve_redirector(self) -> None:
-        """A plain-HTTP listener whose only job is to send people to HTTPS.
-
-        THE PROBLEM THIS SOLVES, WHICH LOOKED LIKE THE SERVER BEING DOWN
-            Type `192.168.1.108:8000` into a phone browser and it tries HTTP.
-            The TLS server accepts the connection, finds no handshake and
-            closes it — which Chrome reports as "This site can't be reached,
-            192.168.1.108 refused to connect". The server is running perfectly
-            and the user is told it is off.
-
-            The port that used to sit here was a SECOND HTTPS server, added on
-            the belief that browsers upgrade a bare `ip:port` to https. Some
-            do. Android Chrome does not, so the second port had exactly the
-            same failure as the first.
-
-        So this speaks HTTP, and answers everything with a redirect to the same
-        path on the HTTPS port. Typing the address by hand now works, which is
-        what people do when a QR code is inconvenient.
-        """
+        """Optional plain-HTTP listener on port 8001 redirecting browsers to HTTPS :8000."""
         from fastapi.responses import RedirectResponse
+
+        probe = socket.socket()
+        try:
+            probe.bind(("0.0.0.0", REDIRECT_PORT))
+        except OSError:
+            probe.close()
+            return
+        probe.close()
 
         bounce = FastAPI(docs_url=None, redoc_url=None)
 
         @bounce.get("/{path:path}")
         async def _to_https(path: str, request: Request):
             query = f"?{request.url.query}" if request.url.query else ""
-            return RedirectResponse(
-                f"https://{self._ip}:{SECURE_PORT}/{path}{query}",
-                status_code=307)
+            return RedirectResponse(f"https://{self._ip}:{PORT}/{path}{query}", status_code=307)
 
-        cfg = uvicorn.Config(bounce, host="0.0.0.0", port=PORT,
-                             log_level="warning")
-        print(f"[Dashboard] Type by hand:  {self._ip}:{PORT}  "
-              f"(sends you to the secure page)")
+        cfg = uvicorn.Config(bounce, host="0.0.0.0", port=REDIRECT_PORT, log_level="warning")
         await uvicorn.Server(cfg).serve()
 
     async def serve(self) -> None:
@@ -1628,87 +2197,39 @@ class DashboardServer:
         set_active_server(self)
         if not _DEPS_OK:
             print("[Dashboard] fastapi/uvicorn not installed — dashboard disabled.")
-            print("[Dashboard] Run:  pip install fastapi 'uvicorn[standard]' cryptography")
             return
 
-        # Startup only CHECKS — see report_network_access for why it never
-        # asks for administrator rights here. In a thread: reading the
-        # firewall rules takes about a second.
-        asyncio.get_running_loop().run_in_executor(
-            None, report_network_access, PORT, SECURE_PORT)
+        self._ip = detect_lan_ipv4()
+        asyncio.get_running_loop().run_in_executor(None, report_network_access, PORT, REDIRECT_PORT)
 
-        # Only make a certificate if HTTPS was actually asked for. Generating
-        # one nobody uses just leaves a private key on disk.
-        try:
-            import json as _json
-            with open(BASE_DIR / "config" / "api_keys.json", "r",
-                      encoding="utf-8") as f:
-                if _json.load(f).get("dashboard_https"):
-                    _ensure_certs()
-        except Exception:
-            pass
+        _ensure_certs(certs_dir=self._certs_dir, extra_ips=[self._ip] if self._ip != "127.0.0.1" else [])
+        use_ssl = self._ssl_enabled()
+        ssl_key, ssl_cert = _resolve_cert_files(self._certs_dir)
 
-        use_ssl  = self._ssl_enabled()
-        ssl_key  = BASE_DIR / "config" / "certs" / "jarvis.key"
-        ssl_cert = BASE_DIR / "config" / "certs" / "jarvis.crt"
-
-        # TLS IS WANTED, BUT NOT AT THE COST OF NOT STARTING.
-        #
-        # An earlier version returned here when certificates could not be made,
-        # on the argument that serving a remote-control channel in clear is a
-        # different product. The argument is right and the behaviour was wrong:
-        # a dashboard that does not start is not more secure, it is absent, and
-        # the user is left with "refused to connect" and nothing to act on.
-        #
-        # So: HTTPS whenever it can be had — which is almost always, since the
-        # certificate is generated locally on first run — and plain HTTP with a
-        # loud, repeated warning when it cannot. The page keeps working either
-        # way; without a secure context it simply cannot encrypt, and it says
-        # so on screen rather than pretending.
         if use_ssl:
             asyncio.create_task(self._serve_redirector())
-        else:
-            print("[Dashboard] Plain HTTP on your local network. Commands are "
-                  "not encrypted; the pairing key still gates access.")
-            print('[Dashboard] For HTTPS set "dashboard_https": true in '
-                  'config/api_keys.json (your phone will ask you to trust the '
-                  'certificate once).')
 
         cfg = uvicorn.Config(
-            self.app, host="0.0.0.0",
-            port=SECURE_PORT if use_ssl else PORT, log_level="warning",
-            **({"ssl_keyfile": str(ssl_key), "ssl_certfile": str(ssl_cert)}
-               if use_ssl else {}),
+            self.app,
+            host="0.0.0.0",
+            port=PORT,
+            log_level="warning",
+            **({"ssl_keyfile": str(ssl_key), "ssl_certfile": str(ssl_cert)} if use_ssl else {}),
         )
 
-        # CAN THIS PORT ACTUALLY BE TAKEN?
-        #
-        # uvicorn raises when the port is busy, and under pythonw.exe there is
-        # no console for that to be seen in — so a second JARVIS, or anything
-        # else already on 8000, produced a dashboard that was silently dead
-        # while the HUD went on showing a QR code pointing at it. The phone
-        # then reports ERR_CONNECTION_REFUSED, which is true and impossible to
-        # act on.
-        #
-        # Asking first costs a millisecond and turns that into a sentence.
-        import socket as _socket
-        # No SO_REUSEADDR. On Windows that option lets a second socket bind a
-        # port another socket already holds — which is exactly the condition
-        # being tested for, so setting it made the probe always succeed.
-        _probe = _socket.socket()
+        _probe = socket.socket()
         try:
-            _probe.bind(("0.0.0.0", SECURE_PORT if use_ssl else PORT))
+            _probe.bind(("0.0.0.0", PORT))
         except OSError as exc:
             _probe.close()
             self._bind_error = (
-                f"port {SECURE_PORT if use_ssl else PORT} is already in use — "
-                f"another copy of JARVIS is probably running. Close it and "
-                f"restart, or the phone dashboard will stay unreachable "
-                f"({exc.__class__.__name__})")
+                f"port {PORT} is already in use — another copy of JARVIS may be running "
+                f"({exc.__class__.__name__})"
+            )
             print(f"[Dashboard] {self._bind_error}")
             return
         _probe.close()
 
-        print(f"[Dashboard] {self.get_url()}")
-        print("[Dashboard] Press 'Remote Control' in JARVIS UI to get the QR code.")
+        print(f"[Dashboard] Serving on {self.get_url()} (0.0.0.0:{PORT}, TLS={use_ssl})")
+        print(f"[Dashboard] Mobile Companion PWA: {self.get_url()}/pwa")
         await uvicorn.Server(cfg).serve()

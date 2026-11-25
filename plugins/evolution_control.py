@@ -49,6 +49,7 @@ PLUGIN = {
                     "rollback_last",
                     "synthesize",
                     "self_heal",
+                    "meta_optimize",
                     "habits",
                     "compile_habit",
                     "run_habit",
@@ -227,6 +228,19 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
         if action == "consolidate_memory":
             from plugins import knowledge_rag
             return knowledge_rag.run({"mode": "consolidate"}, player=player)
+
+        if action == "meta_optimize":
+            from core.evolution import meta_optimizer
+            res = meta_optimizer.run_idle_optimization(BASE_DIR, force=True)
+            staged = len(res.get("staged_branches") or [])
+            queued = len(res.get("queued_proposals") or [])
+            rejected = len(res.get("rejected_candidates") or [])
+            msg = (
+                f"Meta-Optimizer completed: {staged} measurably better evolve/* branch(es) staged, "
+                f"{queued} upgrade(s) queued in Evolution Digest, {rejected} non-improving candidate(s) rejected."
+            )
+            _notify(player, msg, "META-OPTIMIZER", json.dumps(res.get("queued_proposals") or [], indent=2))
+            return msg
 
         return f"Unknown evolution_control action '{action}'."
     except Exception as exc:
