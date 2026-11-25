@@ -14,6 +14,7 @@ live mission logs, and 1-tap remote HUD CONFIRM / ChoiceBanner approvals.
 """
 
 import asyncio
+import atexit
 import base64
 import hashlib
 import inspect
@@ -344,7 +345,10 @@ def detect_tailscale(*, port: int = PORT, https: bool = True) -> dict:
 
 
 LOCAL_TUNNEL_PORT = 8766
+PAIRING_PIN_TTL_SECONDS = 300
 _TUNNEL_LOCK = threading.Lock()
+_TUNNEL_START_LOCK = threading.Lock()       # one launch at a time (auto-start vs. API)
+_TUNNEL_SUPERVISOR: threading.Thread | None = None
 _TUNNEL_PROC: subprocess.Popen | None = None
 _TUNNEL_URL: str = ""
 _TUNNEL_PROVIDER: str = ""
@@ -454,9 +458,24 @@ def start_quick_tunnel(
     local_port: int = PORT,
     https: bool = True,
     tunnel_http_port: int = LOCAL_TUNNEL_PORT,
-    wait_s: float = 8.0,
+    wait_s: float = 25.0,
 ) -> dict:
     """Launch a public HTTPS tunnel (`cloudflared`, with automatic `localhost.run` SSH fallback if DPI-blocked)."""
+    global _TUNNEL_ERR
+    from core import privacy
+    if privacy.is_active():
+        with _TUNNEL_LOCK:
+            _TUNNEL_ERR = "Public tunnel is disabled while Strict Local Privacy Mode is on."
+        return get_tunnel_status()
+    with _TUNNEL_START_LOCK:
+        _start_tunnel_locked(local_port=local_port, https=https,
+                             tunnel_http_port=tunnel_http_port, wait_s=wait_s)
+    if privacy.is_active():                 # switched on while the tunnel was opening
+        stop_quick_tunnel()
+    return get_tunnel_status()
+
+
+def _start_tunnel_locked(*, local_port: int, https: bool, tunnel_http_port: int, wait_s: float) -> dict:
     with _TUNNEL_LOCK:
         if _TUNNEL_PROC is not None and _TUNNEL_PROC.poll() is None and _TUNNEL_URL:
             return get_tunnel_status()
@@ -467,13 +486,14 @@ def start_quick_tunnel(
         cf_cmd = [cf_exe, "tunnel", "--url", f"{scheme}://127.0.0.1:{local_port}"]
         if https:
             cf_cmd.append("--no-tls-verify")
-        if _spawn_tunnel_process(cf_cmd, _TRYCF_RE, "cloudflared", min(5.0, float(wait_s))):
+        if _spawn_tunnel_process(cf_cmd, _TRYCF_RE, "cloudflared", float(wait_s)):
             return get_tunnel_status()
 
     # Automatic fallback when campus/corporate DPI resets api.trycloudflare.com:
     # OpenSSH reverse tunnel to localhost.run (terminates real CA-trusted HTTPS + WSS -> 127.0.0.1:LOCAL_TUNNEL_PORT)
+    from core import privacy
     ssh_exe = _find_ssh()
-    if ssh_exe:
+    if ssh_exe and not privacy.is_active():
         null_kh = "NUL" if os.name == "nt" else "/dev/null"
         ssh_cmd = [
             ssh_exe,
@@ -509,6 +529,40 @@ def stop_quick_tunnel() -> dict:
             except Exception:
                 pass
     return get_tunnel_status()
+
+
+def tunnel_autostart_enabled() -> bool:
+    """`"tunnel_autostart": true` in config/api_keys.json."""
+    try:
+        cfg = json.loads((BASE_DIR / "config" / "api_keys.json").read_text(encoding="utf-8"))
+        return cfg.get("tunnel_autostart") is True
+    except Exception:
+        return False
+
+
+def start_tunnel_supervisor(*, https: bool, interval_s: float = 60.0) -> bool:
+    """Open the tunnel at launch and reopen it if it dies. Off unless configured."""
+    global _TUNNEL_SUPERVISOR
+    from core import privacy
+    if not tunnel_autostart_enabled():
+        return False
+    if _TUNNEL_SUPERVISOR is not None and _TUNNEL_SUPERVISOR.is_alive():
+        return True
+
+    def _run() -> None:
+        time.sleep(3.0)             # let uvicorn bind first
+        while tunnel_autostart_enabled():
+            if not privacy.is_active() and not get_tunnel_status()["running"]:
+                st = start_quick_tunnel(local_port=PORT, https=https)
+                print(f"[Dashboard] Tunnel: {st['pwa_url'] or st['error']}")
+            time.sleep(interval_s)
+
+    _TUNNEL_SUPERVISOR = threading.Thread(target=_run, daemon=True, name="jarvis-tunnel-supervisor")
+    _TUNNEL_SUPERVISOR.start()
+    return True
+
+
+atexit.register(stop_quick_tunnel)          # Windows does not end child processes for us
 
 
 # ── Firewall Inspection & Setup ───────────────────────────────────────────────
@@ -1132,12 +1186,15 @@ class DashboardServer:
         *,
         include_pin: bool = True,
         mode: str = "lan",
+        fresh: bool = False,
     ) -> dict:
         """Build 1-tap phone pairing metadata (URL + PIN + TLS SHA-256 + PNG QR)."""
         ssl_on = self._ssl_enabled()
         base_url = self.get_url(mode=mode)
         pwa_url = f"{base_url}/pwa"
         fp = self.cert_sha256()
+        if include_pin and fresh and not key:
+            key = self.new_key(expiry_secs=PAIRING_PIN_TTL_SECONDS)
         pin = (key or self.active_or_new_key()) if include_pin else ""
 
         q_params: dict[str, str] = {}
@@ -1558,9 +1615,9 @@ class DashboardServer:
             })
 
         @app.get("/api/android/qr")
-        async def android_qr_ep(req: Request, mode: str = "lan"):
+        async def android_qr_ep(req: Request, mode: str = "lan", fresh: bool = False):
             include_pin = _is_trusted_local_caller(req)
-            info = self.build_qr_pairing_info(include_pin=include_pin, mode=mode)
+            info = self.build_qr_pairing_info(include_pin=include_pin, mode=mode, fresh=fresh)
             return JSONResponse(info)
 
         @app.get("/api/android/tunnel")
@@ -1577,11 +1634,23 @@ class DashboardServer:
         async def tunnel_control_ep(req: Request):
             if not _is_trusted_local_caller(req):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
-            body = await req.json()
-            action = str(body.get("action") or "status").strip().lower()
+            try:
+                body = await req.json()
+                if not isinstance(body, dict):
+                    body = {}
+            except Exception:
+                body = {}
+            action = str(body.get("action") or "start").strip().lower()
             if action == "start":
                 st = await asyncio.to_thread(start_quick_tunnel, local_port=PORT, https=self._ssl_enabled())
-                return JSONResponse({"ok": bool(st.get("running")), "cloudflare_tunnel": st})
+                payload = {"ok": bool(st.get("running")), "cloudflare_tunnel": st}
+                if body.get("include_pairing") and st.get("running"):
+                    payload["pairing"] = self.build_qr_pairing_info(
+                        include_pin=True,
+                        mode="tunnel",
+                        fresh=bool(body.get("fresh", True)),
+                    )
+                return JSONResponse(payload)
             if action == "stop":
                 st = await asyncio.to_thread(stop_quick_tunnel)
                 return JSONResponse({"ok": True, "cloudflare_tunnel": st})
@@ -1788,9 +1857,13 @@ class DashboardServer:
             return JSONResponse({"ok": False, "error": "Invalid or expired key"}, status_code=401)
 
         @app.get("/auto-login")
-        async def auto_login(key: str = ""):
+        async def auto_login(req: Request, key: str = ""):
             now = time.time()
-            if not key or key not in self._pending_keys or self._pending_keys[key] <= now:
+            who = _who(req)
+            blocked = self._throttle.blocked_for(who) > 0
+            if blocked or not key or key not in self._pending_keys or self._pending_keys[key] <= now:
+                if key and not blocked:
+                    self._throttle.record_failure(who)
                 return HTMLResponse("""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width">
 <style>
@@ -2287,6 +2360,7 @@ class DashboardServer:
         if use_ssl:
             asyncio.create_task(self._serve_redirector())
         asyncio.create_task(self._serve_local_tunnel_loopback())
+        start_tunnel_supervisor(https=use_ssl)
 
         cfg = uvicorn.Config(
             self.app,

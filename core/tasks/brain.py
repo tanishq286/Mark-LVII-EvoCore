@@ -137,12 +137,31 @@ def _ask_provider(model: str, system: str, turns: list, decls) -> dict:
                       for i, c in enumerate(calls or [])]}
 
 
+def _ask_local(system: str, turns: list, decls) -> dict:
+    """Privacy mode: the on-machine model, whatever provider is configured."""
+    from core import privacy
+    from providers import schema
+
+    llm = privacy.local_provider("llm")
+    text, calls = llm.complete(to_openai(turns, system),
+                               tools=schema.to_openai(decls) if decls else None, timeout=120)
+    return {"text": (text or "").strip(),
+            "calls": [{"id": c.id or f"call_{i}", "name": c.name, "args": dict(c.args or {}), "sig": ""}
+                      for i, c in enumerate(calls or [])]}
+
+
 def ask(system: str, turns: list, decls: list | None) -> dict:
     """One model turn: {"text": str, "calls": [...]}. Raises NoModel."""
     from core import gemini
     from core.action_loader import strip_meta
 
     decls = strip_meta(decls) if decls else None
+    from core import privacy
+    if privacy.is_active():
+        try:
+            return _ask_local(system, turns, decls)
+        except Exception as e:
+            raise NoModel(f"local model did not answer — {str(e)[:120]}", transient=True)
     rungs: list = []
     if gemini.api_key():
         ladder = [m for m in gemini._LADDERS[gemini.SMART]

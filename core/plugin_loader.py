@@ -166,6 +166,10 @@ class PluginRegistry:
             return f"Plugin '{name}' is not available."
         if not get_plugin_enabled(name):
             return f"The '{name}' plugin is currently disabled."
+        from core import privacy
+        blocked = privacy.blocked_reason(name)
+        if blocked:
+            return blocked
         try:
             return _call_run(rec.run, parameters, player, session_memory) or "Done."
         except Exception as e:

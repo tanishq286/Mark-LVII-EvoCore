@@ -206,6 +206,14 @@ class JarvisUI:
         self._win.get_plugin_settings = cb
 
     @property
+    def on_privacy_toggle(self):
+        return self._win.on_privacy_toggle
+
+    @on_privacy_toggle.setter
+    def on_privacy_toggle(self, cb):
+        self._win.on_privacy_toggle = cb
+
+    @property
     def on_wake_toggle(self):
         return self._win.on_wake_toggle
 

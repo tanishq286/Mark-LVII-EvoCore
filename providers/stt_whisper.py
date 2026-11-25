@@ -103,8 +103,10 @@ class WhisperSTT:
     def _load_blocking(self):
         from faster_whisper import WhisperModel
         t0 = time.monotonic()
+        from core import privacy
         model = WhisperModel(
             self.model_name,
+            local_files_only=privacy.is_active(),    # never fetch in private mode
             device=self.device,
             compute_type=self._compute_type(),
             cpu_threads=_threads(),

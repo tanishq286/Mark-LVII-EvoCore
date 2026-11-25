@@ -158,6 +158,10 @@ class ActionRegistry:
         rec = self._actions.get(name)
         if rec is None or not rec.valid:
             return f"Action '{name}' is not available."
+        from core import privacy
+        blocked = privacy.blocked_reason(name)
+        if blocked:
+            return blocked
         try:
             return _call_handler(rec.handler, parameters, ctx or {}) or "Done."
         except Exception as e:

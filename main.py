@@ -102,6 +102,7 @@ from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
 from core                      import audio_devices
+from core                      import privacy
 from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
@@ -343,6 +344,8 @@ def _get_api_key() -> str:
 
 def _gemini_usable() -> bool:
     """A Gemini key is stored, and the user has not chosen to run without Gemini."""
+    if privacy.is_active():
+        return False
     try:
         from memory.config_manager import load_api_keys
         cfg = load_api_keys()
@@ -452,6 +455,22 @@ TOOL_DECLARATIONS = [
                     "type":        "STRING",
                     "description": "Topic to monitor or stop monitoring (e.g. 'space exploration', 'AI news')",
                 },
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "privacy_mode",
+        "description": (
+            "Strict Local Privacy Mode: keeps every prompt on this computer "
+            "(local models only, no cloud). Call with action 'on' when the user "
+            "is about to discuss something sensitive or asks for privacy mode; "
+            "'off' only when the user asks (they must confirm on screen)."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "on | off | status"},
             },
             "required": ["action"],
         },
@@ -620,6 +639,8 @@ def _probe_gemini_key() -> "bool | None":
     False = Google rejected the key itself (or no usable key is saved).
     None  = could not tell (network, outage) — never a reason to ask for a new key.
     """
+    if privacy.is_active():
+        return None
     try:
         key = (_get_api_key() or "").strip()
     except Exception:
@@ -730,7 +751,7 @@ class JarvisLive:
         # Milestone 15: append-only cross-session memory (memory/conversations.sqlite)
         try:
             from core.memory.live_memory import LiveMemoryBridge
-            self._live_mem = LiveMemoryBridge()
+            self._live_mem = LiveMemoryBridge(allow_cloud=not privacy.is_active())
         except Exception as _e:
             print(f"[Memory] cross-session memory unavailable: {_e}")
             self._live_mem = None
@@ -1285,6 +1306,8 @@ class JarvisLive:
 
     async def _routine_news_watch(self) -> None:
         """New headlines on the watched topics, said aloud — one routine run."""
+        if privacy.is_active():
+            return
         try:
             alerts = await asyncio.to_thread(monitor_check_all)
             if not alerts:
@@ -1498,14 +1521,62 @@ class JarvisLive:
         return (url, key, f"{url}/auto-login?key={key}", manual,
                 getattr(self._dashboard, "_bind_error", "") or "")
 
+    # ── Strict Local Privacy Mode ────────────────────────────────────────────
+    def set_privacy(self, action: str) -> str:
+        """'on' | 'off' | 'status'. Safe from any thread."""
+        action = (action or "status").strip().lower()
+        if action == "on":
+            privacy.set_active(True)
+            return ("Strict Local Privacy Mode is on. Everything stays on this computer; "
+                    "web and cloud features are off.")
+        if action == "off":
+            return privacy.request_disable()
+        return f"Strict Local Privacy Mode is {'on' if privacy.is_active() else 'off'}."
+
+    def _on_privacy_changed(self, active: bool) -> None:
+        # Neither side of the switch may carry the other's conversation: drop
+        # the transcript buffer and the server resume handle, then rebuild.
+        self._session_log = []
+        self._resume_handle = None
+        if active:
+            try:
+                from dashboard.server import stop_quick_tunnel
+                stop_quick_tunnel()
+            except Exception as e:
+                print(f"[Privacy] tunnel stop failed: {e}")
+        try:
+            from providers import registry
+            registry.reset()        # no pooled connection survives the switch
+        except Exception:
+            pass
+        self.ui.write_log(
+            "SYS: 🔒 Strict Local Privacy Mode ON — local models only, nothing leaves this computer."
+            if active else "SYS: 🔓 Privacy Mode OFF — cloud services available again.")
+        self.ui.refresh_wake_ui()       # also repaints the privacy button
+        self.request_reconnect(keep_context=False, reason="privacy mode")
+
+    def _privacy_phrase(self, text: str) -> bool:
+        """Switch on a spoken or typed command without relying on a model."""
+        intent = privacy.phrase_intent(text)
+        if intent == "on" and not privacy.is_active():
+            self.set_privacy("on")
+            return True
+        if intent == "off" and privacy.is_active():
+            self.ui.write_log(f"SYS: {self.set_privacy('off')}")
+            return True
+        return False
+
     def _on_text_command(self, text: str):
+        if self._privacy_phrase(text):
+            return
         if not self._loop or not self.session:
             return
         if hasattr(self.ui, "feel"):
             self.ui.feel(text, "user")      # a typed message is hearing from you too
         try:
             from core import emotions as _emotions
-            _emotions.appraise_text(text, "user", player=self.ui)
+            if not privacy.is_active():
+                _emotions.appraise_text(text, "user", player=self.ui)
         except Exception:
             pass
         # Respect wake-trigger sleep: a typed command must not be answered while
@@ -1888,7 +1959,7 @@ class JarvisLive:
         self.ui.set_state("THINKING")
 
 
-        if name == "save_memory":
+        if name == "save_memory" and not privacy.is_active():
             category = args.get("category", "notes")
             key      = args.get("key", "")
             value    = args.get("value", "")
@@ -1902,6 +1973,12 @@ class JarvisLive:
                 response={"result": "ok", "silent": True}
             )
 
+        blocked = privacy.blocked_reason(name)
+        if blocked:
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
+            return types.FunctionResponse(id=fc.id, name=name, response={"result": blocked})
+
         loop   = asyncio.get_event_loop()
         result = "Done."
         _exc_type = ""
@@ -1914,6 +1991,9 @@ class JarvisLive:
                 # hundred short strings, and a thread hop would cost more than
                 # the work itself.
                 result = search_memory(args.get("query", ""), limit=8)
+
+            elif name == "privacy_mode":
+                result = self.set_privacy(args.get("action", "status"))
 
             elif name == "undo":
                 if str(args.get("action", "")).lower().strip() == "list":
@@ -2105,6 +2185,8 @@ class JarvisLive:
         # Live keepalive pings ("1011 keepalive ping timeout" in startup.log).
         # They now run on a worker thread; the reply never waits for them.
         def _post_tool_bookkeeping(_res=str(result), _args=dict(args or {})):
+            if privacy.is_active():
+                return      # tool arguments and results are not logged for learning
             try:
                 from core import auto_evolution as _auto_evo
                 _auto_evo.observe_tool_outcome(name, _args, _res, _elapsed_ms, player=self.ui)
@@ -2132,7 +2214,7 @@ class JarvisLive:
         # the API default and behave as they always have.
         try:
             from core import emotions as _emotions
-            if str(result).lower().startswith(("tool '", "failed:", "status=failed")):
+            if not privacy.is_active() and str(result).lower().startswith(("tool '", "failed:", "status=failed")):
                 _emotions.note_event("tool_error", f"{name}: {str(result)[:80]}", player=self.ui)
             _emo_cue = _emotions.consume_mood_shift_cue()
             if _emo_cue and isinstance(result, str):
@@ -2349,9 +2431,11 @@ class JarvisLive:
             if full_in:
                 self._last_out_logged = ""   # new exchange
                 self.ui.write_log(f"You: {full_in}")
-                self._session_log.append(f"User: {full_in}")
-                if self._live_mem is not None:
-                    self._live_mem.record("user", full_in)
+                if not privacy.is_active():
+                    self._session_log.append(f"User: {full_in}")
+                    if self._live_mem is not None:
+                        self._live_mem.record("user", full_in)
+                self._privacy_phrase(full_in)
                 if self._dashboard:
                     asyncio.create_task(self._dashboard.broadcast({
                         "type": "log", "speaker": "user",
@@ -2446,7 +2530,7 @@ class JarvisLive:
                                     self.ui.feel(txt, "user")
                                 try:
                                     from core import emotions as _emotions
-                                    _emotions.appraise_text(txt, "user", player=self.ui)
+                                    privacy.is_active() or _emotions.appraise_text(txt, "user", player=self.ui)
                                 except Exception:
                                     pass
                                 try:
@@ -2486,22 +2570,23 @@ class JarvisLive:
                                 self._last_out_logged = full_out
                                 if not out_streamed:
                                     self.ui.write_log(f"{self._asst_name}: {full_out}")
-                                self._session_log.append(f"{self._asst_name}: {full_out}")
-                                if self._live_mem is not None:
-                                    self._live_mem.record("assistant", full_out)
-                                try:
-                                    from core.memory import knowledge_graph as _kg
-                                    _prev_u = ""
-                                    for _sl in reversed(self._session_log[:-1]):
-                                        if not _sl.startswith(f"{self._asst_name}:"):
-                                            _prev_u = _sl.split(":", 1)[-1].strip()
-                                            break
-                                    if _prev_u or full_out:
-                                        asyncio.get_running_loop().run_in_executor(
-                                            None, _kg.ingest_conversation_turn, _prev_u, full_out
-                                        )
-                                except Exception:
-                                    pass
+                                if not privacy.is_active():
+                                    self._session_log.append(f"{self._asst_name}: {full_out}")
+                                    if self._live_mem is not None:
+                                        self._live_mem.record("assistant", full_out)
+                                    try:
+                                        from core.memory import knowledge_graph as _kg
+                                        _prev_u = ""
+                                        for _sl in reversed(self._session_log[:-1]):
+                                            if not _sl.startswith(f"{self._asst_name}:"):
+                                                _prev_u = _sl.split(":", 1)[-1].strip()
+                                                break
+                                        if _prev_u or full_out:
+                                            asyncio.get_running_loop().run_in_executor(
+                                                None, _kg.ingest_conversation_turn, _prev_u, full_out
+                                            )
+                                    except Exception:
+                                        pass
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "jarvis",
@@ -2528,9 +2613,10 @@ class JarvisLive:
                                 self._last_out_logged = full_lead
                                 if not out_streamed:
                                     self.ui.write_log(f"{self._asst_name}: {full_lead}")
-                                self._session_log.append(f"{self._asst_name}: {full_lead}")
-                                if self._live_mem is not None:
-                                    self._live_mem.record("assistant", full_lead)
+                                if not privacy.is_active():
+                                    self._session_log.append(f"{self._asst_name}: {full_lead}")
+                                    if self._live_mem is not None:
+                                        self._live_mem.record("assistant", full_lead)
                             if out_streamed and callable(_stream_fn):
                                 _stream_fn(self._asst_name, "", True)
                             out_buf = []
@@ -2719,7 +2805,7 @@ class JarvisLive:
         # news and its topic, and anything the user added to it. No options is
         # the briefing as it always was.
         options   = options or {}
-        want_news = options.get("news", True) is not False
+        want_news = False if privacy.is_active() else (options.get("news", True) is not False)
         topic     = str(options.get("news_topic") or "").strip() or "top world news today"
         extra     = str(options.get("extra") or "").strip()
 
@@ -2869,6 +2955,8 @@ class JarvisLive:
             return
         self._session_log = []    # reset immediately so the next session starts clean
 
+        if privacy.is_active():
+            return
         memory = load_memory()
         lang_entry = memory.get("identity", {}).get("language", {})
         lang = (lang_entry.get("value", "") if isinstance(lang_entry, dict) else str(lang_entry)).strip()
@@ -2918,7 +3006,7 @@ class JarvisLive:
         """Check user-configured topics once per day; speak alerts when new headlines appear."""
         await asyncio.sleep(300)          # wait 5 min after startup before first check
         while True:
-            if self.session and self._awake:
+            if self.session and self._awake and not privacy.is_active():
                 # Don't interrupt if user spoke recently or JARVIS is mid-sentence
                 with self._speaking_lock:
                     speaking = self._is_speaking
@@ -3021,6 +3109,9 @@ class JarvisLive:
                 )
                 if not text:
                     continue
+                if self._privacy_phrase(text):
+                    self.ui.write_log(f"[Web]: {text}")
+                    continue
                 # Wait up to 8s for session to become ready after a wake
                 for _ in range(80):
                     if self.session:
@@ -3069,6 +3160,18 @@ class JarvisLive:
         the same ones the engine gets a moment later, and a misconfiguration is
         reported while there is still a Gemini session to fall back to.
         """
+        if privacy.is_active():
+            # Local only, whatever the saved settings say. No fallback: with no
+            # engine the session loop waits instead of reaching for Gemini.
+            try:
+                llm = privacy.local_provider("llm")
+                caps = dict(getattr(llm, "caps", {}) or {})
+                caps["audio_out"] = True
+                return caps
+            except Exception as e:
+                print(f"[Privacy] local engine unavailable: {e}")
+                self.ui.write_log(f"SYS: 🔒 Local engine unavailable ({e}). Staying offline.")
+                return None
         if self._engine_mode() != "pipeline":
             return None
         try:
@@ -3129,6 +3232,8 @@ class JarvisLive:
         client being rebuilt on every reconnect.
         """
         if self._engine_caps is None:
+            if privacy.is_active():
+                raise privacy.PrivacyBlocked("no cloud session in privacy mode")
             client = genai.Client(
                 api_key=_get_api_key(),
                 http_options={"api_version":
@@ -3146,6 +3251,14 @@ class JarvisLive:
         pipe = get_pipeline()
 
         def part(slot):
+            if privacy.is_active():
+                try:
+                    return privacy.local_provider(slot, log=self.ui.write_log)
+                except Exception as e:
+                    if slot == "llm":
+                        raise
+                    self.ui.write_log(f"SYS: 🔒 Local {slot.upper()} unavailable ({e}).")
+                    return None
             pid = str(pipe.get(slot) or "").strip()
             if not pid:
                 return None
@@ -3344,6 +3457,20 @@ class JarvisLive:
 
                     session.send_client_content = _send_and_arm
 
+                    # A cloud session still open while privacy switches on must
+                    # not receive one more frame of audio, text or tool output.
+                    if self._engine is None:
+                        for _name in ("send_client_content", "send_realtime_input",
+                                      "send_tool_response"):
+                            _send = getattr(session, _name, None)
+                            if _send is None:
+                                continue
+                            async def _cloud_send(*a, _send=_send, **kw):
+                                if privacy.is_active():
+                                    return None
+                                return await _send(*a, **kw)
+                            setattr(session, _name, _cloud_send)
+
                     self.session          = session
                     self.audio_in_queue   = asyncio.Queue()
                     self.out_queue        = asyncio.Queue(maxsize=200)
@@ -3421,6 +3548,8 @@ class JarvisLive:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})
 
                     self._reconnect_event.clear()  # ignore requests from before this session
+                    if privacy.is_active() and self._engine is None:
+                        self._reconnect_event.set()  # switched on while connecting
                     tg.create_task(self._watch_reconnect())
                     tg.create_task(self._watch_audio_hotplug())
                     tg.create_task(self._watch_stall())
@@ -3651,6 +3780,8 @@ def _exit_process(code: int = 0) -> None:
 
 
 def main():
+    if privacy.load():          # before anything can open a connection
+        print("[Privacy] Strict Local Privacy Mode restored from settings.")
     ui = JarvisUI("face.png")
     holder: dict = {}
 
@@ -3658,6 +3789,8 @@ def main():
         ui.wait_for_api_key()
         jarvis = JarvisLive(ui)
         holder["jarvis"] = jarvis
+        privacy.add_listener(jarvis._on_privacy_changed)
+        ui.on_privacy_toggle = jarvis.set_privacy
         try:
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:

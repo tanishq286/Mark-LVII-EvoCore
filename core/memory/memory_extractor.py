@@ -152,6 +152,12 @@ def _llm_extract(convo: str, *, allow_cloud: bool = True) -> tuple[dict[str, Any
         pass
     if allow_cloud:
         try:
+            from core import privacy
+            if privacy.is_active():
+                return None, ""
+        except Exception:
+            pass
+        try:
             from core import gemini
             data = gemini.as_json(prompt, tier=gemini.FAST)
             if isinstance(data, dict):

@@ -527,6 +527,10 @@ def complete_local(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
+    from core import privacy
+    if privacy.is_active():
+        ladder = [m for m in ladder if not privacy.is_cloud_model(m)]
+
     for model in ladder:
         vram_info = ensure_vram_ready(model, origin, timeout=min(5.0, timeout_s))
         body: dict = {

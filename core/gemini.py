@@ -402,6 +402,9 @@ def api_key(refresh: bool = False) -> str:
 def client(timeout_ms: int = DEFAULT_TIMEOUT_MS, key: str = ""):
     """A configured genai.Client with a deadline on it. Raises if there is no
     key, because a caller that cannot work without one should say so."""
+    from core import privacy
+    if privacy.is_active():
+        raise privacy.PrivacyBlocked("Gemini is off in Strict Local Privacy Mode")
     from google import genai
     from google.genai import types as gtypes
 
@@ -853,6 +856,14 @@ def call(contents, tier: str = FAST, config=None,
     a silent None during a session nobody can debug is how the original problem
     stayed hidden.
     """
+    from core import privacy
+    if privacy.is_active():
+        # No cloud ladder at all. Search needs the web and the local text model
+        # cannot see attachments, so both get "no answer" rather than a guess.
+        if tier == SEARCH or _carries_image(contents) or _carries_recording(contents):
+            return None
+        return _local_ollama_fallback(contents, tier, timeout_ms)
+
     # `tier` is normally FAST or SMART. Anything else is taken to be an explicit
     # model name — screen_agent lets the user pick one in its settings — and it
     # is tried first, with the reasoning ladder behind it. So a user's choice is

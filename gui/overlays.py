@@ -1780,6 +1780,7 @@ class RemoteKeyOverlay(QWidget):
     """Floating overlay — QR code for instant phone pairing + manual key fallback."""
 
     closed = pyqtSignal()
+    _tunnel_done = pyqtSignal(object, object)
 
     _OW, _OH = 420, 520
 
@@ -1968,6 +1969,7 @@ class RemoteKeyOverlay(QWidget):
         btn_row.addWidget(close_btn)
         lay.addLayout(btn_row)
 
+        self._tunnel_done.connect(self._on_tunnel_done)
         self._ctimer = QTimer(self)
         self._ctimer.timeout.connect(self._tick)
         self._ctimer.start(1000)
@@ -2080,7 +2082,7 @@ class RemoteKeyOverlay(QWidget):
     def _activate_tunnel(self):
         """Switch QR code to Tailscale or start a Cloudflare Quick Tunnel for 4G/5G pairing."""
         try:
-            from dashboard.server import detect_tailscale, get_active_server, start_quick_tunnel
+            from dashboard.server import detect_tailscale, get_active_server, get_tunnel_status, start_quick_tunnel
             srv = get_active_server()
             if srv is None:
                 return
@@ -2092,16 +2094,42 @@ class RemoteKeyOverlay(QWidget):
                 self._update_qr(str(info.get("pairing_url") or self._manual_url))
                 self._fp_lbl.setText(f"4G Tailscale Ready: {ts.get('url')}")
                 return
+            cur = get_tunnel_status()
+            if cur.get("running") and cur.get("url"):
+                self._on_tunnel_done(cur, None)
+                return
+            self._tun_btn.setEnabled(False)
             self._fp_lbl.setText("Starting Cloudflare 4G Quick Tunnel…")
-            st = start_quick_tunnel(wait_s=4.0)
-            if st.get("running") and st.get("url"):
+
+            def _worker():
+                try:
+                    st = start_quick_tunnel(wait_s=20.0)
+                    self._tunnel_done.emit(st, None)
+                except Exception as exc:
+                    self._tunnel_done.emit({}, str(exc))
+
+            import threading
+            threading.Thread(target=_worker, daemon=True, name="jarvis-ui-tunnel").start()
+        except Exception as exc:
+            self._fp_lbl.setText(f"Tunnel unavailable: {exc}")
+
+    def _on_tunnel_done(self, st, err):
+        self._tun_btn.setEnabled(True)
+        if err:
+            self._fp_lbl.setText(f"Tunnel unavailable: {err}")
+            return
+        try:
+            from dashboard.server import get_active_server
+            srv = get_active_server()
+            if isinstance(st, dict) and st.get("running") and st.get("url") and srv is not None:
                 info = srv.build_qr_pairing_info(key=self._key, include_pin=True, mode="tunnel")
                 self._manual_url = str(info.get("pwa_url") or st["url"])
                 self._url_lbl.setText(self._manual_url)
                 self._update_qr(str(info.get("pairing_url") or st["url"]))
-                self._fp_lbl.setText("4G Cloudflare Quick Tunnel Active ✓")
+                self._fp_lbl.setText(f"4G {st.get('provider') or 'Cloudflare'} Quick Tunnel Active ✓")
             else:
-                self._fp_lbl.setText(str(st.get("error") or "Install Tailscale or cloudflared for 4G access"))
+                msg = st.get("error") if isinstance(st, dict) else ""
+                self._fp_lbl.setText(str(msg or "Install Tailscale or cloudflared for 4G access"))
         except Exception as exc:
             self._fp_lbl.setText(f"Tunnel unavailable: {exc}")
 

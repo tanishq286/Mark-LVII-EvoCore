@@ -223,6 +223,9 @@ def get_llm_settings() -> tuple[str, str]:
     cfg   = _load_config()
     url   = cfg.get("llm_url",   _DEFAULTS["llm_url"]).rstrip("/")
     model = cfg.get("llm_model", _DEFAULTS["llm_model"])
+    from core import privacy
+    if privacy.is_active():
+        url, model = privacy.LOCAL_OLLAMA_ORIGIN, privacy.local_model(model)
     return url, model
 
 
@@ -341,6 +344,9 @@ def call_llm_text(
     url, default_model = get_llm_settings()
     endpoint = f"{url}/api/chat"
     m        = model or default_model
+    from core import privacy
+    if privacy.is_active():
+        m = privacy.local_model(m)
 
     messages: list[dict] = []
     if system:

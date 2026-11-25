@@ -44,6 +44,9 @@ def _save_state(state: dict[str, Any]) -> None:
 
 
 def is_paused() -> bool:
+    from core import privacy
+    if privacy.is_active():
+        return True
     return bool(_load_state().get("paused", False))
 
 

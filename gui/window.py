@@ -159,6 +159,7 @@ class MainWindow(QMainWindow):
         self._avatar_overlay   = None   # standalone transparent 2D avatar overlay
         self.get_plugins       = None   # callable: () -> list[dict], set by JarvisLive
         self.get_plugin_settings = None # callable: () -> list[dict] settings schemas, set by JarvisLive
+        self.on_privacy_toggle = None   # callable: (action: str) -> str, set by main
         self.on_wake_toggle    = None   # callable: (enable: bool) -> str, set by JarvisLive
         self.on_clap_toggle    = None   # callable: (enable: bool) -> str, set by JarvisLive
         self.on_wake_manual    = None   # callable: () -> None — manual sleep/wake
@@ -1716,6 +1717,10 @@ class MainWindow(QMainWindow):
         fs_btn = _row(QPushButton("⛶  FULLSCREEN  [F11]"), self._BTN_DIM)
         fs_btn.clicked.connect(self._toggle_fullscreen)
 
+        self._privacy_btn = _row(QPushButton())
+        self._privacy_btn.clicked.connect(self._toggle_privacy)
+        self._refresh_privacy_btn()
+
         self._brief_btn = _row(QPushButton())
         self._brief_btn.clicked.connect(self._toggle_brief)
 
@@ -2535,6 +2540,9 @@ class MainWindow(QMainWindow):
             self._wake_btn.setStyleSheet(_off)
             self._wake_btn.setToolTip("Enable local 'Hey Jarvis' voice wake word.")
 
+        if hasattr(self, "_privacy_btn"):
+            self._refresh_privacy_btn()
+
         if hasattr(self, "_clap_btn"):
             clap_on = bool(st.get("clap_enabled"))
             self._clap_btn.setText("👏  DOUBLE CLAP: ON" if clap_on else "👏  DOUBLE CLAP: OFF")
@@ -2681,6 +2689,21 @@ class MainWindow(QMainWindow):
                 cb(bool(held))
             except Exception:
                 pass
+
+    def _toggle_privacy(self):
+        from core import privacy
+        if self.on_privacy_toggle:
+            self.on_privacy_toggle("off" if privacy.is_active() else "on")
+        self._refresh_privacy_btn()
+
+    def _refresh_privacy_btn(self):
+        from core import privacy
+        on = privacy.is_active()
+        self._privacy_btn.setText("🔒  STRICT LOCAL PRIVACY: ON" if on else "🔓  PRIVACY MODE: OFF")
+        self._privacy_btn.setStyleSheet(self._BTN_PRI if on else self._BTN_DIM)
+        self._privacy_btn.setToolTip(
+            "Local models only; nothing leaves this computer." if on else
+            "Click to keep every prompt on this computer.")
 
     def _toggle_wake_word(self):
         st = self._wake_state()
