@@ -314,6 +314,7 @@ class BargeInDetector:
         self.guard = guard
         self.max_candidate_blocks = max(1, int(max_candidate_blocks))
         self._candidate: list[bytes] = []
+        self._speech_run = 0
         self._triggered = False
 
     def observe(self, pcm, sr: int, level: float,
@@ -324,6 +325,7 @@ class BargeInDetector:
         if not self.guard.calibrated:
             # Never train the echo profile on speech captured during playback.
             self._candidate.clear()
+            self._speech_run = 0
             self.guard.reset_speech_run()
             return None
 
@@ -331,19 +333,25 @@ class BargeInDetector:
             is_speech = self.guard.is_user_speech(pcm, sr, level, when)
         except Exception:
             self._candidate.clear()
+            self._speech_run = 0
             self.guard.reset_speech_run()
             return None
 
         if not is_speech:
             self._candidate.clear()
+            self._speech_run = 0
             return None
 
+        # Do not use EchoGuard._run as the sole counter: its fast path for
+        # microphone speech with no matching output reference returns True
+        # without changing that internal statistic.
+        self._speech_run += 1
         to_bytes = getattr(pcm, 'tobytes', None)
         self._candidate.append(to_bytes() if callable(to_bytes) else bytes(pcm))
         if len(self._candidate) > self.max_candidate_blocks:
             del self._candidate[:-self.max_candidate_blocks]
 
-        if self.guard.speech_run < self.guard.required_blocks:
+        if self._speech_run < self.guard.required_blocks:
             return None
 
         self._triggered = True
@@ -352,5 +360,6 @@ class BargeInDetector:
     def reset(self) -> None:
         """Re-arm after playback ends or a candidate is abandoned."""
         self._candidate.clear()
+        self._speech_run = 0
         self._triggered = False
         self.guard.reset_speech_run()

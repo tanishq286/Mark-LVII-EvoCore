@@ -91,3 +91,19 @@ def test_room_calibration_uses_echo_residual_samples_not_gain_observations():
     guard._seen = 0
 
     assert guard.calibrated is True
+
+
+def test_detector_counts_positive_classifications_without_guard_run_metadata():
+    class GuardWithoutRunCounter(FakeEchoGuard):
+        def is_user_speech(self, pcm, sr, level, when=None) -> bool:
+            self.calls += 1
+            return level >= 0.5
+
+    guard = GuardWithoutRunCounter(required_blocks=3)
+    detector = BargeInDetector(guard)
+
+    assert detector.observe(b"speech-1", 16_000, 0.9) is None
+    assert detector.observe(b"speech-2", 16_000, 0.9) is None
+    assert detector.observe(b"speech-3", 16_000, 0.9) == (
+        b"speech-1", b"speech-2", b"speech-3"
+    )
