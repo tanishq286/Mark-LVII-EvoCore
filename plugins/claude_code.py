@@ -30,6 +30,7 @@ PLUGIN = {
         "Use it when the user asks to work with Claude Code, check where or what the background agent is doing, "
         "show the live background work, or perform complex multi-file coding and account tasks."
     ),
+    "brief": "Run, watch, check status/history of, or cancel a Claude Code background coding task.",
     "parameters": {
         "type": "OBJECT",
         "properties": {

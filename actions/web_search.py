@@ -366,6 +366,17 @@ def _compare(items: list[str], aspect: str) -> str:
 from core import outcome
 
 
+def open_results_in_browser(query: str) -> str:
+    """Show a Google results page in Jarvis's browser (Chrome when installed)."""
+    from urllib.parse import quote_plus
+    url = "https://www.google.com/search?q=" + quote_plus(query)
+    try:
+        from actions.browser_control import _detect_default_browser, _open_native
+        return str(_open_native(url, _detect_default_browser()))
+    except Exception as exc:
+        return f"could not open the browser ({type(exc).__name__})"
+
+
 def web_search(
     parameters:     dict,
     response=None,
@@ -406,6 +417,10 @@ def web_search(
         return outcome.failed("web_search", f"the search failed: {e}",
                               query=query or ", ".join(items))
 
+    if bool(params.get("open_in_browser")) and (query or items):
+        opened = open_results_in_browser(query or " vs ".join(items))
+        print(f"[WebSearch] opened results in browser: {opened[:120]}")
+
     # EVERYTHING BELOW THIS LINE WAS WRITTEN BY STRANGERS.
     #
     # Search results are pages, titles and snippets from whoever published
@@ -445,6 +460,10 @@ TOOL = {
             "aspect": {
                 "type": "STRING",
                 "description": "Comparison aspect: price | specs | reviews | features"
+            },
+            "open_in_browser": {
+                "type": "BOOLEAN",
+                "description": "Also show the results page in the user's browser (Chrome). Only when the user asks to SEE results."
             }
         },
         "required": [

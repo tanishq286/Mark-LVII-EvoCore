@@ -376,7 +376,24 @@ def _resolve_browser(name: str) -> dict | None:
     return {"engine": engine, "exe": exe, "channel": channel}
 
 
+def _jarvis_preferred_browser() -> str:
+    """Milestone 15: Jarvis's own browser choice (Chrome whenever installed)."""
+    try:
+        from memory.config_manager import get_default_browser
+        return get_default_browser()
+    except Exception:
+        return ""
+
+
 def _detect_default_browser() -> str:
+    """Jarvis preference (Chrome) first; the OS http handler only as fallback."""
+    preferred = _jarvis_preferred_browser()
+    if preferred:
+        return preferred
+    return _detect_os_default_browser()
+
+
+def _detect_os_default_browser() -> str:
     try:
         if _OS == "Windows":
             import winreg
@@ -517,9 +534,10 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
     name = None
     if browser_name:
         name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
-    elif not url:
-        # No URL → only a window will open; needs the default browser's exe
-        name = _detect_default_browser()
+    else:
+        # Milestone 15: URLs open in Jarvis's browser (Chrome) too, not the OS
+        # handler (Edge). Empty -> no preference & no URL -> OS default exe.
+        name = _jarvis_preferred_browser() or (None if url else _detect_default_browser())
 
     # Specific browser → launch its own executable, exactly like the user would.
     if name:

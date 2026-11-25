@@ -26,7 +26,11 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from core import confirm, screenact, screenview
-from core.evolution import reflection_loop, safety_guard, telemetry
+from core import dpi as _dpi
+from core.evolution import reflection_loop, safety_guard, screen_grounding, telemetry
+
+# One coordinate space (physical pixels) for UIA, mss, pyautogui and Vision.
+_dpi.ensure_dpi_awareness()
 
 _STATE_LOCK = threading.Lock()
 _GLOBAL_ABORT = threading.Event()
@@ -151,6 +155,7 @@ class ScreenObservation:
     vision_elements: list[dict[str, Any]] = field(default_factory=list)
     vision_summary: str = ""
     captured_at: float = 0.0
+    frame_meta: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_view(
@@ -193,6 +198,9 @@ def _build_image_part(img_bytes: bytes, mime_type: str = "image/jpeg") -> Any:
         }
 
 
+_LAST_FRAME_META: dict[str, Any] = {}
+
+
 def _capture_frame(capture_fn: Callable[[], Any] | None = None) -> tuple[bytes | None, str, str]:
     """Capture screen bytes and return `(bytes_or_none, mime_type, sha256_prefix16)`."""
     try:
@@ -201,6 +209,8 @@ def _capture_frame(capture_fn: Callable[[], Any] | None = None) -> tuple[bytes |
         else:
             from actions import screen_processor
             raw = screen_processor._capture_screen()
+            _LAST_FRAME_META.clear()
+            _LAST_FRAME_META.update(getattr(screen_processor, "LAST_CAPTURE_META", {}) or {})
 
         mime = "image/jpeg"
         img_bytes: bytes | None = None
@@ -235,15 +245,20 @@ def observe_screen(
     img_bytes: bytes | None = None
     mime = "image/jpeg"
     frame_hash = ""
+    meta: dict[str, Any] = {}
     if include_screenshot:
         img_bytes, mime, frame_hash = _capture_frame(capture_fn=capture_fn)
+        if capture_fn is None and img_bytes:
+            meta = dict(_LAST_FRAME_META)
 
-    return ScreenObservation.from_view(
+    obs = ScreenObservation.from_view(
         view,
         screenshot_bytes=img_bytes,
         screenshot_mime=mime,
         frame_hash=frame_hash,
     )
+    obs.frame_meta = meta
+    return obs
 
 
 def _clamp_point_to_bounds(x: int, y: int, bounds: tuple[int, int, int, int]) -> tuple[int, int]:
@@ -264,21 +279,25 @@ def ground_with_vision(
 ) -> dict[str, Any]:
     """Use Gemini Vision / injected vision oracle to read degraded screens and find coordinates."""
     raw: dict | None = None
+    # Injected oracles answer in screen pixels (contract of M13 tests). Gemini
+    # sees a DOWNSCALED JPEG, so it is asked for 0-1000 normalised image
+    # coordinates which are mapped onto the physical monitor rect below.
+    normalised = False
     if vision_fn is not None:
         raw = vision_fn(goal, target_hint, obs)
     elif obs.screenshot_bytes:
         try:
             from core import gemini
-            b_l, b_t, b_w, b_h = obs.bounds
             prompt = (
-                "You are locating UI controls on a desktop screenshot.\n"
-                f"Logical screen bounds: left={b_l}, top={b_t}, width={b_w}, height={b_h}.\n"
+                "You are locating UI controls on a full-monitor desktop screenshot.\n"
                 f"Active app/title reported by OS: app={obs.app!r}, title={obs.title!r}.\n"
                 f"User goal: {goal}\n"
                 f"Target element to locate: {target_hint or '(inspect visible controls & dialogs)'}\n\n"
+                "Coordinates: give x and y as integers NORMALISED to 0-1000 of the image "
+                "(0,0 = top-left, 1000,1000 = bottom-right), at the CENTRE of the element.\n"
                 "Return ONLY valid JSON:\n"
                 "{\n"
-                '  "summary": "Brief description of what is visible",\n'
+                '  "summary": "Brief description of what is visible, including readable text",\n'
                 '  "active_app": "app name",\n'
                 '  "dialog_visible": false,\n'
                 '  "target_point": {"x": 0, "y": 0, "label": "...", "confidence": 0.9} or null,\n'
@@ -287,11 +306,23 @@ def ground_with_vision(
             )
             img_part = _build_image_part(obs.screenshot_bytes, obs.screenshot_mime)
             raw = gemini.as_json([prompt, img_part], tier=gemini.SMART)
+            normalised = True
         except Exception:
             raw = None
 
     if not isinstance(raw, dict):
         return {"summary": "", "elements": [], "target_point": None}
+
+    meta = dict(obs.frame_meta or {})
+    if normalised and not (meta.get("monitor") or {}).get("width"):
+        geo = _dpi.screen_geometry()
+        if geo.get("width"):
+            meta["monitor"] = {"left": 0, "top": 0, "width": geo["width"], "height": geo["height"]}
+
+    def _to_screen(px: Any, py: Any) -> tuple[int, int]:
+        if normalised:
+            return screen_grounding.map_vision_point(float(px), float(py), meta, space="norm1000")
+        return _clamp_point_to_bounds(int(px), int(py), obs.bounds)
 
     summary = str(raw.get("summary") or "").strip()
     elements_out: list[dict[str, Any]] = []
@@ -300,7 +331,7 @@ def ground_with_vision(
             continue
         if "x" in item and "y" in item:
             try:
-                cx, cy = _clamp_point_to_bounds(int(item["x"]), int(item["y"]), obs.bounds)
+                cx, cy = _to_screen(item["x"], item["y"])
                 elements_out.append({
                     "label": str(item.get("label") or item.get("name") or "").strip(),
                     "role": str(item.get("role") or "unknown").strip(),
@@ -314,7 +345,7 @@ def ground_with_vision(
     target_pt: dict[str, Any] | None = None
     if isinstance(tp_raw, dict) and "x" in tp_raw and "y" in tp_raw:
         try:
-            tx, ty = _clamp_point_to_bounds(int(tp_raw["x"]), int(tp_raw["y"]), obs.bounds)
+            tx, ty = _to_screen(tp_raw["x"], tp_raw["y"])
             target_pt = {
                 "x": tx,
                 "y": ty,
@@ -843,6 +874,10 @@ class AutonomousScreenAgent:
                 after_obs.view.app_running(exp_app)
                 or exp_app.lower() in after_obs.app.lower()
                 or exp_app.lower() in after_obs.title.lower()
+                # 'SearchHost.exe' vs app='Search' (live 2026-11-25 failure)
+                or screen_grounding.app_matches(
+                    exp_app, after_obs.app, after_obs.title, getattr(after_obs.view, "windows", None)
+                )
             )
             if not app_ok:
                 missing.append(f"app {exp_app!r} not visible")
@@ -918,12 +953,16 @@ class AutonomousScreenAgent:
                 break
             self._sleep_fn(min(self._poll_interval_s, max(0.001, deadline - now)))
 
-        # If UIA could not confirm expected_text on a degraded/browser surface, consult Vision once
+        # If UIA could not confirm expected_text, consult Vision once. Not only on
+        # degraded surfaces: the Start-menu search box and Chromium pages expose a
+        # "healthy" UIA tree that still omits the text just typed (live failure
+        # 2026-11-25: "expected text 'Epic Games Launcher' not observed").
         exp_text = str(step.get("expected_text") or "").strip()
         if (
             not verified
             and exp_text
-            and last_obs.degraded
+            and "expected text" in note
+            and (last_obs.degraded or last_obs.screenshot_bytes is not None or step.get("_force_vision"))
             and (self._vision_fn is not None or (self._decide_fn is None and last_obs.screenshot_bytes is not None))
         ):
             ground_with_vision(goal, exp_text, last_obs, vision_fn=self._vision_fn)
@@ -1018,6 +1057,19 @@ class AutonomousScreenAgent:
         if act in ("click", "double_click", "right_click", "type_text"):
             return {
                 **step,
+                "_force_vision": True,
+            }
+
+        if screen_grounding.is_toggle_press(step):
+            # Re-pressing Win closes the Start menu it just opened (live failure
+            # 2026-11-25). Re-observe with Vision instead of undoing the step.
+            return {
+                "action": "wait",
+                "target": target,
+                "expected_app": exp_app,
+                "expected_window_title": step.get("expected_window_title", ""),
+                "expected_text": step.get("expected_text", ""),
+                "expect_change": False,
                 "_force_vision": True,
             }
 
@@ -1161,6 +1213,11 @@ class AutonomousScreenAgent:
             "steps": [],
             "result": "",
         }
+        # Spoken, throttled status through player.request_say (thread-safe,
+        # injects into the Live session) so the user hears progress while the
+        # loop runs on this worker thread, never on the audio/event loop.
+        narrator = screen_grounding.StepNarrator.for_player(player)
+        narrator.say("Looking at your screen.", force=True)
 
         try:
             abort_why = self._check_abort(cancel_event)
@@ -1260,6 +1317,7 @@ class AutonomousScreenAgent:
 
                 step_key = f"Step {step_idx}: {dec_action}({str(decision.get('target') or '')[:30]})"
                 hud_msg = self._narrate_step(step_idx, prev_verified_desc, decision)
+                narrator.step(decision)
                 hud_steps.append(hud_msg)
                 self._hud_job_update(player, job_snap, hud_msg, status="acting", step_key=step_key, step_state="writing", on_step=on_step)
 

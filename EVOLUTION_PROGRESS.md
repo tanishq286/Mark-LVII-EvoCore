@@ -1,8 +1,8 @@
 # Mark-LVII EvoCore & OmniCore Upgrade Progress
 
-- **Active Milestone:** **Milestone 14 — Phone Remote HTTPS Supercharge & Mark-LVII OmniCore (Multi-Agent Swarm, Persistent Missions, Entity-Relation Knowledge Graph, Meta-Optimizer & Universal MCP Bridge) Verified & Ready for Review**
-- **Current Branch:** `milestone/14-omnicore-phone-fix` (branched off `main` `816a95c`, leaving concurrent local UI/goddess working-tree edits intact)
-- **Base `main` Commit (Untouched):** `816a95c`
+- **Active Milestone:** **Milestone 15 — Live Fixes (Screen Vision, Chrome Default, Cross-Session Memory) & 24/7 Researcher/Engineer Agents — Verified, STOPPED for review (not merged, Jarvis not restarted)**
+- **Current Branch:** `milestone/15-live-fixes-memory-and-247-agents` (branched off `main` `98221d4`; your uncommitted UI/goddess edits left untouched in the working tree and NOT committed)
+- **Base `main` Commit (Untouched):** `98221d4`
 - **Test Runners Installed:**
   - `pytest 9.2.0` (`C:\Users\tanis\AppData\Local\Python\pythoncore-3.13-64\python.exe`)
   - OpenJDK 17 (`EclipseAdoptium.Temurin.17.JDK`), Gradle `8.10.2`, Android SDK `android-35` + `build-tools 34.0.0/35.0.0` + `adb`
@@ -19,6 +19,44 @@
 | **Milestone 12: Android MAX Companion & PC Bridge** | 7 / 7 | Setup Pre-Flight (`setup_android_env.ps1`), Bidirectional TLS `/ws` Bridge + Instant PWA (`/pwa`), `android_bridge` Plugin, Native Kotlin App (`AntiTheftGuardService`, `WakeWordVoiceService`, `WhatsAppAndCallController`, `MobileToggleManager`, `ScreenVisionScrollService`, `EmergencySosManager`, `VoiceCameraController`) + On-Device Privacy Mode | **7 / 7 COMPLETE** |
 | **Milestone 13: Closed-Loop Autonomous Screen Agent** | 2 / 2 | Hybrid UIA + Vision/OCR Grounding (`core/evolution/screen_agent.py`), Post-Action Settle Polling (up to 3s), Stuck-State Recovery + `ChoiceBanner` Fallback, Multi-Step Wiring (`planner.py`, `autonomous_brain.py`, `plugins/autonomous_screen_agent.py`, `main.py`), `CONFIRM`/`LOCKED` Irreversible Gate, ESC / Corner / `"Jarvis stop"` Kill-Switches, Step Telemetry for `habit_compiler.py` | **COMPLETE** |
 | **Milestone 14: Phone HTTPS Fix & Mark-LVII OmniCore** | 6 / 6 | LAN Wi-Fi + SAN HTTPS `:8000` + QR Pairing + 4G/5G Tunnel + Live Screen/Voice/1-Tap Approval (`dashboard/server.py`, `pwa.html`, `android_companion/`), Parallel Multi-Agent Swarm + Critic (`core/evolution/swarm.py`), Persistent SQLite Missions (`core/evolution/mission_runner.py`), Entity-Relation Knowledge Graph (`core/memory/knowledge_graph.py`), Idle Meta-Optimizer (`core/evolution/meta_optimizer.py`), Universal MCP Client Bridge (`core/mcp_client.py`, `plugins/mcp_bridge.py`) | **6 / 6 COMPLETE** |
+| **Milestone 15: Live Fixes + 24/7 Agents** | 5 / 5 | Per-Monitor-V2 DPI + non-blank threaded capture + alias-aware verification + spoken step status + async goal queue (`core/dpi.py`, `screen_grounding.py`), Chrome default everywhere (`config_manager`, `browser_control`, `web_search`, `core/tasks/web.py` Playwright `channel="chrome"`), append-only cross-session memory (`conversation_store.py`, `memory_extractor.py`, `live_memory.py`), idle/budgeted Researcher (`research_daemon.py`), worktree-isolated Engineer (`engineer_daemon.py`, `agents_247.py`) | **5 / 5 COMPLETE (pending review)** |
+
+---
+
+## Milestone 15 — Live Fixes, Cross-Session Memory & 24/7 Agents (branch `milestone/15-live-fixes-memory-and-247-agents`)
+
+### Part 1 — Live bugs, diagnosed from real runtime logs/telemetry (not mocks)
+- **(1) Screen vision + autonomous completion.** Root causes found in `startup.log` / telemetry:
+  - The process started DPI-unaware and the first `mss` grab flipped it mid-run, so UIA rects, pyautogui clicks and screenshots used different coordinate spaces on the 150 % 2560x1600 panel → `core/dpi.py` sets Per-Monitor-V2 once in `main.py` before Qt/mss/pyautogui load.
+  - Blank/black frames were sent to Gemini Vision → `screen_processor.capture_screen_meta()` measures frame std, falls back to `PIL.ImageGrab`, and records monitor geometry; Vision now answers in 0-1000 normalized coordinates mapped to physical pixels (`screen_grounding.map_vision_point`).
+  - `press win` "UNVERIFIED" because the expected `SearchHost.exe` never matched the UIA app `Search`, so recovery re-pressed Win and closed Start → alias-aware `app_matches` + toggle-key recovery waits instead of re-pressing.
+  - Swarm sent `action='goal'` (rejected) and concurrent goals were refused → verb aliases + FIFO goal queue (max 5) on a worker thread; the voice loop never blocks.
+  - Synchronous SQLite telemetry ran on the asyncio loop after every tool call → "1011 keepalive ping timeout" disconnects; bookkeeping moved to `asyncio.to_thread`.
+  - Spoken status: throttled `StepNarrator` ("Looking at your screen.", "Opening Chrome.", ...).
+- **(2) Chrome default everywhere.** `config_manager.find_chrome_exe()/get_default_browser()/save_default_browser()`; `browser_control` prefers Jarvis's browser over the OS default (Edge on this PC) and launches `chrome.exe <url>` directly; `web_search` can open results in Chrome; `core/tasks/web.py` uses the installed Chrome UA and a Playwright `channel="chrome"` render fallback (bundled Chromium if Chrome is missing, SSRF guard on every navigation). Missing Chrome → graceful fallback to the OS default.
+- **(3) Cross-session memory.** `memory/conversations.sqlite` (WAL, `synchronous=FULL`) with append-only `conversation_history`, `session_summaries`, `memory_facts` (UPDATE/DELETE triggers abort). Every turn is recorded off-loop; rule facts are extracted per user turn; on sleep/next boot the session is summarised (Ollama first, Gemini fallback, extractive fallback) and facts flow into the knowledge graph and `knowledge_rag` (`jarvis_memory/remembered_facts.md`). A `[CROSS-SESSION MEMORY]` block is injected into every new Live session config (also survives the frequent inactivity reconnects) and a one-time primer is sent on wake.
+
+### Part 2 — 24/7 agents
+- **(4) Researcher** (`core/evolution/research_daemon.py`): runs only when idle ≥ 5 min, CPU ≤ 35 %, GPU ≤ 30 %; strict per-day budget in `memory/research_queue.sqlite` (40k cloud tokens, 15 cloud calls, 120 local calls, 12 web queries; overridable via `agents_247` plugin config); Ollama first, Gemini only within the cap. Analyses tool telemetry, routing failures, user corrections in conversation history, and web references (stored as untrusted). Writes ranked, de-duplicated specs.
+- **(5) Engineer** (`core/evolution/engineer_daemon.py`, scheduler `agents_247.py`, voice controls in `plugins/evolution_control.py`): picks the top `plugin_fix` spec (max 3 runs/day), builds an `evolve/auto-<slug>-<stamp>` worktree from the committed HEAD (live checkout and `main` never touched), writes fix + `tests/evolved/test_auto_<slug>.py`, then gates: safety AST audit → `validate_plugin` (0 errors/0 warnings) → pytest → replay benchmark must beat baseline → diff may only touch the plugin and its test. Any failure discards the branch. Success is queued in `memory/evolution_digest.json` as `approve_evolve` with a HUD/phone notification ("Approve upgrade N"). `safety_guard`, `file_vault`, both `voice_lock`s, `core/confirm`, the gates/daemons themselves and all `memory/*`/`*.sqlite` are refused outright. `approve_upgrade` snapshots `conversations.sqlite` + `knowledge_graph.sqlite` to `memory/upgrade_snapshots/` before any merge.
+- Voice: "pause/resume the 24/7 agents", "show what the researcher and engineer built today", "agents status", "run the agents now". Pause state persists in `memory/agents_state.json`.
+
+### Milestone 15 Files
+- New: `core/dpi.py`, `core/evolution/screen_grounding.py`, `core/memory/conversation_store.py`, `core/memory/memory_extractor.py`, `core/memory/live_memory.py`, `core/evolution/research_daemon.py`, `core/evolution/engineer_daemon.py`, `core/evolution/agents_247.py`, `tests/test_m15_memory_and_agents.py`, `tests/test_m15_live_screen_chrome.py`
+- Changed: `main.py` (M15 hunks only), `memory/config_manager.py` (M15 hunk only), `.gitignore` (M15 lines only), `actions/screen_processor.py`, `actions/browser_control.py`, `actions/web_search.py`, `core/tasks/web.py`, `core/evolution/screen_agent.py`, `core/memory/knowledge_graph.py`, `plugins/autonomous_screen_agent.py`, `plugins/knowledge_rag.py`, `plugins/evolution_control.py`, `plugins/claude_code.py` (missing brief), `tests/conftest.py`, `EVOLUTION_PROGRESS.md`
+
+### Milestone 15 Verification Summary (Windows Python 3.13)
+- `pytest -v` (full): **81 passed, 0 failed, 4 skipped** (skips = opt-in live tests)
+- Live real-desktop run (`JARVIS_LIVE_GUI=1 JARVIS_LIVE_NET=1`, `test_m15_live_screen_chrome.py`): **14 / 14 passed** — DPI-aware non-blank capture from a background thread, UIA active-window read, Notepad open → type → read-back verified, real Chrome window launch, Playwright `channel="chrome"` render
+- Cross-session E2E (two separate processes): session 1 says "My favorite project is Project Nova and my deadline is Friday" and shuts down; session 2 boots with both facts + summary in its bootstrap — **passed**
+- `scripts/validate_plugin.py`: **37 / 37 PASS, 0 errors, 0 warnings**
+- `python -m providers._tests`: **108 passed, 0 failed**
+- `scripts/verify_wake_activation.py`: **8 / 8 passed**
+- `scripts/health_check.py --allow-dirty`: **ALL HEALTHY**
+
+### Known follow-ups (outside the M15 file list)
+- `actions/send_message.py`, `actions/weather_report.py`, `plugins/website_builder.py` still call `webbrowser.open` (OS default = Edge). To make Windows itself use Chrome: `start ms-settings:defaultapps`.
+- Live Gemini recall test is opt-in: `JARVIS_LIVE_GEMINI=1`.
 
 ---
 
@@ -251,15 +289,15 @@
 
 ---
 
-## Merge to `main` & Restart Live Mark-LVII (Run When Ready)
+## Merge to `main` & Restart Live Mark-LVII (Run When Ready — after your review)
 ```powershell
-# 1. Stash your concurrent local UI/goddess edits, merge Milestone 14 into main, then restore UI edits:
+# 1. Stash your concurrent local UI/goddess edits, merge Milestone 15 into main, then restore UI edits:
 cd C:\Users\tanis\Downloads\Mark-LVII-main\Mark-LVII-main
-git stash push -m "local-ui-edits-before-m14-merge"
+git stash push -u -m "local-ui-edits-before-m15-merge"
 git checkout main
-git merge --no-ff milestone/14-omnicore-phone-fix -m "merge: Milestone 14 Phone HTTPS Supercharge & Mark-LVII OmniCore"
+git merge --no-ff milestone/15-live-fixes-memory-and-247-agents -m "merge: Milestone 15 live fixes, cross-session memory & 24/7 agents"
 git stash pop
 
-# 2. Launch Mark-LVII (serves HTTPS phone remote on https://172.16.6.143:8000/pwa):
+# 2. Restart Mark-LVII (close the running instance first):
 C:\Users\tanis\AppData\Local\Python\pythoncore-3.13-64\python.exe -B -u .\scripts\launch_jarvis.pyw
 ```

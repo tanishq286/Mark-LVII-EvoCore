@@ -101,3 +101,5 @@ android_companion/.idea/
 *.jks
 *.apk
 *.aab
+memory/agents_state.json
+memory/upgrade_snapshots/

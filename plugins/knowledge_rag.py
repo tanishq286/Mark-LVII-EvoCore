@@ -879,3 +879,52 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
         err = f"Sir, knowledge_rag encountered an error: {exc}"
         _notify_hud(player, err)
         return err
+
+
+# ── Milestone 15: cross-session memory note (turn-end / sleep extraction) ───
+
+MEMORY_NOTE_REL: str = "jarvis_memory/remembered_facts.md"
+
+
+def remember_facts(
+    facts: list[dict[str, Any]],
+    *,
+    summary: str = "",
+    vault_dir: Path | None = None,
+    reindex: bool = True,
+) -> dict[str, Any]:
+    """Append extracted facts / a session summary to the vault memory note.
+
+    The note lives in the (gitignored) `knowledge/` vault so `search_vault`
+    can retrieve personal facts semantically. Re-indexing is incremental and
+    skipped silently when the local embedding model is not reachable.
+    """
+    vault = Path(vault_dir) if vault_dir is not None else KNOWLEDGE_DIR
+    note = vault / MEMORY_NOTE_REL
+    lines: list[str] = []
+    for f in facts or []:
+        fact = " ".join(str(f.get("fact") or "").split())[:300]
+        if fact:
+            lines.append(f"- [{str(f.get('kind') or 'note')}] {fact}")
+    if summary:
+        lines.append(f"- [session_summary] {' '.join(str(summary).split())[:600]}")
+    if not lines:
+        return {"written": 0, "note": str(note), "indexed": False}
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    with _DB_LOCK:
+        note.parent.mkdir(parents=True, exist_ok=True)
+        existing = note.read_text(encoding="utf-8", errors="replace") if note.is_file() else (
+            "# Things JARVIS remembers about the user\n\n")
+        fresh = [ln for ln in lines if ln not in existing]
+        if fresh:
+            note.write_text(existing.rstrip("\n") + f"\n\n## {stamp}\n" + "\n".join(fresh) + "\n",
+                            encoding="utf-8")
+    indexed = False
+    if reindex and fresh:
+        try:
+            if _embed_model_reachable()[0]:
+                index_vault(vault)
+                indexed = True
+        except Exception:
+            indexed = False
+    return {"written": len(fresh), "note": str(note), "indexed": indexed}
