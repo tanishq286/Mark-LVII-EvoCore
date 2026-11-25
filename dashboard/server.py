@@ -343,11 +343,14 @@ def detect_tailscale(*, port: int = PORT, https: bool = True) -> dict:
     }
 
 
+LOCAL_TUNNEL_PORT = 8766
 _TUNNEL_LOCK = threading.Lock()
 _TUNNEL_PROC: subprocess.Popen | None = None
 _TUNNEL_URL: str = ""
+_TUNNEL_PROVIDER: str = ""
 _TUNNEL_ERR: str = ""
-_TRYCF_RE = re.compile(r"https://[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.trycloudflare\.com")
+_TRYCF_RE = re.compile(r"https://(?!api\.)[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)+\.trycloudflare\.com", re.IGNORECASE)
+_LHR_RE = re.compile(r"https://[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.lhr\.life", re.IGNORECASE)
 
 
 def _find_cloudflared() -> str | None:
@@ -365,16 +368,26 @@ def _find_cloudflared() -> str | None:
     return None
 
 
+def _find_ssh() -> str | None:
+    if sys.platform == "win32":
+        win_ssh = Path(r"C:\Windows\System32\OpenSSH\ssh.exe")
+        if win_ssh.is_file():
+            return str(win_ssh)
+    return shutil.which("ssh")
+
+
 def get_tunnel_status() -> dict:
-    """Return current Cloudflare Quick Tunnel availability and live public HTTPS URL."""
+    """Return current Quick Tunnel (`cloudflared` or `localhost.run` fallback) status & live HTTPS URL."""
     with _TUNNEL_LOCK:
         running = _TUNNEL_PROC is not None and _TUNNEL_PROC.poll() is None
         url = _TUNNEL_URL if running else ""
+        provider = _TUNNEL_PROVIDER if running else ""
         err = _TUNNEL_ERR
-    exe = _find_cloudflared()
+    exe = _find_cloudflared() or _find_ssh()
     return {
         "installed": bool(exe),
         "binary": exe or "",
+        "provider": provider,
         "running": running,
         "url": url,
         "pwa_url": f"{url}/pwa" if url else "",
@@ -382,70 +395,110 @@ def get_tunnel_status() -> dict:
     }
 
 
-def start_quick_tunnel(*, local_port: int = PORT, https: bool = True, wait_s: float = 8.0) -> dict:
-    """Launch an ephemeral `cloudflared tunnel --url ...` for 4G/5G remote access."""
-    global _TUNNEL_PROC, _TUNNEL_URL, _TUNNEL_ERR
-    with _TUNNEL_LOCK:
-        if _TUNNEL_PROC is not None and _TUNNEL_PROC.poll() is None and _TUNNEL_URL:
-            return get_tunnel_status()
-
-    exe = _find_cloudflared()
-    if not exe:
-        with _TUNNEL_LOCK:
-            _TUNNEL_ERR = "cloudflared not installed (run: winget install Cloudflare.cloudflared)"
-        return get_tunnel_status()
-
-    scheme = "https" if https else "http"
-    cmd = [exe, "tunnel", "--url", f"{scheme}://127.0.0.1:{local_port}"]
-    if https:
-        cmd.append("--no-tls-verify")
-
+def _spawn_tunnel_process(cmd: list[str], url_re: re.Pattern[str], provider: str, wait_s: float) -> bool:
+    global _TUNNEL_PROC, _TUNNEL_URL, _TUNNEL_PROVIDER, _TUNNEL_ERR
     found_ev = threading.Event()
+    last_lines: list[str] = []
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
-    def _watch_stderr(proc: subprocess.Popen) -> None:
-        global _TUNNEL_URL, _TUNNEL_ERR
+    def _watch_output(proc: subprocess.Popen) -> None:
+        global _TUNNEL_URL, _TUNNEL_PROVIDER, _TUNNEL_ERR
         try:
-            assert proc.stderr is not None
-            for raw in iter(proc.stderr.readline, b""):
-                line = raw.decode("utf-8", errors="replace")
-                m = _TRYCF_RE.search(line)
+            assert proc.stdout is not None
+            for raw in iter(proc.stdout.readline, b""):
+                line = raw.decode("utf-8", errors="replace").strip()
+                if line:
+                    last_lines.append(line)
+                m = url_re.search(line)
                 if m:
                     with _TUNNEL_LOCK:
                         _TUNNEL_URL = m.group(0).rstrip("/")
+                        _TUNNEL_PROVIDER = provider
                         _TUNNEL_ERR = ""
                     found_ev.set()
         except Exception as exc:
             with _TUNNEL_LOCK:
                 _TUNNEL_ERR = str(exc)
+        finally:
             found_ev.set()
 
     try:
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             shell=False,
+            creationflags=creationflags,
         )
         with _TUNNEL_LOCK:
             _TUNNEL_PROC = proc
             _TUNNEL_URL = ""
+            _TUNNEL_PROVIDER = provider
             _TUNNEL_ERR = ""
-        threading.Thread(target=_watch_stderr, args=(proc,), daemon=True, name="jarvis-cf-tunnel").start()
-        found_ev.wait(timeout=max(0.5, float(wait_s)))
+        threading.Thread(target=_watch_output, args=(proc,), daemon=True, name=f"jarvis-tunnel-{provider}").start()
+        found_ev.wait(timeout=max(1.0, float(wait_s)))
+        with _TUNNEL_LOCK:
+            if _TUNNEL_URL and proc.poll() is None:
+                return True
+            _TUNNEL_ERR = (last_lines[-1] if last_lines else f"{provider} exited without tunnel URL")[:240]
     except Exception as exc:
         with _TUNNEL_LOCK:
-            _TUNNEL_ERR = f"Failed to start cloudflared: {exc}"
+            _TUNNEL_ERR = f"Failed to start {provider}: {exc}"
+    stop_quick_tunnel()
+    return False
+
+
+def start_quick_tunnel(
+    *,
+    local_port: int = PORT,
+    https: bool = True,
+    tunnel_http_port: int = LOCAL_TUNNEL_PORT,
+    wait_s: float = 8.0,
+) -> dict:
+    """Launch a public HTTPS tunnel (`cloudflared`, with automatic `localhost.run` SSH fallback if DPI-blocked)."""
+    with _TUNNEL_LOCK:
+        if _TUNNEL_PROC is not None and _TUNNEL_PROC.poll() is None and _TUNNEL_URL:
+            return get_tunnel_status()
+
+    cf_exe = _find_cloudflared()
+    if cf_exe:
+        scheme = "https" if https else "http"
+        cf_cmd = [cf_exe, "tunnel", "--url", f"{scheme}://127.0.0.1:{local_port}"]
+        if https:
+            cf_cmd.append("--no-tls-verify")
+        if _spawn_tunnel_process(cf_cmd, _TRYCF_RE, "cloudflared", min(5.0, float(wait_s))):
+            return get_tunnel_status()
+
+    # Automatic fallback when campus/corporate DPI resets api.trycloudflare.com:
+    # OpenSSH reverse tunnel to localhost.run (terminates real CA-trusted HTTPS + WSS -> 127.0.0.1:LOCAL_TUNNEL_PORT)
+    ssh_exe = _find_ssh()
+    if ssh_exe:
+        null_kh = "NUL" if os.name == "nt" else "/dev/null"
+        ssh_cmd = [
+            ssh_exe,
+            "-T",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", f"UserKnownHostsFile={null_kh}",
+            "-o", "ServerAliveInterval=30",
+            "-o", "ExitOnForwardFailure=yes",
+            "-R", f"80:127.0.0.1:{tunnel_http_port}",
+            "nokey@localhost.run",
+        ]
+        if _spawn_tunnel_process(ssh_cmd, _LHR_RE, "localhost.run", max(6.0, float(wait_s))):
+            return get_tunnel_status()
+
     return get_tunnel_status()
 
 
 def stop_quick_tunnel() -> dict:
-    """Stop any active Cloudflare Quick Tunnel process cleanly."""
-    global _TUNNEL_PROC, _TUNNEL_URL
+    """Stop any active Quick Tunnel process cleanly."""
+    global _TUNNEL_PROC, _TUNNEL_URL, _TUNNEL_PROVIDER
     with _TUNNEL_LOCK:
         proc = _TUNNEL_PROC
         _TUNNEL_PROC = None
         _TUNNEL_URL = ""
+        _TUNNEL_PROVIDER = ""
     if proc is not None and proc.poll() is None:
         try:
             proc.terminate()
@@ -1432,20 +1485,33 @@ class DashboardServer:
             q_tok = str(req.query_params.get("token") or "").strip()
             return _valid(q_tok)
 
+        def _is_proxied_request(req: Request) -> bool:
+            if req.headers.get("x-forwarded-for") or req.headers.get("cf-connecting-ip") or req.headers.get("x-real-ip"):
+                return True
+            hdr_host = (req.headers.get("host") or "").lower().split(":", 1)[0]
+            return hdr_host.endswith((".lhr.life", ".trycloudflare.com"))
+
         def _who(req: Request) -> str:
+            xff = (req.headers.get("cf-connecting-ip") or req.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
+            if xff:
+                return xff
             return (getattr(getattr(req, "client", None), "host", "") or "unknown")
 
         def _is_trusted_local_caller(req: Request) -> bool:
             if _auth(req):
                 return True
-            host = _who(req).lower()
+            q_pin = str(req.query_params.get("pin") or req.query_params.get("key") or "").strip().upper()
+            now = time.time()
+            if q_pin and self._pending_keys.get(q_pin, 0.0) > now:
+                return True
+            if _is_proxied_request(req):
+                return False
+            host = (getattr(getattr(req, "client", None), "host", "") or "").lower()
             if host in ("127.0.0.1", "::1", "localhost", "testclient"):
                 return True
             if self._ip and host == self._ip.lower():
                 return True
-            q_pin = str(req.query_params.get("pin") or req.query_params.get("key") or "").strip().upper()
-            now = time.time()
-            return bool(q_pin and self._pending_keys.get(q_pin, 0.0) > now)
+            return False
 
         @app.get("/login", response_class=HTMLResponse)
         async def login_page():
@@ -2192,6 +2258,18 @@ class DashboardServer:
         cfg = uvicorn.Config(bounce, host="0.0.0.0", port=REDIRECT_PORT, log_level="warning")
         await uvicorn.Server(cfg).serve()
 
+    async def _serve_local_tunnel_loopback(self) -> None:
+        """Loopback-only (`127.0.0.1:8766`) HTTP/WS listener backing SSH TLS-terminating tunnels."""
+        probe = socket.socket()
+        try:
+            probe.bind(("127.0.0.1", LOCAL_TUNNEL_PORT))
+        except OSError:
+            probe.close()
+            return
+        probe.close()
+        cfg = uvicorn.Config(self.app, host="127.0.0.1", port=LOCAL_TUNNEL_PORT, log_level="warning")
+        await uvicorn.Server(cfg).serve()
+
     async def serve(self) -> None:
         self._loop = asyncio.get_running_loop()
         set_active_server(self)
@@ -2208,6 +2286,7 @@ class DashboardServer:
 
         if use_ssl:
             asyncio.create_task(self._serve_redirector())
+        asyncio.create_task(self._serve_local_tunnel_loopback())
 
         cfg = uvicorn.Config(
             self.app,
