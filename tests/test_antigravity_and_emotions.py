@@ -235,3 +235,24 @@ def test_antigravity_4gate_blocks_unsafe_and_validates_new_plugins():
 
         smoke_out = mod.run({}, player=None, session_memory=None)
         assert isinstance(smoke_out, str) and len(smoke_out.strip()) > 0
+
+
+def test_agy_command_has_no_empty_args_and_bypasses_wsl_shell():
+    """Regression: agy rejected a stray "" argument on Windows (wsl.exe `--`
+    re-parsed the command through the login shell and expanded "$@" to "")."""
+    with patch.object(antigravity_bridge.platform, "system", return_value="Windows"):
+        cmd = antigravity_bridge.build_agy_command(
+            model="", resume_id="", add_dirs=["", None], timeout_s=60)
+    assert "" not in cmd
+    assert "--exec" in cmd
+    head = cmd[: cmd.index("bash")]
+    assert "--" not in head, "wsl.exe `--` re-parses argv through the shell"
+    lc = cmd.index("-lc")
+    assert '"$@"' in cmd[lc + 1]
+    assert cmd[lc + 2] == "agy" and cmd[lc + 3] == "--output-format"
+    assert "-p" not in cmd, "-p swallows the next flag as its prompt; prompt goes via stdin"
+
+    with patch.object(antigravity_bridge.platform, "system", return_value="Linux"):
+        cmd_linux = antigravity_bridge.build_agy_command(model="", resume_id="", timeout_s=60)
+    assert "" not in cmd_linux
+    assert cmd_linux[1] == "--output-format" and "-p" not in cmd_linux

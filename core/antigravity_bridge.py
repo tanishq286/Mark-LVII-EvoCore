@@ -149,7 +149,10 @@ def build_agy_command(
 ) -> list[str]:
     """Construct the cross-OS subprocess argv to run `agy` non-interactively."""
     fmt = "stream-json" if stream_json else "json"
-    args: list[str] = ["-p", "--output-format", fmt]
+    # No `-p`: it takes the NEXT token as its prompt, so `-p --output-format`
+    # made agy treat "--output-format" as the prompt and abort. The prompt is
+    # written to stdin by invoke_agy_sync, which agy reads in print mode.
+    args: list[str] = ["--output-format", fmt]
     if skip_permissions:
         args.append("--dangerously-skip-permissions")
     if disable_slash:
@@ -164,6 +167,9 @@ def build_agy_command(
         if d:
             args.extend(["--add-dir", cross_os.to_wsl_path(d) if platform.system() == "Windows" else str(d)])
 
+    # Never hand agy an empty argument: it rejects any stray "" outright.
+    args = [a for a in args if isinstance(a, str) and a != ""]
+
     if platform.system() == "Windows":
         target_cwd = cross_os.to_wsl_path(wsl_cwd) if wsl_cwd and wsl_cwd != "~" else "~"
         return [
@@ -172,7 +178,12 @@ def build_agy_command(
             cross_os.WSL_DISTRO,
             "--cd",
             target_cwd,
-            "--",
+            # `--exec`, NOT `--`: with `--` wsl.exe joins everything into one
+            # string and re-parses it through the login shell, which expands
+            # the script's "$@" to an empty string — agy then received a lone
+            # "" argument ("unexpected argument \"\"") and every Windows-side
+            # call silently fell back to Gemini. `--exec` passes argv verbatim.
+            "--exec",
             "bash",
             "-lc",
             'export PATH="$HOME/bin:$HOME/.local/bin:$HOME/.local/opt/node/bin:$PATH"; exec agy "$@"',
@@ -384,7 +395,9 @@ def invoke_agy_sync(
     if not ok_bin:
         return {"ok": False, "error": bin_info, "response": "", "conversation_id": "", "model": model}
 
-    models_to_try = [model] if model else list(FALLBACK_AGY_MODELS)
+    # "" = no --model flag, i.e. the account's own default model. Tried last so
+    # a quota on every pinned model still leaves a working path.
+    models_to_try = [model] if model else [*FALLBACK_AGY_MODELS, ""]
     last_err = ""
 
     run_cwd = str(Path.home())
