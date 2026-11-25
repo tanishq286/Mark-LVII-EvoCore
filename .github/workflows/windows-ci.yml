@@ -25,7 +25,6 @@ jobs:
       PYTHONUTF8: "1"
       QT_QPA_PLATFORM: offscreen
       JARVIS_DISABLE_247_AGENTS: "1"
-      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "0"
     steps:
       - name: Check out source
         uses: actions/checkout@v4
