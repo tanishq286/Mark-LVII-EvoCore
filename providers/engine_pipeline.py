@@ -431,6 +431,8 @@ class PipelineEngine:
         Conversation history is retained, but pending tool results and queued
         output from this generation are fenced off from the next user turn.
         """
+        if self._closed:
+            return
         self._turns.interrupt()
         self._followup = False
         self._awaiting.clear()
