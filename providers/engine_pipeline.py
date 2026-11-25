@@ -51,6 +51,7 @@ from typing import Any, AsyncIterator, Optional
 
 from . import schema
 from .base import DEFAULT_CAPS, FunctionCall, Msg
+from core.voice_turn import TurnState, VoiceTurnCoordinator
 
 # How much conversation to carry. Gemini Live compresses its own context with a
 # sliding window server-side; a stateless chat API has no such thing, so the
@@ -144,6 +145,12 @@ class PipelineEngine:
         self._queue: asyncio.Queue = asyncio.Queue()
         self._gen: Optional[asyncio.Task] = None
         self._closed = False
+        # A generation ID follows one response through transcript, TTS, and
+        # playback. Interrupting invalidates it, so late provider chunks cannot
+        # be published after the user has taken the floor.
+        self._turns = VoiceTurnCoordinator()
+        self._active_generation: int | None = None
+        self._pending_generation_ids: dict[str, int] = {}
         # Tool calls handed out and not yet answered. A model that emits two
         # calls in one turn must have BOTH answered before the next generation,
         # or the second result arrives with no call to attach to and several
@@ -340,7 +347,7 @@ class PipelineEngine:
         self._queue_generation()
 
     async def send_tool_response(self, *, function_responses) -> None:
-        """Tool results. Returns immediately — see the module docstring."""
+        """Tool results. Stale results from an interrupted turn are discarded."""
         if self._closed:
             return
         started = self._timing.get("tool_at")
@@ -348,13 +355,23 @@ class PipelineEngine:
             self._tick("tools", time.monotonic() - started)
             self._timing["tool_names"] = ", ".join(
                 sorted(set(self._awaiting.values()))) or ""
+        accepted = False
         for fr in function_responses or []:
             call_id = str(getattr(fr, "id", "") or "")
+            generation = self._pending_generation_ids.pop(call_id, None)
             name = str(getattr(fr, "name", "") or self._awaiting.get(call_id, ""))
             payload = getattr(fr, "response", None)
             if isinstance(payload, dict) and "result" in payload:
                 payload = payload["result"]
             sig = getattr(self, "_pending_sigs", {}).pop(call_id, "")
+            self._awaiting.pop(call_id, None)
+
+            # A tool may finish after the user has interrupted its originating
+            # turn. Never attach that result to a newer conversation.
+            if generation is None or not self._turns.is_current(generation):
+                continue
+
+            accepted = True
             if sig:
                 self._done_calls[sig] = _stringify(payload)
             self._history.append({
@@ -363,10 +380,9 @@ class PipelineEngine:
                 "name": name,
                 "content": _stringify(payload),
             })
-            self._awaiting.pop(call_id, None)
 
-        # Only ask the model again once every call it made has an answer.
-        if not self._awaiting:
+        # Only resume a turn that still owns every returned result.
+        if accepted and not self._awaiting:
             self._start_generation()
 
     async def receive(self) -> AsyncIterator[Msg]:
@@ -374,10 +390,16 @@ class PipelineEngine:
             msg = await self._queue.get()
             if msg is None:
                 return
+            # Events may already have been queued when an interrupt arrives.
+            # Fence again here, immediately before main.py can play their PCM.
+            if (msg.generation is not None
+                    and not self._turns.is_current(msg.generation)):
+                continue
             yield msg
 
     async def close(self) -> None:
         self._closed = True
+        self._turns.close()
         if self._gen and not self._gen.done():
             self._gen.cancel()
         await self._queue.put(None)
@@ -404,42 +426,58 @@ class PipelineEngine:
 
     # ── interruption ─────────────────────────────────────────────────────────
     def interrupt(self) -> None:
-        """Stop the current generation. Called when the user talks over it.
+        """Cancel and invalidate the current response generation.
 
-        The generation is cancelled but the history is left as it is: whatever
-        was already said was heard, and deleting it would make the assistant
-        deny having said something the user is replying to.
+        Conversation history is retained, but pending tool results and queued
+        output from this generation are fenced off from the next user turn.
         """
+        self._turns.interrupt()
+        self._followup = False
+        self._awaiting.clear()
+        self._pending_sigs.clear()
+        self._pending_generation_ids.clear()
+        self._done_calls.clear()
+        self._rounds = 0
         if self._gen and not self._gen.done():
             self._gen.cancel()
 
     # ── generation ───────────────────────────────────────────────────────────
+    def _begin_generation(self) -> int:
+        """Acquire the current capture token and move it to inference."""
+        snap = self._turns.snapshot()
+        if snap.state is TurnState.LISTENING:
+            generation = snap.generation
+        else:
+            generation = self._turns.begin_capture()
+        if not self._turns.finish_capture(generation):
+            generation = self._turns.begin_capture()
+            self._turns.finish_capture(generation)
+        self._active_generation = generation
+        return generation
+
     def _queue_generation(self) -> None:
-        """Answer this, after whatever is already being answered.
-
-        The first version cancelled the generation in flight. That is right for
-        a person talking over the assistant — and `interrupt()` is what does
-        that — but `send_client_content` is ALSO how a background monitor drops
-        a GPU alert into the conversation, and it fired while the assistant was
-        halfway through answering something else. The answer in progress was
-        cancelled and replaced by a reply about the graphics card.
-
-        Nothing that arrives this way is urgent enough to destroy an answer the
-        user is waiting for. It waits its turn.
-        """
-        if self._gen and not self._gen.done():
+        """Start a response, or queue it behind a still-current response."""
+        if (self._gen and not self._gen.done()
+                and self._active_generation is not None
+                and self._turns.is_current(self._active_generation)):
+            # Injected alerts and follow-ups must not cancel an answer in flight.
             self._followup = True
             return
-        self._gen = asyncio.create_task(self._generate())
+        generation = self._begin_generation()
+        self._gen = asyncio.create_task(self._generate(generation))
 
     def _start_generation(self) -> None:
-        """Generate now, replacing anything running. Only used where the
-        conversation genuinely moved on — a tool result completing the turn."""
+        """Resume a tool-calling turn, but never resurrect an interrupted one."""
+        generation = self._active_generation
+        if generation is None or not self._turns.is_current(generation):
+            return
         if self._gen and not self._gen.done():
             self._gen.cancel()
-        self._gen = asyncio.create_task(self._generate())
+        self._gen = asyncio.create_task(self._generate(generation))
 
-    async def _generate(self) -> None:
+    async def _generate(self, generation: int) -> None:
+        if not self._turns.is_current(generation):
+            return
         said: list[str] = []
         calls: list[FunctionCall] = []
         t0 = time.monotonic()
@@ -448,6 +486,8 @@ class PipelineEngine:
         pending = ""            # visible text not yet a whole sentence
         try:
             async for ev in self._llm.chat(self._messages(), self._tools):
+                if not self._turns.is_current(generation):
+                    return
                 if ev.get("text"):
                     visible = thinking.feed(ev["text"])
                     if visible and first_word is None:
@@ -465,8 +505,8 @@ class PipelineEngine:
                     ready, pending = _take_sentences(pending)
                     for sentence in ready:
                         said.append(sentence)
-                        await self._emit(Msg.said(sentence))
-                        await self._speak(sentence)
+                        await self._emit(Msg.said(sentence, generation))
+                        await self._speak(sentence, generation)
                 if ev.get("tool_calls"):
                     calls.extend(ev["tool_calls"])
 
@@ -475,8 +515,8 @@ class PipelineEngine:
                 said.append(pending.strip())
                 if first_word is None:
                     first_word = time.monotonic() - t0
-                await self._emit(Msg.said(pending.strip()))
-                await self._speak(pending.strip())
+                await self._emit(Msg.said(pending.strip(), generation))
+                await self._speak(pending.strip(), generation)
             if thinking.hid:
                 self._timing["thought"] = thinking.hid
 
@@ -562,7 +602,8 @@ class PipelineEngine:
                 self._tick("llm", time.monotonic() - t0, first_word, text)
                 # Already spoken, sentence by sentence, as it arrived.
                 self._timing["tool_at"] = time.monotonic()
-                await self._emit(Msg.calls(calls))
+                self._pending_generation_ids.update({c.id: generation for c in calls})
+                await self._emit(Msg.calls(calls, generation))
                 # No turn_end here: the turn continues once the results arrive.
                 # Emitting one would make main.py log a half-finished answer as
                 # if it were the whole reply.
@@ -574,11 +615,13 @@ class PipelineEngine:
 
             self._log(f"SYS: replied in {time.monotonic() - t0:.1f}s")
             self._print_timing()
-            await self._emit(Msg.turn_end())
-            if self._followup:
+            await self._emit(Msg.turn_end(generation))
+            self._turns.finish_response(generation)
+            if self._followup and self._turns.is_current(generation):
                 # Something was injected while this answer was being produced.
                 self._followup = False
-                self._gen = asyncio.create_task(self._generate())
+                next_generation = self._begin_generation()
+                self._gen = asyncio.create_task(self._generate(next_generation))
 
         except asyncio.CancelledError:
             raise
@@ -587,10 +630,11 @@ class PipelineEngine:
             # sits in THINKING for ever and the stall watchdog reconnects an
             # engine whose only problem was one bad request.
             self._report("the language model", self._llm, e)
-            await self._emit(Msg.said(_failure_line("the language model", e)))
-            await self._emit(Msg.turn_end())
+            await self._emit(Msg.said(_failure_line("the language model", e), generation))
+            await self._emit(Msg.turn_end(generation))
+            self._turns.finish_response(generation)
 
-    async def _speak(self, text: str) -> None:
+    async def _speak(self, text: str, generation: int) -> None:
         if self._tts is None:
             return
         text = _speakable(text)
@@ -637,10 +681,12 @@ class PipelineEngine:
         try:
             async for pcm in self._tts.speak(text, **kwargs):
                 if pcm:
+                    if not self._turns.begin_speaking(generation):
+                        return
                     if first is None:
                         first = time.monotonic() - t0
                     total += len(pcm)
-                    await self._emit(Msg.audio(pcm))
+                    await self._emit(Msg.audio(pcm, generation))
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -755,8 +801,15 @@ class PipelineEngine:
         traceback.print_exception(type(exc), exc, exc.__traceback__)
 
     async def _emit(self, msg: Msg) -> None:
-        if not self._closed:
-            await self._queue.put(msg)
+        if self._closed:
+            return
+        if msg.generation is not None:
+            if not self._turns.is_current(msg.generation):
+                return
+            # Audio only leaves the provider when its generation owns playback.
+            if msg.data and not self._turns.accepts_audio(msg.generation):
+                return
+        await self._queue.put(msg)
 
     # ── conversion ───────────────────────────────────────────────────────────
     def _to_content(self, parts: list) -> Any:
