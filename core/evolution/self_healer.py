@@ -230,6 +230,14 @@ def _default_patch_with_llm(plugin_name: str, current_code: str, failures: list[
         "- Zero PyQt/PySide imports, zero eval/exec/compile/__import__/importlib/ctypes/os.system/shell=True.\n"
         "- Return ONLY valid Python code (no markdown fences)."
     )
+    patched = ""
+    try:
+        from core import antigravity_bridge
+        patched = _strip_code_fences(antigravity_bridge.generate_code_with_antigravity(prompt, timeout_s=120) or "")
+    except Exception:
+        patched = ""
+    if patched and "PLUGIN" in patched and "def run" in patched:
+        return patched
     return _strip_code_fences(gemini.text(prompt, tier=gemini.SMART, timeout_ms=90_000) or "")
 
 

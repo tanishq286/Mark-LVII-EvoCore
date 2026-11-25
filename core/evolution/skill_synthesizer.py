@@ -80,7 +80,14 @@ def _generate_with_llm(slug: str, specification: str) -> tuple[str, str]:
         "3. Zero Qt/PyQt/PySide imports, zero eval/exec/compile/__import__/importlib/ctypes/os.system/shell=True, zero raw api_keys/long_term/.env paths.\n"
         "4. Return ONLY raw Python source code."
     )
-    code = _strip_fences(gemini.text(code_prompt, tier=gemini.SMART, timeout_ms=90_000) or "")
+    code = ""
+    try:
+        from core import antigravity_bridge
+        code = _strip_fences(antigravity_bridge.generate_code_with_antigravity(code_prompt, timeout_s=120) or "")
+    except Exception:
+        code = ""
+    if not code or "PLUGIN" not in code or "def run" not in code:
+        code = _strip_fences(gemini.text(code_prompt, tier=gemini.SMART, timeout_ms=90_000) or "")
     test_prompt = (
         f"Write a minimal standalone pytest test file verifying `plugins/{slug}.py` against this spec:\n{specification}\n\n"
         f"Plugin code:\n{code[:4000]}\n\n"

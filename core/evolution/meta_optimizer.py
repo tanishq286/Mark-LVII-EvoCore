@@ -318,6 +318,14 @@ def _default_optimize_with_llm(
         "3. Zero Qt/PyQt/PySide imports, zero eval/exec/compile/__import__/importlib/ctypes/os.system/shell=True, zero raw api_keys/long_term/mcp_servers/.env strings.\n"
         "4. Return ONLY valid Python source code."
     )
+    optimized = ""
+    try:
+        from core import antigravity_bridge
+        optimized = _strip_fences(antigravity_bridge.generate_code_with_antigravity(prompt, timeout_s=120) or "")
+    except Exception:
+        optimized = ""
+    if optimized and "PLUGIN" in optimized and "def run" in optimized:
+        return optimized
     return _strip_fences(gemini.text(prompt, tier=gemini.SMART, timeout_ms=90_000) or "")
 
 

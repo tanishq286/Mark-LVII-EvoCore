@@ -2586,24 +2586,30 @@ class MainWindow(QMainWindow):
 
     def _refresh_hud_btn(self):
         from memory.config_manager import get_hud_style
-        face = get_hud_style() == "face"
-        # Neither state is "off", so both read as active — this is a choice
-        # between two things, not a switch with a disabled side.
-        self._hud_btn.setText("🧑  HUD: ANIMATED FACE" if face
-                              else "◉  HUD: REACTOR CORE")
+        style = get_hud_style()
+        # None of the states is "off", so all read as active — this is a
+        # choice between things, not a switch with a disabled side.
+        text, tip = {
+            "face": ("🧑  HUD: ANIMATED FACE",
+                     "An animated head that speaks your words and shows what JARVIS "
+                     "is doing. Tap to switch to the goddess."),
+            "goddess": ("✨  HUD: GODDESS",
+                        "A full-body goddess with feelings and a beating heart: her mood "
+                        "follows the conversation. Tap to switch to the reactor core."),
+        }.get(style, ("◉  HUD: REACTOR CORE",
+                      "A 3-D reactor core that turns with the state and moves with your "
+                      "voice. Tap to switch to the animated head."))
+        self._hud_btn.setText(text)
         self._hud_btn.setStyleSheet(btn_css("choice"))
-        self._hud_btn.setToolTip(
-            "An animated head that speaks your words and shows what JARVIS is "
-            "doing. Tap to switch to the reactor core."
-            if face else
-            "A 3-D reactor core that turns with the state and moves with your "
-            "voice. Tap to switch to the animated head.")
+        self._hud_btn.setToolTip(tip)
 
     def _toggle_hud_style(self):
         """Swap the centrepiece. Both objects stay in memory, so the change is
         instant and switching back costs nothing."""
         from memory.config_manager import get_hud_style, save_hud_style
-        want = "core" if get_hud_style() == "face" else "face"
+        order = ("face", "goddess", "core")
+        cur = get_hud_style()
+        want = order[(order.index(cur) + 1) % len(order)] if cur in order else "face"
         save_hud_style(want)
         try:
             self.hud.hud_style = want
@@ -2611,9 +2617,10 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._refresh_hud_btn()
-        self._log.append_log(
-            "SYS: HUD switched to the animated face." if want == "face"
-            else "SYS: HUD switched to the reactor core.")
+        self._log.append_log({
+            "face": "SYS: HUD switched to the animated face.",
+            "goddess": "SYS: HUD switched to the goddess.",
+        }.get(want, "SYS: HUD switched to the reactor core."))
 
     def _toggle_ptt(self):
         from memory.config_manager import (get_push_to_talk_enabled,

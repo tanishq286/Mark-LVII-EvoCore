@@ -441,7 +441,17 @@ Additional mandatory rules for `{rel_path}`:
 7. For any LLM call, use `from core import gemini` (`gemini.text(prompt, tier=gemini.FAST)` or `gemini.SMART`) and handle `None`/empty fallbacks gracefully.
 8. Output ONLY valid Python source code — no markdown fences, no commentary.
 """
-        code = _strip_fences(gemini.text(write_prompt, tier=gemini.SMART, timeout_ms=90_000) or "")
+        code = ""
+        try:
+            from core import antigravity_bridge
+            code = _strip_fences(antigravity_bridge.generate_code_with_antigravity(write_prompt, timeout_s=150) or "")
+            if code and "PLUGIN" in code and "def run(" in code:
+                job["model"] = "Antigravity (agy)"
+                step(f"Antigravity drafted `{rel_path}` — validating…", status="checking", file_rel=rel_path, fstate="waiting")
+        except Exception:
+            code = ""
+        if not code or "PLUGIN" not in code or "def run(" not in code:
+            code = _strip_fences(gemini.text(write_prompt, tier=gemini.SMART, timeout_ms=90_000) or "")
         if not code or "PLUGIN" not in code or "def run(" not in code:
             raise RuntimeError("Model did not return a complete plugin module.")
 

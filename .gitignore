@@ -33,6 +33,10 @@ memory/heuristics_chain.json
 memory/score_history.json
 memory/evolution_journal.json
 memory/failure_patterns.json
+memory/goddess_mind.json
+memory/antigravity_*.json
+memory/antigravity_backups/
+.jarvis_backup/
 memory/habits.json
 memory/evolution_digest.json
 memory/evolution_commits.json
@@ -64,6 +68,7 @@ __pycache__/
 *$py.class
 *.so
 *.bak
+*.bak-*
 *.tmp
 build/
 dist/

@@ -723,6 +723,11 @@ def start_daemon(player=None, interval_s: float = 180.0) -> None:
                     knowledge_graph.consolidate_graph()
                     reflection_loop.run_reflection_cycle(_BASE, consolidate_rag=True)
                     meta_optimizer.run_idle_optimization(_BASE, min_idle_seconds=180.0)
+                    try:
+                        from core import antigravity_bridge
+                        antigravity_bridge.run_autonomous_self_upgrade_check(player=player)
+                    except Exception as agy_exc:
+                        print(f"[AutoEvolution] Antigravity self-upgrade check skipped: {agy_exc}")
                 except Exception as e:
                     print(f"[AutoEvolution] reflection cycle error: {e}")
 

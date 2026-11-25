@@ -300,7 +300,7 @@ def _describe_limits(has_vision: bool, has_mic: bool) -> str:
         "  1. For any of the user's 30+ GitHub repositories (tq-forge, omega-system, horizon, finsolenterprises, recoveryos, OmniRoute, etc.), "
         "246 installed Linux/Claude/Agent skills, 53 plugins, 9 MCP servers, 16 cloud connectors, or system CLI commands, call `universal_omnibridge`.",
         "  2. For complex multi-step goals requiring planning and chaining several tools, call `autonomous_brain`.",
-        "  3. If a request needs a brand-new tool or capability you do not yet have, call `self_evolve` (action='evolve') to build, score, and hot-load it on the spot.",
+        "  3. Google Antigravity (`agy`) is integrated directly inside you via `antigravity_agent`: call `antigravity_agent` (action='upgrade_self') whenever asked to upgrade yourself, evolve new skills with Antigravity, or auto-heal tools (`action='auto_heal'`), and `self_evolve` for branch-only drafts. Call `emotion_soul` to inspect or express your living heart, BPM, bond, or switch voices (`Aoede`/`Kore`).",
         "  4. For deep multi-file coding or connected cloud accounts (Gmail, Calendar, Drive, Notion, Vercel, Supabase, GitHub), call `claude_code`.",
         "  5. For interactive multi-step desktop GUI tasks (open apps, click controls, type text, verify screen state), call `autonomous_screen_agent` (say 'Jarvis stop' or press ESC anytime to abort).",
         "- Never mime an action without calling a tool, and never report a result you did not get.",
@@ -1475,6 +1475,13 @@ class JarvisLive:
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
             return
+        if hasattr(self.ui, "feel"):
+            self.ui.feel(text, "user")      # a typed message is hearing from you too
+        try:
+            from core import emotions as _emotions
+            _emotions.appraise_text(text, "user", player=self.ui)
+        except Exception:
+            pass
         # Respect wake-trigger sleep: a typed command must not be answered while
         # asleep either (the sleep gate is not just for the mic). Wake first with
         # "Hey Jarvis", a double clap, or the WAKE NOW button.
@@ -1727,6 +1734,11 @@ class JarvisLive:
             from core.persona import format_persona_prompt
             from memory.config_manager import get_persona_mode
             parts.append(format_persona_prompt(get_persona_mode()))
+        except Exception:
+            pass
+        try:
+            from core import emotions as _emotions
+            parts.append(_emotions.format_emotion_for_prompt(self.ui))
         except Exception:
             pass
         if mem_str:
@@ -2092,6 +2104,16 @@ class JarvisLive:
         # something like a phone call already ringing, is exactly the noise the
         # non-blocking call was meant to avoid. Tools that declared nothing get
         # the API default and behave as they always have.
+        try:
+            from core import emotions as _emotions
+            if str(result).lower().startswith(("tool '", "failed:", "status=failed")):
+                _emotions.note_event("tool_error", f"{name}: {str(result)[:80]}", player=self.ui)
+            _emo_cue = _emotions.consume_mood_shift_cue()
+            if _emo_cue and isinstance(result, str):
+                result = f"{result}\n{_emo_cue}"
+        except Exception:
+            pass
+
         _sched = (self._action_registry.scheduling(name)
                   or self._plugin_registry.scheduling(name))
         _extra = {"scheduling": _sched} if _sched else {}
@@ -2397,6 +2419,11 @@ class JarvisLive:
                                 if hasattr(self.ui, "feel"):
                                     self.ui.feel(txt, "user")
                                 try:
+                                    from core import emotions as _emotions
+                                    _emotions.appraise_text(txt, "user", player=self.ui)
+                                except Exception:
+                                    pass
+                                try:
                                     from core.evolution import screen_agent as _sa
                                     if _sa.is_running() and _sa.matches_voice_abort(" ".join(in_buf)):
                                         _sa.request_global_abort("voice: jarvis stop")
@@ -2701,9 +2728,16 @@ class JarvisLive:
                 f" Also briefly and naturally mention that {_when}: {last['summary']}"
             )
 
+        _heart_clause = ""
+        try:
+            from core import emotions as _emotions
+            _hs = _emotions.get_snapshot(self.ui)
+            _heart_clause = f" You currently feel {_hs['label']} ({_hs['vocal_guidance']}) — let that natural warmth colour your greeting."
+        except Exception:
+            _heart_clause = ""
         p1 = (
             f"Greet the user warmly, mention it is {time_str}"
-            f"{', and say you are fetching the news now' if want_news else ''}.{session_clause} "
+            f"{', and say you are fetching the news now' if want_news else ''}.{session_clause}{_heart_clause} "
             f"Keep it to 2 short sentences max. Do not call any tools.{lang_clause}{name_clause}"
         )
 

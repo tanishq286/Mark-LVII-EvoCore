@@ -36,6 +36,7 @@ from PyQt6.QtWidgets import (
 from gui.theme import (
     C,
     HoloAvatar,
+    make_goddess,
     qcol,
 )
 
@@ -67,6 +68,15 @@ class HudCanvas(QWidget):
                 self._avatar = HoloAvatar()
             except Exception:
                 self._avatar = None
+
+        # The full-body goddess (core/goddess_avatar.py): feelings, a heartbeat,
+        # and the same step()/glance() inputs as the head.
+        self._goddess = None
+        if make_goddess is not None:
+            try:
+                self._goddess = make_goddess()
+            except Exception:
+                self._goddess = None
 
         # The reactor core in three dimensions (gui/reactor.py). The flat ring
         # stack it replaced is kept whole as _paint_core_classic, and it is
@@ -128,8 +138,40 @@ class HudCanvas(QWidget):
         try:
             if self._avatar is not None:
                 self._avatar.glance(dx, dy, hold)
+            if self._goddess is not None:
+                self._goddess.glance(dx, dy, hold)
         except Exception:
             pass
+
+    def feel(self, text: str, who: str = "jarvis") -> None:
+        """Thread-safe: let the goddess and holographic face react emotionally."""
+        try:
+            if self._goddess is not None:
+                self._goddess.feel(text, who)
+        except Exception:
+            pass
+
+    def set_mood(self, mood: str, intensity: float = 1.0, hold: float | None = None) -> None:
+        """Thread-safe: shift the avatar into an explicit emotional mood."""
+        try:
+            if self._goddess is not None:
+                self._goddess.set_mood(mood, intensity, hold)
+            if self._avatar is not None and mood in ("shy", "sad"):
+                self._avatar.glance(0.0, 0.35, hold=1.6)
+        except Exception:
+            pass
+
+    def get_emotional_state(self) -> dict:
+        """Thread-safe: read live heart BPM, mood label, and drives from the avatar soul."""
+        try:
+            if self._goddess is not None and hasattr(self._goddess, "soul"):
+                snap = self._goddess.soul.snapshot()
+                if hasattr(self._goddess, "heart"):
+                    snap["bpm"] = round(float(self._goddess.heart.bpm), 1)
+                return snap
+        except Exception:
+            pass
+        return {}
 
     def push_visemes(self, frames, hop: float, at: float) -> None:
         """Thread-safe: hand over a schedule of (level, openness, width) frames.
@@ -336,7 +378,10 @@ class HudCanvas(QWidget):
         # starts talking. Same lesson the head's sway taught.
         self._core_phase += min(0.10, max(0.0, dt))
 
-        if self._avatar is not None and self.hud_style == "face":
+        if self._goddess is not None and self.hud_style == "goddess":
+            self._goddess.step(dt, amp, speaking=self.speaking, muted=self.muted,
+                               state=self.state, v_open=v_open)
+        elif self._avatar is not None and self.hud_style == "face":
             self._avatar.step(dt, amp, speaking=self.speaking,
                               muted=self.muted, state=self.state,
                               v_open=v_open, v_wide=v_wide or 0.0,
@@ -387,7 +432,9 @@ class HudCanvas(QWidget):
         # so a sleeping HUD stops pinning a CPU core. The visuals stay smooth
         # either way because the animation state keeps stepping at 60 Hz.
         self._paint_tick = (self._paint_tick + 1) % 6
-        active = (self.speaking or amp > 0.02
+        # The goddess always has something moving (her heart, petals, hair),
+        # so she is never "idle" for the throttle.
+        active = (self.speaking or amp > 0.02 or self.hud_style == "goddess"
                   or self.state in ("THINKING", "PROCESSING"))
         if _blinked or (self._paint_tick % 2 == 0 if active
                         else self._paint_tick % 3 == 0):
@@ -610,7 +657,16 @@ class HudCanvas(QWidget):
         band_t = 30.0
         band_h = max(60.0, sy - 14.0 - band_t)
 
-        if self._avatar is not None and self.hud_style == "face":
+        if self._goddess is not None and self.hud_style == "goddess":
+            G = self._goddess
+            u = min(band_h / G.SPAN, W / G.WIDTH)
+            acc = qcol(C.MUTED_C) if self.muted else (
+                qcol(C.ACC) if self.speaking else
+                qcol(C.ACC2) if self.state in ("THINKING", "PROCESSING") else
+                qcol(C.GREEN) if self.state == "LISTENING" else qcol(C.PRI))
+            self._goddess.paint(p, cx, band_t + (band_h - G.SPAN * u) / 2.0, u,
+                                qcol(C.PRI), acc, qcol(C.BG))
+        elif self._avatar is not None and self.hud_style == "face":
             r_head = min(fw * 0.355, band_h / (self._avatar.SPAN + 0.08))
             head_cy = band_t + (band_h - self._avatar.SPAN * r_head) / 2.0 + r_head
             if self.muted:

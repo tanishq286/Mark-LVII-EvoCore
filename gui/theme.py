@@ -64,6 +64,11 @@ try:
 except Exception:      # pragma: no cover — HUD must never die over cosmetics
     HoloAvatar = None
 
+try:
+    from core.goddess_portrait import make_goddess
+except Exception:      # pragma: no cover — same rule: a cosmetic never kills the HUD
+    make_goddess = None
+
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):

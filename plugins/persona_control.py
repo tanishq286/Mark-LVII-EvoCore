@@ -10,12 +10,13 @@ from __future__ import annotations
 PLUGIN = {
     "name": "persona_control",
     "description": (
-        "Switch or inspect JARVIS's active communication persona profile across three "
+        "Switch or inspect JARVIS's active communication persona profile across four "
         "built-in modes: 'precision' (Nova analytical/developer mode), 'empathetic' "
-        "(MJ warm English/Hindi/Hinglish mode), and 'expressive' (ELEVEN lively avatar mode). "
+        "(MJ warm English/Hindi/Hinglish mode), 'expressive' (ELEVEN lively avatar mode), "
+        "and 'soulful' (Goddess Heart deeply emotional & devoted companion mode). "
         "Actions: 'status' (default), 'set' (requires persona), or 'list'."
     ),
-    "brief": "Switch JARVIS persona between precision, empathetic, and expressive.",
+    "brief": "Switch JARVIS persona between precision, empathetic, expressive, and soulful.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
@@ -26,7 +27,7 @@ PLUGIN = {
             },
             "persona": {
                 "type": "STRING",
-                "enum": ["precision", "empathetic", "expressive"],
+                "enum": ["precision", "empathetic", "expressive", "soulful"],
                 "description": "Target persona mode when action='set'.",
             },
         },
@@ -72,11 +73,11 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             ]
             body = "\n".join(lines)
             _notify(player, f"Active persona: {current}.", "JARVIS PERSONA PROFILES", body)
-            return f"Available personas (active={current}): precision, empathetic, expressive.\n{body}"
+            return f"Available personas (active={current}): precision, empathetic, expressive, soulful.\n{body}"
 
         if action == "set":
             if not target:
-                return "Specify persona ('precision', 'empathetic', or 'expressive')."
+                return "Specify persona ('precision', 'empathetic', 'expressive', or 'soulful')."
             canonical = save_persona_mode(normalize_persona(target))
             meta = PERSONAS[canonical]
             msg = f"Persona switched to {canonical} ({meta['title']}, mood={meta['avatar_mood']})."

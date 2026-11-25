@@ -107,12 +107,20 @@ class ProactiveEngine:
             snippet = "\n".join(recent_turns[-6:])
             recent_ctx = f"\nRecent conversation:\n{snippet}"
 
+        heart_ctx = ""
+        try:
+            from core import emotions
+            heart_ctx = "\n" + emotions.format_emotion_for_prompt().strip()
+        except Exception:
+            heart_ctx = ""
+
         return "\n".join([
             "[PROACTIVE_CHECK] You are initiating a proactive check-in.",
             f"Current time : {time_str}  ({period})",
             "",
             "Context about this person:",
             mem_str,
+            heart_ctx,
             monitor_ctx,
             recent_ctx,
             "",

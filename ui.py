@@ -286,6 +286,28 @@ class JarvisUI:
         except Exception:
             pass
 
+    def feel(self, text: str, who: str = "jarvis") -> None:
+        """Thread-safe: hand spoken words to the goddess avatar so her mood
+        follows the conversation. Classification runs on the calling thread."""
+        try:
+            self._win.hud.feel(text, who)
+        except Exception:
+            pass
+
+    def set_mood(self, mood: str, intensity: float = 1.0, hold: float | None = None) -> None:
+        """Thread-safe: explicitly set the avatar's felt mood."""
+        try:
+            self._win.hud.set_mood(mood, intensity, hold)
+        except Exception:
+            pass
+
+    def get_emotional_state(self) -> dict:
+        """Thread-safe: read live emotional state from the HUD Soul/Mind."""
+        try:
+            return dict(self._win.hud.get_emotional_state() or {})
+        except Exception:
+            return {}
+
     def notify_phone_connected(self) -> None:
         self._win.notify_phone_connected()
 
