@@ -613,6 +613,32 @@ def _flatten_error_text(exc: BaseException) -> str:
     return " | ".join(p for p in parts if p)
 
 
+def _probe_gemini_key() -> "bool | None":
+    """Ask Google whether the saved key works, without spending generation quota.
+
+    True  = the key was accepted.
+    False = Google rejected the key itself (or no usable key is saved).
+    None  = could not tell (network, outage) — never a reason to ask for a new key.
+    """
+    try:
+        key = (_get_api_key() or "").strip()
+    except Exception:
+        return False
+    if len(key) < 16:
+        return False
+    try:
+        client = genai.Client(api_key=key, http_options={"api_version": "v1beta"})
+        next(iter(client.models.list(config={"page_size": 1})), None)
+        return True
+    except Exception as exc:
+        msg = str(exc)
+        code = getattr(exc, "code", None)
+        if ("API key not valid" in msg or "API_KEY_INVALID" in msg
+                or code in (401, 403)):
+            return False
+        return None
+
+
 class JarvisLive:
     def __init__(self, ui: JarvisUI):
         # Platform limits are announced once per run, not once per
@@ -3529,8 +3555,32 @@ class JarvisLive:
                     )
                     continue
 
-                # Invalid API key — stop hammering the API, prompt re-configuration
+                # Invalid API key — stop hammering the API, prompt re-configuration.
+                # 1007 is only the WebSocket "invalid payload" close code: Gemini
+                # Live also sends it for a malformed request (a rejected tool
+                # schema, a bad realtime frame), not just a bad key. Treating every
+                # 1007 as a bad key threw a working JARVIS back to the API-key
+                # screen with the key still saved. Ask Google about the key first;
+                # only a key Google actually rejects reaches the setup screen.
                 if "API key not valid" in err_str or "1007" in err_str:
+                    _key_state = await asyncio.to_thread(_probe_gemini_key)
+                    if _key_state is not False:
+                        _now = time.monotonic()
+                        if _now - getattr(self, "_bad_payload_at", 0.0) > 300:
+                            self._bad_payload_streak = 0
+                        self._bad_payload_at = _now
+                        self._bad_payload_streak = getattr(self, "_bad_payload_streak", 0) + 1
+                        _wait = min(3 * (2 ** (self._bad_payload_streak - 1)), 60)
+                        self._resume_handle = None
+                        print(f"[JARVIS] Live closed with 1007 but the API key is fine "
+                              f"(probe={_key_state}) — fresh reconnect in {_wait}s. "
+                              f"Detail: {err_str[:400]}")
+                        self.ui.write_log(
+                            "SYS: Live session rejected a request — reconnecting "
+                            "fresh. Your API key is fine.")
+                        self._conn_backoff = 0
+                        await asyncio.sleep(_wait)
+                        continue
                     self.ui.write_log("ERR: API key invalid — please re-enter your key.")
                     self.ui.set_state("SLEEPING")
                     self.ui.prompt_reconfig()
