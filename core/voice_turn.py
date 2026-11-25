@@ -82,6 +82,11 @@ class VoiceTurnCoordinator:
             self._state = TurnState.SPEAKING
             return True
 
+    def is_current(self, generation: int) -> bool:
+        """Whether a token still belongs to the active conversation turn."""
+        with self._lock:
+            return self._matches(generation)
+
     def accepts_audio(self, generation: int) -> bool:
         """Check immediately before queueing a PCM chunk."""
         with self._lock:
