@@ -1076,3 +1076,66 @@ def graph_stats(*, db_path: Path | None = None) -> dict[str, Any]:
         "by_type": by_type,
         "db_size_bytes": path.stat().st_size if path.is_file() else 0,
     }
+
+
+# ── Milestone 15: durable facts from turn-end / sleep memory extraction ─────
+
+_FACT_KIND_TO_ENTITY: dict[str, tuple[str, str]] = {
+    "preference": ("preference", "prefers"),
+    "favorite": ("preference", "prefers"),
+    "project": ("project", "works_on"),
+    "task": ("recurring_task", "has_task"),
+    "deadline": ("recurring_task", "has_deadline"),
+    "identity": ("person", "is"),
+    "person": ("person", "knows"),
+    "location": ("concept", "lives_in"),
+    "work": ("concept", "works_at"),
+    "note": ("concept", "noted"),
+    "personal": ("concept", "has"),
+}
+
+
+def ingest_extracted_facts(
+    facts: list[dict[str, Any]],
+    *,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    """Upsert extracted facts as typed entities linked from `person:user`."""
+    touched: list[str] = []
+    if not facts:
+        return {"entities_touched": 0, "entity_ids": []}
+    now_iso = _now_iso()
+    with _LOCK:
+        conn = _connect(db_path)
+        try:
+            user_ent = _upsert_entity_conn(
+                conn, "person", "User", summary="Primary Mark-LVII operator",
+                confidence=1.0, now_iso=now_iso,
+            )
+            user_id = user_ent["entity_id"]
+            for f in facts:
+                kind = str(f.get("kind") or "note").strip().lower()
+                etype, rel = _FACT_KIND_TO_ENTITY.get(kind, ("concept", "related_to"))
+                subject = " ".join(str(f.get("subject") or "").split())[:80]
+                value = " ".join(str(f.get("value") or "").split())[:120]
+                fact = " ".join(str(f.get("fact") or f"{subject}: {value}").split())[:300]
+                if not value and not subject:
+                    continue
+                if etype == "project" and value:
+                    name = value
+                elif etype == "person" and kind == "identity":
+                    name = value
+                else:
+                    name = f"{subject}: {value}" if subject and value else (value or subject)
+                ent = _upsert_entity_conn(
+                    conn, etype, name, summary=fact,
+                    attributes={"subject": subject, "value": value, "kind": kind},
+                    confidence=float(f.get("confidence") or 0.8), now_iso=now_iso,
+                )
+                _add_relation_conn(conn, user_id, rel, ent["entity_id"],
+                                   weight=1.0, evidence=fact[:200], now_iso=now_iso)
+                touched.append(ent["entity_id"])
+            conn.commit()
+        finally:
+            conn.close()
+    return {"entities_touched": len(touched), "entity_ids": touched}

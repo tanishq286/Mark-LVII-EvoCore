@@ -29,11 +29,14 @@ PLUGIN = {
         "'synthesize' = create + pytest-sandbox a new skill on skill/* branch; "
         "'self_heal' = repair an unhealthy plugin on autofix/* branch with replay benchmark; "
         "'habits' / 'compile_habit' / 'run_habit' = detect, compile, or execute 1-voice macros; "
-        "'consolidate_memory' = deduplicate & prune local knowledge_rag SQLite chunks."
+        "'consolidate_memory' = deduplicate & prune local knowledge_rag SQLite chunks; "
+        "'pause_agents' / 'resume_agents' = pause or resume the 24/7 research and engineering agents; "
+        "'agents_today' = show what the researcher and engineer built today; "
+        "'agents_status' / 'run_agents_now' = 24/7 agent state, or force one idle research+engineer pass."
     ),
     "brief": (
         "EvoCore status, telemetry, reflection digest, upgrade approval, self-heal, "
-        "habit macros, memory consolidation, and evolution rollback."
+        "habit macros, memory consolidation, evolution rollback, 24/7 agents pause/resume/today."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -54,6 +57,11 @@ PLUGIN = {
                     "compile_habit",
                     "run_habit",
                     "consolidate_memory",
+                    "pause_agents",
+                    "resume_agents",
+                    "agents_today",
+                    "agents_status",
+                    "run_agents_now",
                 ],
                 "description": "EvoCore operation to run (default 'status').",
             },
@@ -95,6 +103,39 @@ def _notify(player, log_line: str, title: str = "", body: str = "") -> None:
             pass
 
 
+_AGENT_ACTION_ALIASES = {
+    "pause": "pause_agents", "pause_247": "pause_agents", "pause_research": "pause_agents",
+    "resume": "resume_agents", "resume_247": "resume_agents", "resume_research": "resume_agents",
+    "today": "agents_today", "built_today": "agents_today", "what_built_today": "agents_today",
+    "agents": "agents_status", "run_agents": "run_agents_now",
+}
+
+
+def _agents_action(action: str, player) -> str:
+    from core.evolution import agents_247
+    if action == "pause_agents":
+        msg = agents_247.pause("voice")
+    elif action == "resume_agents":
+        msg = agents_247.resume()
+    elif action == "agents_today":
+        body = agents_247.built_today_report()
+        _notify(player, "24/7 agents: today's report is on the HUD.", "24/7 AGENTS TODAY", body)
+        return body[:1500]
+    elif action == "run_agents_now":
+        res = agents_247.run_once(player=player, force=True)
+        eng = res.get("engineer") or {}
+        msg = (f"Research pass done: {res.get('research', {}).get('specs', 0)} spec(s). "
+               + (f"Engineer built {eng.get('branch')} - say 'Approve upgrade {eng.get('upgrade_id')}'."
+                  if eng.get("ok") else f"Engineer: {eng.get('reason', 'nothing built')}."))
+    else:
+        st = agents_247.status()
+        msg = (f"24/7 agents {'PAUSED' if st['paused'] else 'active'}, scheduler "
+               f"{'running' if st['thread_running'] else 'stopped'}, {st['pending_specs']} pending spec(s), "
+               f"budget {st['budget']}.")
+    _notify(player, msg)
+    return msg
+
+
 def run(parameters: dict, player=None, session_memory=None) -> str:
     """Entry point discovered by `core.plugin_loader`. Never raises."""
     _ = session_memory
@@ -110,6 +151,10 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
 
         params = parameters if isinstance(parameters, dict) else {}
         action = str(params.get("action") or "status").strip().lower()
+        action = _AGENT_ACTION_ALIASES.get(action, action)
+
+        if action in ("pause_agents", "resume_agents", "agents_today", "agents_status", "run_agents_now"):
+            return _agents_action(action, player)
         skill_name = str(params.get("skill_name") or "").strip()
         spec = str(params.get("specification") or "").strip()
 
@@ -162,6 +207,13 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             uid = int(params.get("upgrade_id") or 0)
             if uid <= 0:
                 return "Specify positive integer 'upgrade_id' from the Evolution Digest."
+            # Milestone 15: conversations.sqlite + knowledge_graph.sqlite are
+            # gitignored (a merge cannot touch them) AND snapshotted first.
+            try:
+                from core.evolution import engineer_daemon
+                engineer_daemon.snapshot_memory_dbs()
+            except Exception as exc:
+                return f"Upgrade #{uid} not merged: memory snapshot failed ({exc})."
             return reflection_loop.approve_upgrade(uid, repo_root=BASE_DIR, player=player, require_confirm=True)
 
         if action == "rollback_last":

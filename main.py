@@ -14,6 +14,16 @@ if _platform.system() == "Windows":
 
     _subprocess.Popen = _Popen
 
+# ── Per-Monitor-V2 DPI awareness, before Qt / mss / pyautogui load ───────────
+# Milestone 15: without it the process starts DPI-unaware and the first mss
+# grab flips it mid-run, so UIA rects, pyautogui clicks and screenshots used
+# different coordinate spaces on the 150 %-scaled 2560x1600 panel.
+try:
+    from core.dpi import ensure_dpi_awareness as _ensure_dpi
+    _ensure_dpi()
+except Exception:
+    pass
+
 
 # ── Console must survive non-UTF-8 code pages ────────────────────────────────
 # Every status line in this file carries an emoji, and on a legacy Windows
@@ -691,6 +701,13 @@ class JarvisLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        # Milestone 15: append-only cross-session memory (memory/conversations.sqlite)
+        try:
+            from core.memory.live_memory import LiveMemoryBridge
+            self._live_mem = LiveMemoryBridge()
+        except Exception as _e:
+            print(f"[Memory] cross-session memory unavailable: {_e}")
+            self._live_mem = None
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
         self._tuned_live    = True  # turn-taking / media / thinking knobs; same fallback
@@ -905,6 +922,21 @@ class JarvisLive:
             self.ui.bring_to_front()
         self.ui.refresh_wake_ui()
         self.ui.write_log(f"SYS: Awake — {reason}.")
+        _primer = self._live_mem.wake_primer() if getattr(self, "_live_mem", None) is not None else ""
+        if _primer and self.session is not None and self._loop is not None and self._loop.is_running():
+            async def _send_memory_primer(text=_primer):
+                try:
+                    if self.session is not None:
+                        await self.session.send_client_content(
+                            turns={"role": "user", "parts": [{"text": text}]},
+                            turn_complete=False,
+                        )
+                except Exception as exc:
+                    print(f"[Memory] wake primer skipped: {exc}")
+            try:
+                asyncio.run_coroutine_threadsafe(_send_memory_primer(), self._loop)
+            except Exception as exc:
+                print(f"[Memory] wake primer schedule skipped: {exc}")
         if (
             speak_ack
             and not self.ui.muted
@@ -952,6 +984,8 @@ class JarvisLive:
         self.ui.set_state("SLEEPING")
         self.ui.refresh_wake_ui()
         self.ui.write_log(f"SYS: Sleeping — {reason}. {self._wake_prompt_hint()}")
+        if getattr(self, "_live_mem", None) is not None:
+            self._live_mem.on_sleep(reason)       # summary + facts, background thread
 
     async def _run_sleep_watch(self) -> None:
         """Auto-sleep after the configured silence window (when a wake trigger is active)."""
@@ -1117,6 +1151,16 @@ class JarvisLive:
             await asyncio.wait_for(self._save_session_summary(), timeout=12)
         except Exception as e:
             print(f"[JARVIS] session summary not saved on exit: {e!r}")
+        try:
+            from core.evolution import agents_247 as _agents
+            _agents.stop()
+        except Exception:
+            pass
+        if getattr(self, "_live_mem", None) is not None:
+            try:
+                await asyncio.wait_for(asyncio.to_thread(self._live_mem.on_shutdown), timeout=6)
+            except Exception as e:
+                print(f"[Memory] conversation store not closed cleanly: {e!r}")
 
     def _stop_engines(self) -> None:
         """Routines stop firing; a running background task stops after the round
@@ -1687,6 +1731,10 @@ class JarvisLive:
             pass
         if mem_str:
             parts.append(mem_str)
+        if getattr(self, "_live_mem", None) is not None:
+            _boot = self._live_mem.bootstrap_text()
+            if _boot:
+                parts.append(_boot)
         parts.append(sys_prompt)
 
         cfg = dict(
@@ -2014,23 +2062,29 @@ class JarvisLive:
         _elapsed_ms = (time.monotonic() - _t_tool) * 1000
         print(f"[JARVIS] 📤 {name} ({_elapsed_ms:.0f} ms) "
               f"→ {str(result)[:80]}")
-        try:
-            from core import auto_evolution as _auto_evo
-            _auto_evo.observe_tool_outcome(name, args, str(result), _elapsed_ms, player=self.ui)
-        except Exception:
-            pass
-        try:
-            from core.evolution import telemetry as _evo_tel
-            _evo_tel.record_tool_event(
-                name,
-                args,
-                str(result),
-                _elapsed_ms,
-                error_type=_exc_type,
-                tb=_exc_tb,
-            )
-        except Exception:
-            pass
+        # Milestone 15: SQLite telemetry + auto-evolution bookkeeping used to
+        # run right here ON the event loop; slow disk turns were enough to miss
+        # Live keepalive pings ("1011 keepalive ping timeout" in startup.log).
+        # They now run on a worker thread; the reply never waits for them.
+        def _post_tool_bookkeeping(_res=str(result), _args=dict(args or {})):
+            try:
+                from core import auto_evolution as _auto_evo
+                _auto_evo.observe_tool_outcome(name, _args, _res, _elapsed_ms, player=self.ui)
+            except Exception:
+                pass
+            try:
+                from core.evolution import telemetry as _evo_tel
+                _evo_tel.record_tool_event(
+                    name,
+                    _args,
+                    _res,
+                    _elapsed_ms,
+                    error_type=_exc_type,
+                    tb=_exc_tb,
+                )
+            except Exception:
+                pass
+        self._keep_task(asyncio.ensure_future(asyncio.to_thread(_post_tool_bookkeeping)))
 
         # A tool that declared itself NON_BLOCKING also says when its answer may
         # re-enter the conversation. Without this the model finishes whatever it
@@ -2248,6 +2302,8 @@ class JarvisLive:
                 self._last_out_logged = ""   # new exchange
                 self.ui.write_log(f"You: {full_in}")
                 self._session_log.append(f"User: {full_in}")
+                if self._live_mem is not None:
+                    self._live_mem.record("user", full_in)
                 if self._dashboard:
                     asyncio.create_task(self._dashboard.broadcast({
                         "type": "log", "speaker": "user",
@@ -2378,6 +2434,8 @@ class JarvisLive:
                                 if not out_streamed:
                                     self.ui.write_log(f"{self._asst_name}: {full_out}")
                                 self._session_log.append(f"{self._asst_name}: {full_out}")
+                                if self._live_mem is not None:
+                                    self._live_mem.record("assistant", full_out)
                                 try:
                                     from core.memory import knowledge_graph as _kg
                                     _prev_u = ""
@@ -2418,6 +2476,8 @@ class JarvisLive:
                                 if not out_streamed:
                                     self.ui.write_log(f"{self._asst_name}: {full_lead}")
                                 self._session_log.append(f"{self._asst_name}: {full_lead}")
+                                if self._live_mem is not None:
+                                    self._live_mem.record("assistant", full_lead)
                             if out_streamed and callable(_stream_fn):
                                 _stream_fn(self._asst_name, "", True)
                             out_buf = []
@@ -3051,6 +3111,13 @@ class JarvisLive:
 
     async def run(self):
         self._loop = asyncio.get_event_loop()
+        if getattr(self, "_live_mem", None) is not None:
+            self._live_mem.start()                  # + summarise crash-orphaned sessions
+        try:
+            from core.evolution import agents_247 as _agents
+            _agents.start(player=self.ui)           # idle-aware, budgeted, pausable
+        except Exception as _e:
+            print(f"[Agents] 24/7 agents not started: {_e}")
         self._reconnect_event = asyncio.Event()
 
         # ── Wire the shared core services to the interface ───────────────────

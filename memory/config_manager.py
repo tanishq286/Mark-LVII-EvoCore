@@ -706,3 +706,67 @@ def save_persona_mode(mode: str) -> str:
     canonical = normalize_persona(mode)
     _patch_config(persona_mode=canonical)
     return canonical
+
+
+# ── Milestone 15: Chrome is JARVIS's default browser everywhere ─────────────
+# Jarvis keeps its OWN preference (api_keys.json "default_browser") instead of
+# following the OS http UserChoice (Edge on this PC). Chrome wins whenever it
+# is installed; anything else is only a graceful fallback.
+
+_KNOWN_BROWSERS = ("chrome", "edge", "firefox", "brave", "opera", "operagx", "vivaldi", "safari")
+
+
+@functools.lru_cache(maxsize=1)
+def find_chrome_exe() -> str:
+    """Absolute path to an installed Google Chrome, or "" when it is missing."""
+    import shutil
+    cands: list[Path] = []
+    if sys.platform == "win32":
+        for env in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+            root = os.environ.get(env)
+            if root:
+                cands.append(Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe")
+        try:
+            import winreg
+            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                try:
+                    with winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe") as k:
+                        cands.append(Path(winreg.QueryValueEx(k, "")[0]))
+                except OSError:
+                    pass
+        except Exception:
+            pass
+    elif sys.platform == "darwin":
+        cands.append(Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
+    for c in cands:
+        try:
+            if c.is_file():
+                return str(c)
+        except OSError:
+            continue
+    for name in ("chrome", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return ""
+
+
+def get_default_browser() -> str:
+    """Jarvis's browser: saved choice > Chrome (if installed) > "" (= follow the OS)."""
+    try:
+        saved = str(load_api_keys().get("default_browser") or "").strip().lower()
+    except Exception:
+        saved = ""
+    if saved in _KNOWN_BROWSERS:
+        if saved == "chrome" and not find_chrome_exe():
+            return ""
+        return saved
+    return "chrome" if find_chrome_exe() else ""
+
+
+def save_default_browser(name: str) -> str:
+    canonical = str(name or "").strip().lower().replace("google ", "").replace("microsoft ", "")
+    if canonical not in _KNOWN_BROWSERS:
+        raise ValueError(f"Unknown browser {name!r}; choose one of {', '.join(_KNOWN_BROWSERS)}")
+    _patch_config(default_browser=canonical)
+    return canonical

@@ -37,8 +37,38 @@ _MAX_BYTES = 6_000_000          # a page larger than this is not an article
 _MAX_PDF_BYTES = 20_000_000
 _MAX_REDIRECTS = 4
 _TIMEOUT = 20
-_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+_UA_FALLBACK = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
+def _chrome_major() -> str:
+    """Major version of the installed Google Chrome ("" when Chrome is missing)."""
+    try:
+        from memory.config_manager import find_chrome_exe
+        exe = find_chrome_exe()
+    except Exception:
+        exe = ""
+    if not exe:
+        return ""
+    try:
+        vers = sorted((p.name for p in Path(exe).parent.iterdir()
+                       if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", p.name)),
+                      key=lambda v: tuple(int(x) for x in v.split(".")))
+        return vers[-1].split(".")[0] if vers else ""
+    except Exception:
+        return ""
+
+
+def _user_agent() -> str:
+    """A UA that matches the Chrome actually installed (Milestone 15)."""
+    major = _chrome_major()
+    if not major:
+        return _UA_FALLBACK
+    return ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36")
+
+
+_UA = _user_agent()
 
 
 class Refused(ValueError):
@@ -176,8 +206,54 @@ def fetch_document(url: str) -> dict:
 
     body = body.strip()
     if not body:
+        rendered = render_with_chrome(current)
+        if rendered:
+            return rendered
         raise FetchError("the page has no readable text (it may need a browser)")
     return {"url": current, "title": title, "text": body}
+
+
+def render_with_chrome(url: str, *, timeout_ms: int = 20_000) -> dict | None:
+    """Render a JS-only page in headless Google Chrome (Playwright channel="chrome").
+
+    Falls back to Playwright's bundled Chromium only when Chrome is missing.
+    Every document/frame navigation (redirects included) passes `check_url`,
+    so rendering cannot be used to reach private/internal addresses.
+    Returns None when no browser engine is available.
+    """
+    try:
+        current = check_url(url)
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return None
+
+    def _guard(route, request):
+        if request.resource_type in ("document", "subdocument"):
+            try:
+                check_url(request.url)
+            except Refused:
+                return route.abort()
+        return route.continue_()
+
+    try:
+        with sync_playwright() as pw:
+            try:
+                browser = pw.chromium.launch(channel="chrome", headless=True)
+            except Exception:
+                browser = pw.chromium.launch(headless=True)
+            try:
+                page = browser.new_page(user_agent=_UA)
+                page.route("**/*", _guard)
+                page.goto(current, wait_until="networkidle", timeout=timeout_ms)
+                final = check_url(page.url)
+                html = page.content().encode("utf-8")
+            finally:
+                browser.close()
+        title, body = _text_from_html(html, "utf-8")
+        body = body.strip()
+        return {"url": final, "title": title, "text": body} if body else None
+    except Exception:
+        return None
 
 
 def format_page(doc: dict, max_chars: int = 15_000) -> str:

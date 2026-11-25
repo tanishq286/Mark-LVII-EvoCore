@@ -123,6 +123,52 @@ def _capture_windows_host_screen() -> bytes | None:
     return None
 
 
+# What the last screen capture covered, so a caller that hands the JPEG to a
+# Vision model can map the model's pixel/normalised coordinates back onto the
+# real (physical-pixel) monitor. The JPEG is downscaled (2560x1600 -> 1152x720
+# on the live panel), so image pixels are NOT screen pixels.
+LAST_CAPTURE_META: dict = {}
+
+# A frame with almost no variance is a black/blank grab (secure desktop, a
+# capture from a session without a desktop, a GPU-protected surface).
+_BLANK_STD = 2.0
+
+
+def _frame_stats(rgb_bytes: bytes, size) -> tuple[float, float]:
+    try:
+        arr = np.frombuffer(rgb_bytes, dtype=np.uint8)
+        sample = arr[:: max(1, len(arr) // 200_000)]
+        return float(sample.mean()), float(sample.std())
+    except Exception:
+        return 0.0, 0.0
+
+
+def _grab_mss() -> tuple[bytes, tuple[int, int], dict]:
+    sct_cls = getattr(mss, "MSS", None) or mss.mss
+    with sct_cls() as sct:
+        monitors = sct.monitors          # [0] = all combined, [1..n] = real screens
+        target   = monitors[1] if len(monitors) > 1 else monitors[0]
+        shot     = sct.grab(target)
+        png      = mss.tools.to_png(shot.rgb, shot.size)
+        mean, std = _frame_stats(shot.rgb, shot.size)
+    mon = {"left": int(target["left"]), "top": int(target["top"]),
+           "width": int(target["width"]), "height": int(target["height"])}
+    return png, (mean, std), mon
+
+
+def _grab_pil() -> tuple[bytes, tuple[float, float], dict] | None:
+    try:
+        from PIL import ImageGrab
+        img = ImageGrab.grab(all_screens=False).convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        arr = np.asarray(img)[::8, ::8]
+        mon = {"left": 0, "top": 0, "width": img.width, "height": img.height}
+        return buf.getvalue(), (float(arr.mean()), float(arr.std())), mon
+    except Exception:
+        return None
+
+
 def _capture_screen() -> tuple[bytes, str]:
     if _is_wsl():
         win_png = _capture_windows_host_screen()
@@ -132,13 +178,45 @@ def _capture_screen() -> tuple[bytes, str]:
     if not _MSS:
         raise RuntimeError("mss is not installed. Run: pip install mss")
 
-    with mss.mss() as sct:
-        monitors = sct.monitors          # [0] = all combined, [1..n] = real screens
-        target   = monitors[1] if len(monitors) > 1 else monitors[0]
-        shot     = sct.grab(target)
-        png      = mss.tools.to_png(shot.rgb, shot.size)
+    try:
+        from core.dpi import ensure_dpi_awareness
+        ensure_dpi_awareness()
+    except Exception:
+        pass
 
-    return _compress(png, "PNG")
+    png, (mean, std), mon = _grab_mss()
+    backend = "mss"
+    if std < _BLANK_STD:
+        # One quick retry (a grab racing a full-screen transition), then GDI.
+        import time as _time
+        _time.sleep(0.15)
+        png, (mean, std), mon = _grab_mss()
+        if std < _BLANK_STD and sys.platform == "win32":
+            alt = _grab_pil()
+            if alt is not None and alt[1][1] >= std:
+                png, (mean, std), mon = alt
+                backend = "pil_imagegrab"
+
+    data, mime = _compress(png, "PNG")
+    img_w, img_h = mon["width"], mon["height"]
+    if _PIL and mime == "image/jpeg":
+        try:
+            img_w, img_h = PIL.Image.open(io.BytesIO(data)).size
+        except Exception:
+            pass
+    LAST_CAPTURE_META.clear()
+    LAST_CAPTURE_META.update({
+        "monitor": mon, "image_w": int(img_w), "image_h": int(img_h),
+        "mean": round(mean, 2), "std": round(std, 2),
+        "blank": bool(std < _BLANK_STD), "backend": backend,
+    })
+    return data, mime
+
+
+def capture_screen_meta() -> tuple[bytes, str, dict]:
+    """`_capture_screen()` plus the geometry/blank metadata of that same frame."""
+    data, mime = _capture_screen()
+    return data, mime, dict(LAST_CAPTURE_META)
 
 
 def _cv2_backend() -> int:
