@@ -456,7 +456,12 @@ class PipelineEngine:
         return generation
 
     def _queue_generation(self) -> None:
-        """Start a response, or queue it behind a still-current response."""
+        """Start a response, or queue it behind a still-current response/tool call."""
+        if self._awaiting:
+            # Keep tool-call/result pairs intact. The queued prompt runs after the
+            # current tool round has completed and its answer has been generated.
+            self._followup = True
+            return
         if (self._gen and not self._gen.done()
                 and self._active_generation is not None
                 and self._turns.is_current(self._active_generation)):
@@ -626,6 +631,8 @@ class PipelineEngine:
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            if not self._turns.is_current(generation):
+                return
             # A failed generation must still end the turn. Without this the UI
             # sits in THINKING for ever and the stall watchdog reconnects an
             # engine whose only problem was one bad request.
