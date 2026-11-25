@@ -58,6 +58,7 @@ import re
 import threading
 import time
 import json
+import os as _os
 import sys
 import traceback
 from contextlib import asynccontextmanager
@@ -104,7 +105,7 @@ from core                      import confirm as confirm_gate
 from core                      import audio_devices
 from core                      import privacy
 from core.action_loader        import discover_actions
-from core.echo                 import EchoGuard
+from core.echo                 import EchoGuard, BargeInDetector
 from core.viseme               import VisemeStream
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
@@ -703,6 +704,13 @@ class JarvisLive:
         self._ptt                  = None    # core.hotkey.PushToTalk
         self._out_level            = 0.0     # level of the audio being played right now
         self._echo                 = EchoGuard()
+        self._barge_in             = BargeInDetector(self._echo)
+        self._voice_barge_in_enabled = (
+            _os.environ.get("JARVIS_VOICE_BARGE_IN", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        if self._voice_barge_in_enabled:
+            print("[JARVIS] Voice barge-in opted in; waiting for room echo calibration")
         # `stream.write()` returns when the buffer accepts the audio, not when the
         # speaker has finished with it, so sound is still in the room after the
         # speaking flag drops. Streaming the microphone during that gap is how an
@@ -1690,7 +1698,10 @@ class JarvisLive:
 
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
-        self._interrupted = True
+        # Gemini Live needs a response fence until its interrupted turn closes.
+        # The local pipeline has its own generation fence and must not suppress
+        # the next, newly-recognised user turn.
+        self._interrupted = self._engine is None
         q = self.audio_in_queue
         if q:
             drained = 0
@@ -2287,15 +2298,58 @@ class JarvisLive:
             # the echo of what we are playing right now", sustained long enough
             # that a cough or a keystroke cannot trigger it.
             if jarvis_speaking:
-                # Nothing is streamed while JARVIS talks.
-                #
-                # Interrupting by voice used to live here: `EchoGuard` can pick a
-                # user out from under our own echo, and `core/echo.py` still does
-                # that for the tail below. Re-enabling is small — classify each
-                # block here and call interrupt() after `required_blocks` of
-                # agreement — but it depends on the listener's room, so it stays
-                # out until it can be tried on real hardware.
+                # Voice interruption is explicitly opt-in until this particular
+                # microphone / speaker / room has been tested. The detector does
+                # not learn during playback: it waits for calibration gathered
+                # from the existing post-playback echo-tail path.
+                if (
+                    not self._voice_barge_in_enabled
+                    or self.ui.muted
+                    or self._phone_active
+                    or (self._ptt_enabled and not self._ptt_held)
+                ):
+                    return
+                try:
+                    _barge_frames = self._barge_in.observe(
+                        indata, SEND_SAMPLE_RATE, _pcm_level(indata)
+                    )
+                except Exception:
+                    return
+                if _barge_frames:
+                    _confirmed_audio = tuple(_barge_frames)
+
+                    def _dispatch_voice_barge_in():
+                        # Re-check input ownership on the event loop: state may
+                        # change after the PortAudio callback has run.
+                        if (
+                            self.ui.muted
+                            or self._phone_active
+                            or (self._ptt_enabled and not self._ptt_held)
+                        ):
+                            self._barge_in.reset()
+                            return
+                        self.interrupt()
+                        self._last_user_speech = time.monotonic()
+                        q = self.out_queue
+                        if q is None:
+                            return
+                        for _frame in _confirmed_audio:
+                            try:
+                                q.put_nowait({
+                                    "data": _frame,
+                                    "mime_type": "audio/pcm",
+                                })
+                            except asyncio.QueueFull:
+                                break
+
+                    try:
+                        loop.call_soon_threadsafe(_dispatch_voice_barge_in)
+                    except RuntimeError:
+                        self._barge_in.reset()
                 return
+
+            # Re-arm once playback ends, while retaining the learned room profile.
+            self._barge_in.reset()
 
             # ── Echo tail ────────────────────────────────────────────────────
             # The speaking flag has dropped but the speakers have not finished.
@@ -2476,6 +2530,19 @@ class JarvisLive:
                         self.request_reconnect(keep_context=True, reason="session refresh")
                         return
 
+                    _server_content = getattr(response, "server_content", None)
+                    if (
+                        _server_content is not None
+                        and getattr(_server_content, "interrupted", False)
+                    ):
+                        if not self._interrupted:
+                            self.interrupt()
+                        out_buf = []
+                        if out_streamed and callable(_stream_fn):
+                            _stream_fn(self._asst_name, "", True)
+                        out_streamed = False
+                        self._visemes.reset()
+
                     if response.data:
                         if self._interrupted:
                             pass  # discard: interrupted
@@ -2489,10 +2556,14 @@ class JarvisLive:
                             for _i in range(0, len(_audio_data), _SLICE):
                                 self.audio_in_queue.put_nowait(_audio_data[_i : _i + _SLICE])
 
-                    if response.server_content:
-                        sc = response.server_content
+                    if _server_content:
+                        sc = _server_content
 
-                        if sc.output_transcription and sc.output_transcription.text:
+                        if (
+                            not self._interrupted
+                            and sc.output_transcription
+                            and sc.output_transcription.text
+                        ):
                             txt = _clean_transcript(sc.output_transcription.text)
                             # A turn that involves a tool call passes through
                             # several turn_completes, and the API re-sends the
@@ -2558,11 +2629,11 @@ class JarvisLive:
                             # If this turn_complete ends an interrupted response, clear the
                             # flag and skip all further processing for that turn.
                             if self._interrupted:
-                                self._interrupted = False
-                                in_buf  = []
+                                _flush_user_in()
                                 out_buf = []
                                 out_streamed = False
                                 self._visemes.reset()
+                                self._interrupted = False
                                 continue
 
                             _flush_user_in()

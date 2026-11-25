@@ -169,6 +169,15 @@ class EchoGuard:
         return _BLOCKS_NORMAL if self.reliable else _BLOCKS_NOISY
 
     @property
+    def speech_run(self) -> int:
+        """Consecutive microphone blocks classified as non-echo speech."""
+        return self._run
+
+    def reset_speech_run(self) -> None:
+        """Clear only the current candidate; retain the learned room profile."""
+        self._run = 0
+
+    @property
     def last_similarity(self) -> float:
         """1.0 = fully explained by our own output, 0.0 = nothing to do with it."""
         return self._last_sim
@@ -286,3 +295,56 @@ class EchoGuard:
             return False
         except Exception:
             return False      # any doubt: do not interrupt
+
+
+class BargeInDetector:
+    """Require calibrated, sustained non-echo speech before interrupting.
+
+    Only the contiguous blocks that pass EchoGuard are returned. Earlier
+    playback / room echo is never replayed as microphone input.
+    """
+
+    def __init__(self, guard: EchoGuard, *, max_candidate_blocks: int = 32) -> None:
+        self.guard = guard
+        self.max_candidate_blocks = max(1, int(max_candidate_blocks))
+        self._candidate: list[bytes] = []
+        self._triggered = False
+
+    def observe(self, pcm, sr: int, level: float,
+                when: float | None = None) -> tuple[bytes, ...] | None:
+        """Observe one mic block; return the confirmed speech run exactly once."""
+        if self._triggered:
+            return None
+        if not self.guard.calibrated:
+            # Never train the echo profile on speech captured during playback.
+            self._candidate.clear()
+            self.guard.reset_speech_run()
+            return None
+
+        try:
+            is_speech = self.guard.is_user_speech(pcm, sr, level, when)
+        except Exception:
+            self._candidate.clear()
+            self.guard.reset_speech_run()
+            return None
+
+        if not is_speech:
+            self._candidate.clear()
+            return None
+
+        to_bytes = getattr(pcm, 'tobytes', None)
+        self._candidate.append(to_bytes() if callable(to_bytes) else bytes(pcm))
+        if len(self._candidate) > self.max_candidate_blocks:
+            del self._candidate[:-self.max_candidate_blocks]
+
+        if self.guard.speech_run < self.guard.required_blocks:
+            return None
+
+        self._triggered = True
+        return tuple(self._candidate)
+
+    def reset(self) -> None:
+        """Re-arm after playback ends or a candidate is abandoned."""
+        self._candidate.clear()
+        self._triggered = False
+        self.guard.reset_speech_run()
