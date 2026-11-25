@@ -88,3 +88,22 @@ def test_coordinator_is_thread_safe_for_generation_invalidation() -> None:
     assert len(set(tokens)) == 64
     assert turns.snapshot().generation == max(tokens)
     assert turns.finish_capture(max(tokens))
+
+
+def test_current_generation_remains_valid_after_normal_response_finishes() -> None:
+    turns = VoiceTurnCoordinator()
+    token = turns.begin_capture()
+    assert turns.finish_capture(token)
+    assert turns.begin_speaking(token)
+    assert turns.finish_response(token)
+    assert turns.is_current(token)
+    assert not turns.accepts_audio(token)
+
+
+def test_interrupted_generation_is_no_longer_current() -> None:
+    turns = VoiceTurnCoordinator()
+    old = turns.begin_capture()
+    assert turns.finish_capture(old)
+    assert turns.begin_speaking(old)
+    turns.interrupt()
+    assert not turns.is_current(old)
