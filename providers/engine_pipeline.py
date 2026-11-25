@@ -433,6 +433,26 @@ class PipelineEngine:
         """
         if self._closed:
             return
+        pending_ids = set(self._awaiting)
+        if pending_ids:
+            # Keep any spoken acknowledgement and tool/result pairs that
+            # already completed, but remove only unresolved tool calls. An
+            # orphaned assistant.tool_calls entry can make the next model turn
+            # invalid or cause it to reason from a result that never arrived.
+            for index in range(len(self._history) - 1, -1, -1):
+                entry = self._history[index]
+                if entry.get("role") != "assistant" or not entry.get("tool_calls"):
+                    continue
+                entry["tool_calls"] = [
+                    call for call in entry["tool_calls"]
+                    if str(call.get("id", "")) not in pending_ids
+                ]
+                if not entry["tool_calls"]:
+                    if not entry.get("content"):
+                        del self._history[index]
+                    else:
+                        entry.pop("tool_calls", None)
+                break
         self._turns.interrupt()
         self._followup = False
         self._awaiting.clear()
