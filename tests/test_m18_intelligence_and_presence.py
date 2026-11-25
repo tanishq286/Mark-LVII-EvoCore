@@ -349,9 +349,17 @@ def test_romantic_charm_persona_callbacks_and_persuasion_coach_ethics(tmp_path: 
     assert persona.normalize_persona("romantic") == "romantic_charm"
     prompt = persona.format_persona_prompt("romantic_charm", db_path=db)
     assert "ROMANTIC CHARM" in prompt
+    assert "Boss" in prompt and "Tanishq" in prompt
     assert "Hinglish" in prompt
     assert "tender" in prompt and "playful" in prompt and "shy" in prompt
     assert "Masala chai" in prompt
+
+    core_prompt = (REPO_ROOT / "core" / "prompt.txt").read_text(encoding="utf-8")
+    for tok in ("{assistant_name}", "{platform}", "{capabilities}", "{limits}"):
+        assert tok in core_prompt, f"Missing token {tok} in core/prompt.txt"
+    assert "IDENTITY & DEVOTION" in core_prompt
+    assert "DYNAMIC MODE SWITCHING" in core_prompt
+    assert "NEVER use asterisks" in core_prompt
 
     class _DummyPlayer:
         def __init__(self):
