@@ -95,3 +95,31 @@ def test_new_local_turn_can_start_after_interruption() -> None:
         await engine.close()
 
     asyncio.run(scenario())
+
+
+def test_interrupt_removes_only_unresolved_tool_calls_from_history() -> None:
+    engine = _engine()
+    engine._history.extend([
+        {
+            "role": "assistant",
+            "content": "I opened the first item; cancelling the second.",
+            "tool_calls": [
+                {"id": "completed-call", "type": "function"},
+                {"id": "pending-call", "type": "function"},
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "completed-call",
+            "name": "open_app",
+            "content": "Opened",
+        },
+    ])
+    engine._awaiting["pending-call"] = "send_message"
+    engine._pending_generation_ids["pending-call"] = engine._begin_generation()
+
+    engine.interrupt()
+
+    assert engine._history[0]["content"] == "I opened the first item; cancelling the second."
+    assert [c["id"] for c in engine._history[0]["tool_calls"]] == ["completed-call"]
+    assert engine._history[1]["tool_call_id"] == "completed-call"
