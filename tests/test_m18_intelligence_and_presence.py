@@ -235,7 +235,8 @@ def test_emotion_matched_tts_pacing_and_pipeline_streaming(tmp_path: Path, monke
         caps = {"tools": False, "streaming": True}
 
     eng = PipelineEngine(_DummyLLM(), tts=_ProsodyTTS())
-    asyncio.run(eng._speak("Oh really? Tell me more!"))
+    generation = eng._begin_generation()
+    asyncio.run(eng._speak("Oh really? Tell me more!", generation))
     assert len(captured) == 1
     assert isinstance(captured[0]["rate"], int)
     assert 130 <= captured[0]["pause_ms"] <= 450
