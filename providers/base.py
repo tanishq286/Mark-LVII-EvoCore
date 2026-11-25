@@ -180,36 +180,43 @@ class ServerContent:
 
 @dataclass
 class Msg:
-    """One event out of `Engine.receive()`, shaped like the SDK's own."""
+    """One event out of `Engine.receive()`, shaped like the SDK's own.
+
+    `generation` is local-pipeline metadata. Native Live SDK messages leave it
+    unset; a provider adapter uses it to fence stale audio after interruption.
+    """
     data: Optional[bytes] = None
     server_content: Optional[ServerContent] = None
     tool_call: Optional[ToolCall] = None
     session_resumption_update: Any = None
+    generation: Optional[int] = None
 
     # -- constructors for the five things an engine actually emits ------------
     @staticmethod
-    def audio(pcm: bytes) -> "Msg":
-        return Msg(data=pcm)
+    def audio(pcm: bytes, generation: Optional[int] = None) -> "Msg":
+        return Msg(data=pcm, generation=generation)
 
     @staticmethod
-    def said(text: str) -> "Msg":
+    def said(text: str, generation: Optional[int] = None) -> "Msg":
         """What the assistant is saying — feeds the log AND the avatar's mouth."""
         return Msg(server_content=ServerContent(
-            output_transcription=Transcription(text)))
+            output_transcription=Transcription(text)), generation=generation)
 
     @staticmethod
-    def heard(text: str) -> "Msg":
+    def heard(text: str, generation: Optional[int] = None) -> "Msg":
         """What the user said — feeds the log and the self-echo guard's clock."""
         return Msg(server_content=ServerContent(
-            input_transcription=Transcription(text)))
+            input_transcription=Transcription(text)), generation=generation)
 
     @staticmethod
-    def turn_end() -> "Msg":
-        return Msg(server_content=ServerContent(turn_complete=True))
+    def turn_end(generation: Optional[int] = None) -> "Msg":
+        return Msg(server_content=ServerContent(turn_complete=True),
+                   generation=generation)
 
     @staticmethod
-    def calls(items: Sequence[FunctionCall]) -> "Msg":
-        return Msg(tool_call=ToolCall(list(items)))
+    def calls(items: Sequence[FunctionCall],
+              generation: Optional[int] = None) -> "Msg":
+        return Msg(tool_call=ToolCall(list(items)), generation=generation)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
