@@ -1,6 +1,6 @@
 # Phase 2 — Voice Intelligence: Technical Design
 
-**Status:** Design specification only. Application-code implementation is gated on the local working-tree and private runtime-data backup check.
+**Status:** First isolated primitive implemented and unit-tested; microphone/playback integration remains gated on local working-tree preservation, CI validation, and real-device testing.
 
 ## Goal
 
@@ -126,3 +126,21 @@ Do not persist raw microphone audio, speaker reference audio, transcripts beyond
 - Google Gemini Live API — 20–40 ms audio chunk guidance and interruption troubleshooting: https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/live-api/troubleshooting
 - WebRTC Audio Processing Python binding candidate: https://github.com/strands-labs/pywebrtc-audio
 - ElevenLabs voice settings and model-dependent prosody controls: https://elevenlabs.io/docs/api-reference/voices/settings/get
+
+
+## Implementation progress
+
+### Stage 1 — generation-safe turn coordinator
+
+Added on `upgrade/phase-2-voice-intelligence`:
+
+- `core/voice_turn.py`: a thread-safe coordinator with explicit IDLE, LISTENING, THINKING, SPEAKING, and CLOSED states.
+- `tests/test_voice_turn.py`: seven unit tests covering the happy path, interruption invalidation, stale completion rejection, playback gating, cancellation, close semantics, and concurrent generation allocation.
+
+The coordinator issues monotonically increasing generation IDs. An integration must carry the active ID through the response and check `accepts_audio(generation)` immediately before placing PCM in the playback queue. An interruption allocates a newer ID, making all old-generation audio and callbacks stale.
+
+**Validation performed:** the isolated test file ran locally with 7 passed. This is not evidence that the full repository CI passes.
+
+**Not yet integrated:** no microphone callback, Gemini Live stream, PipelineEngine, playback queue, TTS provider, or avatar code has been changed. The coordinator does not yet make the application interruptible; it provides a tested foundation for wiring that behaviour safely.
+
+**Next:** wire generation IDs to the shared playback publication boundary and interruption path on a separate commit, after the user's local repository state and private runtime backup are verified. Then add mocked race-condition tests and perform a microphone/speaker smoke test before enabling barge-in by default.
